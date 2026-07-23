@@ -133,6 +133,7 @@ func (w *dropWarner) flush() (int64, bool) {
 type userOptions struct {
 	acceptAccount     bool
 	acceptTransaction bool
+	acceptLogs        bool
 }
 
 type SocketHub struct {
@@ -430,6 +431,8 @@ func (h *SocketHub) StartServer(ctx context.Context) {
 				h.handleAccountsEvent(event)
 			case indexer.USER_TRANSACTIONS:
 				h.handleUserTransactionEvent(event)
+			case indexer.LOGS:
+				h.handleLogsEvent(event)
 			case indexer.TRANSACTIONS:
 				h.handleBroadcastEvent(event, h.transactionSubscription)
 			default:
@@ -448,6 +451,28 @@ func (h *SocketHub) handleAccountsEvent(event indexer.Event) {
 			continue
 		}
 		h.notifyAddressSubscribers(account, parsed, acceptAccount)
+	}
+}
+
+func (h *SocketHub) handleLogsEvent(event indexer.Event) {
+	logs, ok := event.Message.([]*data.Logs)
+	if !ok {
+		log.Error("ws.EventReceive", "err", "cannot convert message to []*data.Logs")
+		return
+	}
+	acceptLogs := func(opts userOptions) bool { return opts.acceptLogs }
+	for _, entry := range logs {
+		if entry == nil || entry.Address == "" {
+			continue
+		}
+		// entry.ID is the hex-encoded hash of the transaction that produced this log
+		// (already computed for the Elasticsearch-facing shape; reused here as the
+		// envelope hash so a subscriber can correlate a log back to its transaction).
+		parsed := h.marshalAndPost(event.EvType, entry.Address, entry.ID, entry)
+		if parsed == nil {
+			continue
+		}
+		h.notifyAddressSubscribers(entry.Address, parsed, acceptLogs)
 	}
 }
 
@@ -792,18 +817,18 @@ func (h *SocketHub) HandleClientInsertion(eventType []indexer.EventType, address
 	// an empty address list writes to no map, and deleteAll must still close it.
 	h.clients[c] = struct{}{}
 
-	acceptAccounts, acceptTransactions := h.applyEventTypes(eventType, c)
+	acceptAccounts, acceptTransactions, acceptLogs := h.applyEventTypes(eventType, c)
 	if wantsAddresses {
-		h.addAddressSubscriptions(addresses, c, acceptAccounts, acceptTransactions)
+		h.addAddressSubscriptions(addresses, c, acceptAccounts, acceptTransactions, acceptLogs)
 	}
 	return nil
 }
 
 // containsAddressScoped reports whether eventType includes a type for which the
-// request's addresses are meaningful (ACCOUNTS or USER_TRANSACTIONS).
+// request's addresses are meaningful (ACCOUNTS, USER_TRANSACTIONS or LOGS).
 func containsAddressScoped(eventType []indexer.EventType) bool {
 	for _, t := range eventType {
-		if t == indexer.ACCOUNTS || t == indexer.USER_TRANSACTIONS {
+		if t == indexer.ACCOUNTS || t == indexer.USER_TRANSACTIONS || t == indexer.LOGS {
 			return true
 		}
 	}
@@ -832,7 +857,7 @@ func (h *SocketHub) countNewAddresses(addresses []string, c *client) int {
 
 // applyEventTypes registers the global block/transaction subscriptions for c and returns
 // the per-address accept flags. The caller must hold h.mu.
-func (h *SocketHub) applyEventTypes(eventType []indexer.EventType, c *client) (acceptAccounts, acceptTransactions bool) {
+func (h *SocketHub) applyEventTypes(eventType []indexer.EventType, c *client) (acceptAccounts, acceptTransactions, acceptLogs bool) {
 	for _, t := range eventType {
 		switch t {
 		case indexer.BLOCKS:
@@ -843,14 +868,16 @@ func (h *SocketHub) applyEventTypes(eventType []indexer.EventType, c *client) (a
 			acceptTransactions = true
 		case indexer.ACCOUNTS:
 			acceptAccounts = true
+		case indexer.LOGS:
+			acceptLogs = true
 		}
 	}
-	return acceptAccounts, acceptTransactions
+	return acceptAccounts, acceptTransactions, acceptLogs
 }
 
 // addAddressSubscriptions adds c to each address with the given accept flags, bumping the
 // per-client count for newly added (address, client) pairs. The caller must hold h.mu.
-func (h *SocketHub) addAddressSubscriptions(addresses []string, c *client, acceptAccounts, acceptTransactions bool) {
+func (h *SocketHub) addAddressSubscriptions(addresses []string, c *client, acceptAccounts, acceptTransactions, acceptLogs bool) {
 	for _, address := range addresses {
 		value, ok := h.addressSubscription[address]
 		if !ok {
@@ -868,6 +895,9 @@ func (h *SocketHub) addAddressSubscriptions(addresses []string, c *client, accep
 		}
 		if acceptTransactions {
 			existing.acceptTransaction = true
+		}
+		if acceptLogs {
+			existing.acceptLogs = true
 		}
 		value[c] = existing
 	}
@@ -1050,6 +1080,7 @@ func (h *SocketHub) HandleClientRemoval(eventTypes []indexer.EventType, addresse
 
 	var removeAccounts bool
 	var removeTransactions bool
+	var removeLogs bool
 	for _, t := range eventTypes {
 		switch t {
 		case indexer.BLOCKS:
@@ -1060,15 +1091,17 @@ func (h *SocketHub) HandleClientRemoval(eventTypes []indexer.EventType, addresse
 			removeAccounts = true
 		case indexer.USER_TRANSACTIONS:
 			removeTransactions = true
+		case indexer.LOGS:
+			removeLogs = true
 		}
 	}
 
 	for _, addr := range addresses {
-		h.removeClientFromAddress(addr, c, removeAccounts, removeTransactions)
+		h.removeClientFromAddress(addr, c, removeAccounts, removeTransactions, removeLogs)
 	}
 }
 
-func (h *SocketHub) removeClientFromAddress(addr string, c *client, removeAccounts, removeTransactions bool) {
+func (h *SocketHub) removeClientFromAddress(addr string, c *client, removeAccounts, removeTransactions, removeLogs bool) {
 	clients, ok := h.addressSubscription[addr]
 	if !ok {
 		return
@@ -1083,7 +1116,10 @@ func (h *SocketHub) removeClientFromAddress(addr string, c *client, removeAccoun
 	if removeTransactions {
 		existing.acceptTransaction = false
 	}
-	if !existing.acceptAccount && !existing.acceptTransaction {
+	if removeLogs {
+		existing.acceptLogs = false
+	}
+	if !existing.acceptAccount && !existing.acceptTransaction && !existing.acceptLogs {
 		delete(clients, c)
 		h.decrClientAddresses(c)
 	} else {
