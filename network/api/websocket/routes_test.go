@@ -236,7 +236,7 @@ func TestSubscribeTopics_LogsEventDelivery(t *testing.T) {
 	err = conn.WriteJSON(subReq)
 	require.NoError(t, err)
 
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
 	var subResp socket.WSResponse
 	err = conn.ReadJSON(&subResp)
 	require.NoError(t, err, "expected a response to the dynamic subscribe request")
@@ -250,7 +250,7 @@ func TestSubscribeTopics_LogsEventDelivery(t *testing.T) {
 		},
 	}
 
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
 	var received socket.Send
 	err = conn.ReadJSON(&received)
 	require.NoError(t, err, "expected to receive logs event but got nothing")
