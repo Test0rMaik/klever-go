@@ -21,6 +21,11 @@ type ForkControllerStub struct {
 	FixAuditChangesV5Value       bool
 	EpochConfirmedCalled         bool
 	LastConfirmedEpoch           uint32
+
+	// FixAuditChangesV5Epoch, when non-nil, is the activation epoch answered by
+	// FixAuditChangesV5InEpoch. When nil the stub falls back to FixAuditChangesV5Value, so
+	// the epoch-aware gate matches the boolean one for tests that only set the latter.
+	FixAuditChangesV5Epoch *uint32
 }
 
 func NewForkControllerStub() *ForkControllerStub {
@@ -105,6 +110,7 @@ func (s *ForkControllerStub) SetByConfig(config config.EnableEpochs) {
 	s.FixAuditChangesV3Value = config.FixAuditChangesV3 == 0
 	s.FixAuditChangesV4Value = config.FixAuditChangesV4 == 0
 	s.FixAuditChangesV5Value = config.FixAuditChangesV5 == 0
+	s.FixAuditChangesV5Epoch = &config.FixAuditChangesV5
 	s.LastConfirmedEpoch = 0
 }
 
@@ -181,6 +187,16 @@ func (s *ForkControllerStub) FixAuditChangesV4() bool {
 // FixAuditChangesV5 returns the stubbed value
 func (s *ForkControllerStub) FixAuditChangesV5() bool {
 	return s.FixAuditChangesV5Value
+}
+
+// FixAuditChangesV5InEpoch returns the stubbed value for an explicit epoch, using the
+// configured activation epoch when one was set and the boolean value otherwise
+func (s *ForkControllerStub) FixAuditChangesV5InEpoch(epoch uint32) bool {
+	if s.FixAuditChangesV5Epoch == nil {
+		return s.FixAuditChangesV5Value
+	}
+
+	return epoch >= *s.FixAuditChangesV5Epoch
 }
 
 // EpochConfirmed records that the method was called and stores the epoch

@@ -35,8 +35,7 @@ var MaximumRuntimeInstanceStackSize = uint64(10)
 var _ vmhost.VMHost = (*vmHost)(nil)
 
 const (
-	minExecutionTimeout = time.Millisecond * 400
-	internalVMErrors    = "internalVMErrors"
+	internalVMErrors = "internalVMErrors"
 
 	// importDBExecutionTimeout is used in ExecutionModeReplay (import-db replay). It is
 	// excessively permissive for any real call so that machine-speed differences never turn a
@@ -136,7 +135,7 @@ func createBaseHost(hostParameters *vmhost.VMHostParameters) *vmHost {
 		builtInFuncContainer: hostParameters.BuiltInFuncContainer,
 		kdaTransferParser:    hostParameters.KDATransferParser,
 		callArgsParser:       parsers.NewCallArgsParser(),
-		executionTimeout:     minExecutionTimeout,
+		executionTimeout:     core.MinSCExecutionTimeout,
 		forkController:       hostParameters.ForkController,
 		executionMode:        hostParameters.ExecutionMode,
 	}
@@ -145,7 +144,7 @@ func createBaseHost(hostParameters *vmhost.VMHostParameters) *vmHost {
 // configureTimeouts sets up execution and tolerance timeouts for the VM host
 func configureTimeouts(host *vmHost, hostParameters *vmhost.VMHostParameters) {
 	newExecutionTimeout := time.Duration(hostParameters.TimeOutForSCExecutionInMilliseconds) * time.Millisecond
-	if newExecutionTimeout > minExecutionTimeout {
+	if newExecutionTimeout > core.MinSCExecutionTimeout {
 		host.executionTimeout = newExecutionTimeout
 	}
 

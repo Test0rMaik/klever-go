@@ -128,6 +128,11 @@ func (hhs *HeaderHandlerStub) GetTxHashes() [][]byte {
 	return nil
 }
 
+// GetTxResults --
+func (hhs *HeaderHandlerStub) GetTxResults() []uint32 {
+	return nil
+}
+
 // Clone --
 func (hhs *HeaderHandlerStub) Clone() data.HeaderHandler {
 	panic("implement me")

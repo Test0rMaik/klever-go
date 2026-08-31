@@ -241,6 +241,26 @@ func (bp *baseProcessor) validateBlockAndSlot(headerHandler data.HeaderHandler) 
 		return process.ErrInvalidTXCount
 	}
 
+	// TxResults carries one consensus result code per transaction and is what the validator
+	// compares its own execution against (KLR-63). A proposer always fills it in lockstep with
+	// TxHashes, so any other length is malformed - and an omitted list would silently skip the
+	// comparison altogether. The field is not covered by the tx root hash yet, so this only bounds
+	// the shape of the list, not its contents.
+	//
+	// The gate is derived from the header's own epoch, not from the notifier's current one:
+	// ProcessBlock reaches here (block.go:127) before it advances the notifier (block.go:167),
+	// so the flag would still hold the previous epoch's value and skip this check on the very
+	// first block of the activation epoch - the one block commitBlock would then reject, after
+	// the whole block had already been executed with the per-tx comparison bypassed.
+	if bp.forkController.FixAuditChangesV5InEpoch(headerHandler.GetEpoch()) &&
+		len(headerHandler.GetTxResults()) != len(headerHandler.GetTxHashes()) {
+		log.Error("checkBlockValidity tx results count does not match",
+			"txResults", len(headerHandler.GetTxResults()),
+			"txHashes", len(headerHandler.GetTxHashes()))
+
+		return process.ErrInvalidTXResultsCount
+	}
+
 	burnnedTxFees := headerHandler.GetTxFees() - bp.validatorStatisticsProcessor.LeaderRewards(headerHandler.GetTxFees())
 	if headerHandler.GetTxBurnedFees() != burnnedTxFees {
 		return process.ErrInvalidTXFees

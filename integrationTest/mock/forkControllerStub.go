@@ -1,21 +1,22 @@
 package mock
 
 type ForkControllerStub struct {
-	ProcessorFlowITOPriceCalled   func() bool
-	ClaimKFICalled                func() bool
-	FixStakingBucketsCalled       func() bool
-	KdaFprCalled                  func() bool
-	BigBucketsComputeCalled       func() bool
-	FPRComputeAndKdaFeeFlowCalled func() bool
-	FixDelegationSameEpochCalled  func() bool
-	EnableSmartContractsCalled    func() bool
-	FixAuditChangesCalled         func() bool
-	EpochRewardsV2Called          func() bool
-	FixAuditChangesV2Called       func() bool
-	FixMarketBuyOverflowCalled    func() bool
-	FixAuditChangesV3Called       func() bool
-	FixAuditChangesV4Called       func() bool
-	FixAuditChangesV5Called       func() bool
+	ProcessorFlowITOPriceCalled    func() bool
+	ClaimKFICalled                 func() bool
+	FixStakingBucketsCalled        func() bool
+	KdaFprCalled                   func() bool
+	BigBucketsComputeCalled        func() bool
+	FPRComputeAndKdaFeeFlowCalled  func() bool
+	FixDelegationSameEpochCalled   func() bool
+	EnableSmartContractsCalled     func() bool
+	FixAuditChangesCalled          func() bool
+	EpochRewardsV2Called           func() bool
+	FixAuditChangesV2Called        func() bool
+	FixMarketBuyOverflowCalled     func() bool
+	FixAuditChangesV3Called        func() bool
+	FixAuditChangesV4Called        func() bool
+	FixAuditChangesV5Called        func() bool
+	FixAuditChangesV5InEpochCalled func(epoch uint32) bool
 }
 
 // ProcessorFlowITOPrice -
@@ -140,6 +141,14 @@ func (fc *ForkControllerStub) FixAuditChangesV5() bool {
 	}
 
 	return false
+}
+
+func (fc *ForkControllerStub) FixAuditChangesV5InEpoch(epoch uint32) bool {
+	if fc.FixAuditChangesV5InEpochCalled != nil {
+		return fc.FixAuditChangesV5InEpochCalled(epoch)
+	}
+
+	return fc.FixAuditChangesV5()
 }
 
 // IsInterfaceNil -

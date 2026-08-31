@@ -54,6 +54,7 @@ type HeaderHandler interface {
 
 	GetBlockHeader() interface{}
 	GetTxHashes() [][]byte
+	GetTxResults() []uint32
 	ComputeRootHash(hasher hashing.Hasher) ([]byte, error)
 
 	IsInterfaceNil() bool

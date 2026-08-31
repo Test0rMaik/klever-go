@@ -318,3 +318,9 @@ const BucketIDSize = 32
 
 // DefaultTolerancePercentage is the default tolerance for SC execution timeout when is not configured
 const DefaultTolerancePercentage = 15
+
+// MinSCExecutionTimeout is the floor the VM host clamps the configured SC execution timeout to
+// (see hostCore.configureTimeouts). A node with timeOutForSCExecutionInMilliseconds unset or
+// below this value still executes contracts with this timeout, so any consumer deriving a bound
+// from the raw config value has to apply the same floor or the two halves of the mechanism drift.
+const MinSCExecutionTimeout = time.Millisecond * 400

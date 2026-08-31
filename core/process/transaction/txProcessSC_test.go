@@ -1,11 +1,15 @@
 package transaction_test
 
 import (
+	"errors"
 	"testing"
 	"time"
 
 	commonMock "github.com/klever-io/klever-go/common/mock"
+	"github.com/klever-io/klever-go/config"
+	"github.com/klever-io/klever-go/core/fork"
 	"github.com/klever-io/klever-go/core/kapp"
+	"github.com/klever-io/klever-go/core/process"
 	"github.com/klever-io/klever-go/data"
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/data/transaction"
@@ -109,51 +113,115 @@ func TestProcessTransaction_TxResultsValidation_LocalFailConsensusSuccess(t *tes
 	assert.NotNil(t, err, "Should return error indicating result mismatch")
 }
 
-// TestProcessTransaction_TxResultsValidation_LocalSuccessConsensusFail tests
-// when local execution succeeds but consensus says it failed.
+// TestProcessTransaction_TxResultsValidation_LocalSuccessConsensusFail pins KLR-63 CASE 1b: a
+// proposer that marks a locally successful transaction with a *deterministic* failure code instead
+// of the timeout code. VMUserError (57), VMOutOfGas (58) and Fail (99) cannot be produced by a slow
+// leader, so there is no timing argument to weigh - the block is rejected outright and the forged
+// code is never stamped onto the transaction. Before this fix these codes matched neither CASE 1
+// (keyed to VMExecutionFailed) nor CASE 2 and fell through to the always-nil localErr, so the block
+// was accepted while carrying a result contradicting the state it committed.
 func TestProcessTransaction_TxResultsValidation_LocalSuccessConsensusFail(t *testing.T) {
 	t.Parallel()
 
-	args := createArgsForTxProcessor()
+	// Local execution succeeds; the execution time is irrelevant on this path, so it is set well
+	// inside the tolerance band to prove the rejection carries no timing precondition.
+	newProcessor := func(t *testing.T, mode vmcommon.ExecutionMode, enableEpochs *config.EnableEpochs) (process.TransactionProcessor, *transaction.Transaction, []byte) {
+		args := createArgsForTxProcessor()
+		args.ScProcessor = &commonMock.SCProcessorMock{
+			ExecutionMode: mode,
+			ExecuteSmartContractTransactionCalled: func(ctx kapp.KappContext, tc data.SmartContractHandler, acntSrc, acntDst state.UserAccountHandler) (vmcommon.ReturnCode, error) {
+				ctx.SetExecutionTime(100 * time.Millisecond)
+				return vmcommon.Ok, nil // Local succeeds (result code 0)
+			},
+		}
+		if enableEpochs != nil {
+			forkController, err := fork.NewForkController(*enableEpochs, &commonMock.EpochNotifierStub{})
+			require.Nil(t, err)
+			args.ForkController = forkController
+		}
 
-	// Mock SC processor to simulate successful execution
-	args.ScProcessor = &commonMock.SCProcessorMock{
-		ExecuteSmartContractTransactionCalled: func(ctx kapp.KappContext, tc data.SmartContractHandler, acntSrc, acntDst state.UserAccountHandler) (vmcommon.ReturnCode, error) {
-			ctx.SetExecutionTime(100 * time.Millisecond)
-			return vmcommon.Ok, nil // Local succeeds (result code 0)
-		},
+		execTx := NewTXProcessor(t, args)
+
+		AddBalanceAccount(args.AccountsCacher, 10_000_000, nil, testOwnerAddress)
+		AddBalanceAccount(args.AccountsCacher, 0, nil, testToAddress)
+		_ = args.AccountsCacher.SaveAll()
+
+		scContract := transaction.SmartContract{
+			Type:    transaction.SmartContract_SCInvoke,
+			Address: testToAddress,
+		}
+		tx, _ := createTransactionMock(&scContract, transaction.TXContract_SmartContractType, testOwnerAddress, 0)
+		tx.RawData.Data = [][]byte{[]byte("invokeFunction")}
+
+		_, hash, err := execTx.PreProcessTransaction(tx)
+		require.Nil(t, err)
+
+		return execTx, tx, hash
 	}
 
-	execTx := NewTXProcessor(t, args)
-
-	AddBalanceAccount(args.AccountsCacher, 10_000_000, nil, testOwnerAddress)
-	AddBalanceAccount(args.AccountsCacher, 0, nil, testToAddress)
-	_ = args.AccountsCacher.SaveAll()
-
-	scContract := transaction.SmartContract{
-		Type:    transaction.SmartContract_SCInvoke,
-		Address: testToAddress,
+	deterministicFailures := []struct {
+		name string
+		code transaction.Transaction_TXResultCode
+	}{
+		{name: "VMUserError", code: transaction.Transaction_VMUserError},
+		{name: "VMOutOfGas", code: transaction.Transaction_VMOutOfGas},
+		{name: "Fail", code: transaction.Transaction_Fail},
 	}
-	tx, _ := createTransactionMock(&scContract, transaction.TXContract_SmartContractType, testOwnerAddress, 0)
-	tx.RawData.Data = [][]byte{[]byte("invokeFunction")}
 
-	_, hash, err := execTx.PreProcessTransaction(tx)
-	require.Nil(t, err)
+	for _, tc := range deterministicFailures {
+		t.Run(tc.name+" rejects the block", func(t *testing.T) {
+			t.Parallel()
 
-	// Consensus says failure, but local execution succeeded
-	block := createBlockHeader()
-	block.TxHashes = [][]byte{hash}
-	block.TxResults = []uint32{57} // Consensus: VMUserError
+			execTx, tx, hash := newProcessor(t, vmcommon.ExecutionModeValidator, nil)
 
-	// Process - local returns 0 (Ok), consensus expects 57 → MISMATCH
-	err = execTx.ProcessTransaction(block, hash, tx)
+			blk := createBlockHeader()
+			blk.TxHashes = [][]byte{hash}
+			blk.TxResults = []uint32{uint32(tc.code)}
 
-	// When local succeeds but consensus fails, the validation detects the mismatch
-	// but the transaction still succeeds locally with result code 0
-	// The mismatch is logged for monitoring purposes
-	assert.Nil(t, err, "Transaction completes successfully despite mismatch")
-	// Local execution succeeded, so ResultCode remains 0
-	assert.Equal(t, transaction.Transaction_Ok, tx.ResultCode)
+			err := execTx.ProcessTransaction(blk, hash, tx)
+
+			require.Error(t, err, "a forged non-timeout failure must not report success to processBlockTxs")
+			assert.True(t, errors.Is(err, process.ErrTransactionResultMismatch),
+				"the block is only rejected as a whole when the sentinel survives ProcessTransaction, got: %v", err)
+			// The forged consensus result must never be adopted
+			assert.Equal(t, transaction.Transaction_Ok, tx.ResultCode)
+		})
+	}
+
+	// The replay short-circuit is scoped to the timeout code: a deterministic failure that local
+	// re-execution contradicts is a real determinism break, not agreed history to reproduce.
+	t.Run("Observer rejects too", func(t *testing.T) {
+		t.Parallel()
+
+		execTx, tx, hash := newProcessor(t, vmcommon.ExecutionModeReplay, nil)
+
+		blk := createBlockHeader()
+		blk.TxHashes = [][]byte{hash}
+		blk.TxResults = []uint32{uint32(transaction.Transaction_VMUserError)}
+
+		err := execTx.ProcessTransaction(blk, hash, tx)
+
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, process.ErrTransactionResultMismatch), "got: %v", err)
+		assert.Equal(t, transaction.Transaction_Ok, tx.ResultCode)
+	})
+
+	// Pre-fork the legacy always-nil localErr is returned, so replay of historical blocks is
+	// byte-identical. Deleting the gate would break it silently without this case.
+	t.Run("fork disabled: legacy acceptance preserved", func(t *testing.T) {
+		t.Parallel()
+
+		execTx, tx, hash := newProcessor(t, vmcommon.ExecutionModeValidator, &config.EnableEpochs{FixAuditChangesV5: 1000})
+
+		blk := createBlockHeader()
+		blk.TxHashes = [][]byte{hash}
+		blk.TxResults = []uint32{uint32(transaction.Transaction_VMUserError)}
+
+		err := execTx.ProcessTransaction(blk, hash, tx)
+
+		assert.Nil(t, err, "pre-fork behaviour must be unchanged")
+		assert.Equal(t, transaction.Transaction_Ok, tx.ResultCode)
+	})
 }
 
 // TestProcessTransaction_TxResultsValidation_BothFailDifferentErrors tests
@@ -324,5 +392,64 @@ func TestProcessTransaction_TxResultsValidation_TxNotInBlock(t *testing.T) {
 
 	// Should succeed - validation skipped because tx not found in block (findTxIndexInBlock returns -1)
 	assert.Nil(t, err, "Should succeed when transaction not found in block")
+	assert.Equal(t, transaction.Transaction_Ok, tx.ResultCode)
+}
+
+// TestProcessTransaction_TxResultsValidation_FastLocalSuccessRejectsBlock pins the end of the
+// KLR-63 path: a local success far below the tolerance band contradicts a consensus
+// VMExecutionFailed, and the rejection has to survive ProcessTransaction as the sentinel
+// processBlockTxs unwraps. The sentinel travels through the shared kAppFeeErr variable and an error
+// path that resets receipts and reverts fees, so wrapping it anywhere in between silently disables
+// the fix - the unit tests on validateToleranceBand would stay green.
+func TestProcessTransaction_TxResultsValidation_FastLocalSuccessRejectsBlock(t *testing.T) {
+	t.Parallel()
+
+	args := createArgsForTxProcessor()
+	// Without a configured timeout the lower bound is zero and no execution time can fall below it
+	args.Cfg = config.Config{
+		VirtualMachine: config.VirtualMachineServicesConfig{
+			Execution: config.VirtualMachineConfig{
+				TimeOutForSCExecutionInMilliseconds: 500, // lower bound = 500ms - 15% = 425ms
+				TimeOutTolerancePercentage:          15,
+			},
+		},
+	}
+
+	// Live validation path, and 10ms is nowhere near the 425ms bound: no honest leader could have
+	// timed out on this transaction
+	args.ScProcessor = &commonMock.SCProcessorMock{
+		ExecutionMode: vmcommon.ExecutionModeValidator,
+		ExecuteSmartContractTransactionCalled: func(ctx kapp.KappContext, tc data.SmartContractHandler, acntSrc, acntDst state.UserAccountHandler) (vmcommon.ReturnCode, error) {
+			ctx.SetExecutionTime(10 * time.Millisecond)
+			return vmcommon.Ok, nil
+		},
+	}
+
+	execTx := NewTXProcessor(t, args)
+
+	AddBalanceAccount(args.AccountsCacher, 10_000_000, nil, testOwnerAddress)
+	AddBalanceAccount(args.AccountsCacher, 0, nil, testToAddress)
+	_ = args.AccountsCacher.SaveAll()
+
+	scContract := transaction.SmartContract{
+		Type:    transaction.SmartContract_SCInvoke,
+		Address: testToAddress,
+	}
+	tx, _ := createTransactionMock(&scContract, transaction.TXContract_SmartContractType, testOwnerAddress, 0)
+	tx.RawData.Data = [][]byte{[]byte("invokeFunction")}
+
+	_, hash, err := execTx.PreProcessTransaction(tx)
+	require.Nil(t, err)
+
+	block := createBlockHeader()
+	block.TxHashes = [][]byte{hash}
+	block.TxResults = []uint32{uint32(transaction.Transaction_VMExecutionFailed)}
+
+	err = execTx.ProcessTransaction(block, hash, tx)
+
+	require.Error(t, err, "a fast local success must not report success to processBlockTxs")
+	assert.True(t, errors.Is(err, process.ErrTransactionResultMismatch),
+		"the block is only rejected as a whole when the sentinel survives ProcessTransaction, got: %v", err)
+	// The forged consensus result must never be adopted
 	assert.Equal(t, transaction.Transaction_Ok, tx.ResultCode)
 }

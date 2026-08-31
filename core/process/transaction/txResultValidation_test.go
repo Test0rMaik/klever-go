@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/klever-io/klever-go/config"
+	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/core/kapp"
 	"github.com/klever-io/klever-go/core/process"
 	"github.com/klever-io/klever-go/data"
@@ -59,7 +60,13 @@ func TestGetActualResultCode(t *testing.T) {
 	})
 }
 
-// TestValidateToleranceBand_LeaderWeakHardware tests rejection when leader hardware is too weak
+// TestValidateToleranceBand_LeaderWeakHardware tests rejection when leader hardware is too weak.
+// KLR-63: a malicious proposer marks a locally-successful transaction as VMExecutionFailed in
+// TxResults while publishing the *successful* state root, so the downstream verifyBlockTrieRoots
+// comparison matches and cannot catch the lie. From FixAuditChangesV5 on, the rejection is an
+// explicit non-nil error instead of the (always nil) localErr, so it propagates out of
+// ProcessTransaction and rejects the block - and it has to be the sentinel processBlockTxs unwraps,
+// or the block is dropped as a "bad tx" instead of rejected as a whole.
 func TestValidateToleranceBand_LeaderWeakHardware(t *testing.T) {
 	t.Parallel()
 
@@ -72,27 +79,68 @@ func TestValidateToleranceBand_LeaderWeakHardware(t *testing.T) {
 		},
 	}
 
-	txProc := &txProcessor{
-		baseTxProcessor: &baseTxProcessor{
-			cfg: cfg,
-		},
-	}
-
-	tx := &transaction.Transaction{}
-	txHash := []byte("test-hash")
-	expectedResultCode := uint32(transaction.Transaction_VMExecutionFailed)
-
 	// Validator finished in 400ms (well below 425ms lower bound)
 	// Lower bound = 500ms - (500ms * 15%) = 425ms
 	// Leader should have succeeded -> REJECT block
 	validatorTimeNs := int64(400 * time.Millisecond)
 	localErr := error(nil) // Validator succeeded
+	expectedResultCode := uint32(transaction.Transaction_VMExecutionFailed)
+	txHash := []byte("test-hash")
 
-	err := txProc.validateToleranceBand(txHash, tx, expectedResultCode, validatorTimeNs, localErr)
+	t.Run("fork enabled: explicit mismatch error", func(t *testing.T) {
+		t.Parallel()
 
-	assert.Equal(t, localErr, err)
-	// ResultCode should NOT be updated when rejecting
-	assert.Equal(t, transaction.Transaction_TXResultCode(0), tx.ResultCode)
+		txProc := &txProcessor{
+			baseTxProcessor: &baseTxProcessor{
+				cfg:            cfg,
+				forkController: &forkControllerStub{fixAuditChangesV5: true},
+			},
+		}
+		tx := &transaction.Transaction{}
+
+		err := txProc.validateToleranceBand(txHash, tx, expectedResultCode, validatorTimeNs, localErr)
+
+		assert.Equal(t, process.ErrTransactionResultMismatch, err)
+		// ResultCode must NOT be updated when rejecting
+		assert.Equal(t, transaction.Transaction_TXResultCode(0), tx.ResultCode)
+		assert.Equal(t, transaction.Transaction_TXResult(0), tx.Result)
+	})
+
+	t.Run("fork enabled: far below the bound", func(t *testing.T) {
+		t.Parallel()
+
+		txProc := &txProcessor{
+			baseTxProcessor: &baseTxProcessor{
+				cfg:            cfg,
+				forkController: &forkControllerStub{fixAuditChangesV5: true},
+			},
+		}
+		tx := &transaction.Transaction{}
+
+		// 10ms: nowhere near the 425ms lower bound, so no honest leader could have timed out on it
+		err := txProc.validateToleranceBand(txHash, tx, expectedResultCode, int64(10*time.Millisecond), localErr)
+
+		assert.Equal(t, process.ErrTransactionResultMismatch, err)
+		assert.Equal(t, transaction.Transaction_TXResultCode(0), tx.ResultCode)
+		assert.Equal(t, transaction.Transaction_TXResult(0), tx.Result)
+	})
+
+	t.Run("fork disabled: legacy nil localErr preserved", func(t *testing.T) {
+		t.Parallel()
+
+		txProc := &txProcessor{
+			baseTxProcessor: &baseTxProcessor{
+				cfg:            cfg,
+				forkController: &forkControllerStub{fixAuditChangesV5: false},
+			},
+		}
+		tx := &transaction.Transaction{}
+
+		err := txProc.validateToleranceBand(txHash, tx, expectedResultCode, validatorTimeNs, localErr)
+
+		assert.Equal(t, localErr, err)
+		assert.Equal(t, transaction.Transaction_TXResultCode(0), tx.ResultCode)
+	})
 }
 
 // TestValidateToleranceBand_LeaderRightToFail tests acceptance when leader had right to fail
@@ -110,7 +158,8 @@ func TestValidateToleranceBand_LeaderRightToFail(t *testing.T) {
 
 	txProc := &txProcessor{
 		baseTxProcessor: &baseTxProcessor{
-			cfg: cfg,
+			cfg:            cfg,
+			forkController: &forkControllerStub{fixAuditChangesV5: true},
 		},
 	}
 
@@ -146,7 +195,8 @@ func TestValidateToleranceBand_ExactlyAtLowerBound(t *testing.T) {
 
 	txProc := &txProcessor{
 		baseTxProcessor: &baseTxProcessor{
-			cfg: cfg,
+			cfg:            cfg,
+			forkController: &forkControllerStub{fixAuditChangesV5: true},
 		},
 	}
 
@@ -181,7 +231,8 @@ func TestValidateToleranceBand_DefaultTolerance(t *testing.T) {
 
 	txProc := &txProcessor{
 		baseTxProcessor: &baseTxProcessor{
-			cfg: cfg,
+			cfg:            cfg,
+			forkController: &forkControllerStub{fixAuditChangesV5: true},
 		},
 	}
 
@@ -214,7 +265,8 @@ func TestValidateToleranceBand_ToleranceOver100(t *testing.T) {
 
 	txProc := &txProcessor{
 		baseTxProcessor: &baseTxProcessor{
-			cfg: cfg,
+			cfg:            cfg,
+			forkController: &forkControllerStub{fixAuditChangesV5: true},
 		},
 	}
 
@@ -232,6 +284,89 @@ func TestValidateToleranceBand_ToleranceOver100(t *testing.T) {
 	// Should accept (tolerance capped at 100%)
 	assert.Equal(t, process.ErrTransactionResultMismatchAcceptLeader, err)
 	assert.Equal(t, transaction.Transaction_TXResultCode(expectedResultCode), tx.ResultCode)
+}
+
+// TestValidateToleranceBand_UnconfiguredBaseTimeout covers the node that never set
+// timeOutForSCExecutionInMilliseconds (or set it below the floor). The VM host clamps that config
+// value to core.MinSCExecutionTimeout before executing, so the bound has to be derived from the
+// same floor. Taking the raw 0 instead gives a zero lower bound, and since the call site only
+// reaches here with validatorExecutionTimeNs > 0, no execution time can ever fall below it: the
+// rejection becomes unreachable and the node stamps FAILED onto a transaction that succeeded.
+func TestValidateToleranceBand_UnconfiguredBaseTimeout(t *testing.T) {
+	t.Parallel()
+
+	// Floored base = 400ms, tolerance 15% -> lower bound = 400ms - 60ms = 340ms
+	newCfg := func(baseTimeoutMs uint32) config.Config {
+		return config.Config{
+			VirtualMachine: config.VirtualMachineServicesConfig{
+				Execution: config.VirtualMachineConfig{
+					TimeOutForSCExecutionInMilliseconds: baseTimeoutMs,
+					TimeOutTolerancePercentage:          15,
+				},
+			},
+		}
+	}
+	newTxProc := func(cfg config.Config, fixActive bool) *txProcessor {
+		return &txProcessor{
+			baseTxProcessor: &baseTxProcessor{
+				cfg:            cfg,
+				forkController: &forkControllerStub{fixAuditChangesV5: fixActive},
+			},
+		}
+	}
+
+	txHash := []byte("test-hash")
+	expectedResultCode := uint32(transaction.Transaction_VMExecutionFailed)
+
+	t.Run("unset timeout still rejects a fast local success", func(t *testing.T) {
+		t.Parallel()
+
+		tx := &transaction.Transaction{}
+		err := newTxProc(newCfg(0), true).
+			validateToleranceBand(txHash, tx, expectedResultCode, int64(50*time.Millisecond), nil)
+
+		assert.Equal(t, process.ErrTransactionResultMismatch, err)
+		assert.Equal(t, transaction.Transaction_TXResultCode(0), tx.ResultCode)
+	})
+
+	t.Run("timeout below the floor is raised to it", func(t *testing.T) {
+		t.Parallel()
+
+		// 100ms configured: without the floor the bound would be 85ms and a 300ms local execution
+		// would look like a justified leader timeout.
+		tx := &transaction.Transaction{}
+		err := newTxProc(newCfg(100), true).
+			validateToleranceBand(txHash, tx, expectedResultCode, int64(300*time.Millisecond), nil)
+
+		assert.Equal(t, process.ErrTransactionResultMismatch, err)
+		assert.Equal(t, transaction.Transaction_TXResultCode(0), tx.ResultCode)
+	})
+
+	t.Run("unset timeout still accepts inside the floored band", func(t *testing.T) {
+		t.Parallel()
+
+		// 350ms is above the 340ms lower bound, so the leader keeps the right to fail: the floor
+		// must not turn into a blanket rejection.
+		tx := &transaction.Transaction{}
+		err := newTxProc(newCfg(0), true).
+			validateToleranceBand(txHash, tx, expectedResultCode, int64(350*time.Millisecond), nil)
+
+		assert.Equal(t, process.ErrTransactionResultMismatchAcceptLeader, err)
+		assert.Equal(t, transaction.Transaction_TXResultCode(expectedResultCode), tx.ResultCode)
+	})
+
+	t.Run("fork disabled: bound stays on the raw config value", func(t *testing.T) {
+		t.Parallel()
+
+		// Legacy behaviour, kept byte-identical for pre-fork replay: base 0 -> lower bound 0, so
+		// the 50ms local success lands at or above it and the consensus failure is adopted.
+		tx := &transaction.Transaction{}
+		err := newTxProc(newCfg(0), false).
+			validateToleranceBand(txHash, tx, expectedResultCode, int64(50*time.Millisecond), nil)
+
+		assert.Equal(t, process.ErrTransactionResultMismatchAcceptLeader, err)
+		assert.Equal(t, transaction.Transaction_TXResultCode(expectedResultCode), tx.ResultCode)
+	})
 }
 
 // TestHandleResultMismatch_ValidatorSucceededLeaderFailed tests CASE 1
@@ -254,8 +389,9 @@ func TestHandleResultMismatch_ValidatorSucceededLeaderFailed(t *testing.T) {
 
 	txProc := &txProcessor{
 		baseTxProcessor: &baseTxProcessor{
-			cfg:         cfg,
-			scProcessor: mockSC,
+			cfg:            cfg,
+			scProcessor:    mockSC,
+			forkController: &forkControllerStub{fixAuditChangesV5: true},
 		},
 	}
 
@@ -278,10 +414,9 @@ func TestHandleResultMismatch_ValidatorSucceededLeaderFailed(t *testing.T) {
 		vmcommon.ExecutionModeValidator,
 	)
 
-	// Should reject because leader hardware too weak
-	// Note: With the current implementation, when rejecting, it returns localErr (nil in this case)
-	// This means the function returns nil, even though the log says "Rejecting block"
-	assert.Equal(t, nil, err)
+	// Rejects because leader hardware too weak, with an error that actually propagates (KLR-63)
+	assert.Equal(t, process.ErrTransactionResultMismatch, err)
+	assert.Equal(t, transaction.Transaction_TXResultCode(0), tx.ResultCode)
 }
 
 // TestHandleResultMismatch_LeaderSucceededValidatorFailed tests CASE 2 for Validator
@@ -387,7 +522,9 @@ func TestHandleResultMismatch_ImportDB_ReproducesConsensusFailure(t *testing.T) 
 	assert.Equal(t, transaction.Transaction_FAILED, tx.Result)
 }
 
-func TestHandleResultMismatch_LivePathUnchanged_FastValidator(t *testing.T) {
+// A fast local success in Validator mode routes through the tolerance band, not the Observer
+// short-circuit, so the block is rejected and the consensus ResultCode is never stamped.
+func TestHandleResultMismatch_ValidatorMode_FastLocalSuccessRejects(t *testing.T) {
 	t.Parallel()
 
 	cfg := config.Config{
@@ -402,8 +539,9 @@ func TestHandleResultMismatch_LivePathUnchanged_FastValidator(t *testing.T) {
 
 	txProc := &txProcessor{
 		baseTxProcessor: &baseTxProcessor{
-			cfg:         cfg,
-			scProcessor: &mockSmartContractProcessor{executionMode: vmcommon.ExecutionModeValidator},
+			cfg:            cfg,
+			scProcessor:    &mockSmartContractProcessor{executionMode: vmcommon.ExecutionModeValidator},
+			forkController: &forkControllerStub{fixAuditChangesV5: true},
 		},
 	}
 
@@ -415,8 +553,9 @@ func TestHandleResultMismatch_LivePathUnchanged_FastValidator(t *testing.T) {
 
 	err := txProc.handleResultMismatch(txHash, 0, tx, nil, expectedResultCode, actualResultCode, validatorTimeNs, vmcommon.ExecutionModeValidator)
 
-	// Live path unchanged: returns localErr (nil), ResultCode not updated.
-	assert.Equal(t, nil, err)
+	// Live path still routes through the tolerance band (not the Observer short-circuit): the fast
+	// local success rejects the block and never stamps the consensus ResultCode.
+	assert.Equal(t, process.ErrTransactionResultMismatch, err)
 	assert.Equal(t, transaction.Transaction_TXResultCode(0), tx.ResultCode)
 }
 
@@ -526,8 +665,9 @@ func TestValidateTransactionResult_CallsHandleResultMismatch(t *testing.T) {
 
 	txProc := &txProcessor{
 		baseTxProcessor: &baseTxProcessor{
-			cfg:         cfg,
-			scProcessor: mockSC,
+			cfg:            cfg,
+			scProcessor:    mockSC,
+			forkController: &forkControllerStub{fixAuditChangesV5: true},
 		},
 	}
 
@@ -563,7 +703,7 @@ func TestValidateTransactionResult_CallsHandleResultMismatch(t *testing.T) {
 		err := txProc.validateTransactionResult(blk, txHash, tx, localErr, validatorTimeNs)
 
 		// Should reject (leader hardware too weak)
-		assert.Nil(t, err)                                                      // Returns localErr which is nil
+		assert.Equal(t, process.ErrTransactionResultMismatch, err)
 		assert.Equal(t, transaction.Transaction_TXResultCode(0), tx.ResultCode) // Not updated
 	})
 
@@ -624,8 +764,9 @@ func TestValidateTransactionResult_ObserverModePlumbing(t *testing.T) {
 	newTxProc := func(mode vmcommon.ExecutionMode) *txProcessor {
 		return &txProcessor{
 			baseTxProcessor: &baseTxProcessor{
-				cfg:         cfg,
-				scProcessor: &mockSmartContractProcessor{executionMode: mode},
+				cfg:            cfg,
+				scProcessor:    &mockSmartContractProcessor{executionMode: mode},
+				forkController: &forkControllerStub{fixAuditChangesV5: true},
 			},
 		}
 	}
@@ -649,14 +790,27 @@ func TestValidateTransactionResult_ObserverModePlumbing(t *testing.T) {
 		assert.Equal(t, transaction.Transaction_VMExecutionFailed, tx.ResultCode)
 	})
 
-	t.Run("Validator at the same 50ms returns nil via the tolerance band", func(t *testing.T) {
+	t.Run("Validator at the same 50ms rejects via the tolerance band", func(t *testing.T) {
 		tx := &transaction.Transaction{}
 		err := newTxProc(vmcommon.ExecutionModeValidator).
 			validateTransactionResult(newBlock(), txHash, tx, nil, fastLocal)
 
-		assert.Nil(t, err)
+		// Same input, opposite outcome from Observer: the leader had no right to fail this fast,
+		// so the block is rejected and the consensus ResultCode is never adopted.
+		assert.Equal(t, process.ErrTransactionResultMismatch, err)
 		assert.Equal(t, transaction.Transaction_TXResultCode(0), tx.ResultCode)
 	})
+}
+
+// forkControllerStub overrides only the flag under test. Every other core.ForkController method is
+// promoted from the embedded nil interface, so an unexpected call panics instead of passing silently.
+type forkControllerStub struct {
+	core.ForkController
+	fixAuditChangesV5 bool
+}
+
+func (f *forkControllerStub) FixAuditChangesV5() bool {
+	return f.fixAuditChangesV5
 }
 
 type mockSmartContractProcessor struct {

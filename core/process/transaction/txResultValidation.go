@@ -16,8 +16,11 @@ import (
 //
 // The validation behaves differently based on the VM execution mode:
 //   - Validator (live): re-judges a timeout mismatch via the tolerance band (KLC-1894)
-//   - Observer (import-db replay): treats the recorded consensus result as ground truth and reproduces
-//     it, never re-deriving pass/fail from local wall-clock timing (see CASE 1 in handleResultMismatch)
+//   - Observer (import-db replay): treats a recorded *timeout* as ground truth and reproduces it,
+//     never re-deriving pass/fail from local wall-clock timing (see CASE 1a in handleResultMismatch)
+//
+// A consensus failure code that is not the timeout code is deterministic, so a local success
+// contradicting it is rejected in every mode (CASE 1b).
 //
 // Parameters:
 //   - block: The block containing consensus results in TxResults field
@@ -120,10 +123,15 @@ func (txProc *txProcessor) logResultMismatch(
 // handleResultMismatch processes different transaction result mismatch scenarios and determines
 // whether to accept or reject the block based on the mismatch type and the execution mode.
 //
-// Three main scenarios are handled:
-//  1. Local succeeded, consensus recorded a timeout failure:
+// Scenarios handled:
+//  1. Local succeeded, consensus recorded a failure:
+//     a. the failure is VMExecutionFailed (the timeout code), which a slow leader can legitimately
+//     produce:
 //     - Observer (import-db replay): reproduce the recorded failure and revert the local success
 //     - Validator (live): check the tolerance band to decide if the leader's timeout was justified
+//     b. the failure is any other code (VMUserError, VMOutOfGas, Fail, ...), which is deterministic
+//     and cannot be explained by leader slowness: reject the block outright, in every mode
+//     (KLR-63, from FixAuditChangesV5 on)
 //  2. Consensus succeeded, but local failed: reject the block
 //  3. Both failed with different errors: bubble up the local error
 //
@@ -151,21 +159,49 @@ func (txProc *txProcessor) handleResultMismatch(
 	okCode := uint32(transaction.Transaction_Ok)
 	vmFailedCode := uint32(transaction.Transaction_VMExecutionFailed)
 
-	// CASE 1: local succeeded, consensus recorded VMExecutionFailed
-	if actualResultCode == okCode && expectedResultCode == vmFailedCode {
-		// Observer (import-db replay): the recorded VMExecutionFailed is agreed history, not a live
-		// leader to judge. Reproduce it and let the preprocessor revert the completed local execution
-		// so the account state root matches the recorded root - never re-derive pass/fail from local
-		// wall-clock timing (the tolerance band below, KLC-1894, is Validator/live-only).
-		if executionMode == vmcommon.ExecutionModeReplay {
-			log.Warn("Observer: transaction result mismatch - Accepting leader failure (import-db mode)",
-				"txHash", txHash,
-				"expectedResult", expectedResultCode,
-				"actualResult", actualResultCode,
-				"txIndex", txIndex)
-			return acceptConsensusFailure(tx, expectedResultCode)
+	// CASE 1: local succeeded, consensus recorded a failure of any kind.
+	if actualResultCode == okCode && expectedResultCode != okCode {
+		// CASE 1a: the consensus failure is the timeout code, so the leader may have a legitimate
+		// hardware excuse and the tolerance band gets to judge it.
+		if expectedResultCode == vmFailedCode {
+			// Observer (import-db replay): the recorded VMExecutionFailed is agreed history, not a
+			// live leader to judge. Reproduce it and let the preprocessor revert the completed local
+			// execution so the account state root matches the recorded root - never re-derive
+			// pass/fail from local wall-clock timing (the tolerance band, KLC-1894, is
+			// Validator/live-only).
+			if executionMode == vmcommon.ExecutionModeReplay {
+				log.Warn("Observer: transaction result mismatch - Accepting leader failure (import-db mode)",
+					"txHash", txHash,
+					"expectedResult", expectedResultCode,
+					"actualResult", actualResultCode,
+					"txIndex", txIndex)
+				return acceptConsensusFailure(tx, expectedResultCode)
+			}
+			return txProc.validateToleranceBand(txHash, tx, expectedResultCode, validatorExecutionTimeNs, localErr)
 		}
-		return txProc.validateToleranceBand(txHash, tx, expectedResultCode, validatorExecutionTimeNs, localErr)
+
+		// CASE 1b (KLR-63): the consensus failure is a deterministic one - VMUserError (57),
+		// VMOutOfGas (58), Fail (99), anything that is not the timeout code. Local execution
+		// provably succeeded, and no amount of leader slowness produces those codes, so there is
+		// no timing argument to weigh and validateToleranceBand must not be reached: accepting
+		// would stamp a non-timeout failure onto a transaction that succeeded. Reject outright.
+		//
+		// This holds in Observer mode too. The replay short-circuit above exists because timeouts
+		// are environmental; a deterministic failure code that local re-execution contradicts is a
+		// genuine determinism break, and reproducing it would paper over it. Pre-fork blocks are
+		// unaffected - the flag is toggled per epoch, so replaying them takes the legacy branch.
+		log.Warn("Transaction result mismatch - consensus recorded a non-timeout failure for a locally successful transaction",
+			"txHash", txHash,
+			"expectedResult", expectedResultCode,
+			"actualResult", actualResultCode,
+			"txIndex", txIndex,
+			"mode", executionMode)
+
+		if txProc.forkController.FixAuditChangesV5() {
+			return process.ErrTransactionResultMismatch
+		}
+
+		return localErr
 	}
 
 	// CASE 2: Leader succeeded, but validator failed - block reject
@@ -187,15 +223,16 @@ func (txProc *txProcessor) handleResultMismatch(
 // based on the validator's execution time and configured tolerance band.
 //
 // Tolerance Band Logic:
-//   - baseTimeout: Configured timeout (e.g., 500ms)
+//   - baseTimeout: Configured timeout (e.g., 500ms), floored at core.MinSCExecutionTimeout to match
+//     the clamp the VM host applies to the same config value
 //   - tolerance: Percentage tolerance (e.g., 15%)
 //   - lowerBound: baseTimeout - (baseTimeout * tolerance%) = 425ms with 15% tolerance
 //
 // Decision Rules:
 //   - If validator finishes BEFORE lower bound: leader hardware too weak, the leader should have
-//     succeeded. localErr (nil, since local execution succeeded) is returned WITHOUT updating the
-//     ResultCode; the block is then rejected downstream by verifyBlockTrieRoots, because the local
-//     success leaves an account state root that differs from the recorded (failed) root.
+//     succeeded. The ResultCode is NOT updated and the block is rejected (KLR-63: explicit from
+//     FixAuditChangesV5 on; before the fork the always-nil localErr was returned instead, leaving
+//     the rejection to the downstream verifyBlockTrieRoots state-root comparison).
 //   - If validator finishes AT OR AFTER lower bound: leader had the right to fail. The ResultCode
 //     is updated to the consensus value and ErrTransactionResultMismatchAcceptLeader is returned so
 //     the preprocessor reverts the local success and accepts the block with the consensus result.
@@ -207,7 +244,8 @@ func (txProc *txProcessor) handleResultMismatch(
 //   - validatorExecutionTimeNs: Validator's execution time in nanoseconds
 //
 // Returns:
-//   - localErr: leader too weak; no ResultCode update (rejection happens at the state-root check)
+//   - process.ErrTransactionResultMismatch (pre-FixAuditChangesV5: localErr, always nil): leader
+//     too weak, reject the block; no ResultCode update
 //   - process.ErrTransactionResultMismatchAcceptLeader: accept, with ResultCode set to consensus
 func (txProc *txProcessor) validateToleranceBand(
 	txHash []byte,
@@ -216,7 +254,21 @@ func (txProc *txProcessor) validateToleranceBand(
 	validatorExecutionTimeNs int64,
 	localErr error,
 ) error {
+	// The bound has to be derived from the timeout the VM actually enforced, not from the raw
+	// config value. hostCore.configureTimeouts clamps to core.MinSCExecutionTimeout, so on a node
+	// where timeOutForSCExecutionInMilliseconds is unset or below the floor the raw value is 0
+	// while contracts still execute with a 400ms budget. Judging the leader against a zero base
+	// puts every possible execution time at or above a zero lower bound, which makes the rejection
+	// below unreachable and silently turns the fix inert exactly where it matters (the call site
+	// only reaches here when validatorExecutionTimeNs > 0). Gated so that pre-fork replay keeps
+	// deriving the bound from the raw config value.
+	fixAuditChangesV5 := txProc.forkController.FixAuditChangesV5()
+
 	baseTimeout := time.Duration(txProc.cfg.VirtualMachine.Execution.TimeOutForSCExecutionInMilliseconds) * time.Millisecond
+	if fixAuditChangesV5 && baseTimeout < core.MinSCExecutionTimeout {
+		baseTimeout = core.MinSCExecutionTimeout
+	}
+
 	tolerancePercentage := txProc.cfg.VirtualMachine.Execution.TimeOutTolerancePercentage
 	if tolerancePercentage == 0 {
 		tolerancePercentage = core.DefaultTolerancePercentage
@@ -238,14 +290,19 @@ func (txProc *txProcessor) validateToleranceBand(
 		"baseTimeout", baseTimeout,
 		"lowerBound", lowerBound)
 
-	// If validator finished BEFORE lower bound, leader hardware is too weak:
-	//return localErr (nil), block will be rejected at verifyBlockTrieRoots
+	// If validator finished BEFORE lower bound, leader hardware is too weak: the leader should
+	// have succeeded, so the block is invalid and must be rejected.
 	if validatorExecTime < lowerBound {
 		log.Warn("Rejecting block: leader hardware too weak",
 			"txHash", txHash,
 			"validatorTime", validatorExecTime,
 			"lowerBound", lowerBound,
 			"leaderShouldHaveSucceeded", true)
+
+		if fixAuditChangesV5 {
+			return process.ErrTransactionResultMismatch
+		}
+
 		return localErr
 	}
 

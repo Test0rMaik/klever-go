@@ -103,6 +103,15 @@ func (f *forkController) FixAuditChangesV5() bool {
 	return f.flagFixAuditChangesV5.IsSet()
 }
 
+// FixAuditChangesV5InEpoch answers the gate for an explicit epoch rather than for the
+// notifier's current one. The flag above only tracks the last epoch EpochConfirmed saw,
+// so callers that run before the notifier has been advanced to the header's epoch - block
+// validation is one, it runs ahead of CheckEpoch - would otherwise read the previous
+// epoch's value and skip the check on the very first block the fork covers.
+func (f *forkController) FixAuditChangesV5InEpoch(epoch uint32) bool {
+	return epoch >= f.enableEpochs.FixAuditChangesV5
+}
+
 // EpochConfirmed is called whenever a new epoch is confirmed
 func (f *forkController) EpochConfirmed(epoch uint32) {
 	f.flagClaimKFIEnabled.Toggle(epoch >= f.enableEpochs.ClaimKFI)

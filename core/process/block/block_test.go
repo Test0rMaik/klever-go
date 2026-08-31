@@ -1463,6 +1463,144 @@ func TestMetaProcessor_ProcessBlockWithPastSlotShouldErr(t *testing.T) {
 	assert.Equal(t, process.ErrLowerSlotInBlock, err)
 }
 
+// TxResults carries the consensus result code the validator compares its own execution against
+// (KLR-63), and a proposer fills it in lockstep with TxHashes. A list of any other length is
+// malformed, and an omitted one would skip the comparison entirely, so the header is rejected
+// before the transactions are processed - and stays accepted behind the fork flag.
+func TestMetaProcessor_ProcessBlockWithMismatchedTxResultsCount(t *testing.T) {
+	t.Parallel()
+
+	createHeader := func(txResults []uint32) *block.Block {
+		return &block.Block{
+			Header: &block.BlockHeader{
+				Nonce:   2,
+				Slot:    11,
+				TxCount: 1,
+			},
+			TxHashes:  [][]byte{[]byte("txHash")},
+			TxResults: txResults,
+		}
+	}
+
+	processBlock := func(t *testing.T, txResults []uint32, prepare func(arguments *blproc.ArgMetaProcessor)) error {
+		t.Helper()
+
+		arguments := createMockMetaArguments()
+		blkc := blockchain.NewBlockChain()
+		_ = blkc.SetCurrentBlockHeader(
+			&block.Block{Header: &block.BlockHeader{Nonce: 1, Slot: 10}},
+		)
+		_ = blkc.SetGenesisHeader(&block.Block{Header: &block.BlockHeader{Nonce: 0}})
+		arguments.BlockChain = blkc
+		if prepare != nil {
+			prepare(&arguments)
+		}
+
+		mp, err := blproc.NewMetaProcessor(arguments)
+		require.NoError(t, err)
+
+		controller, _ := kapps.NewProposalController(arguments.ForkController)
+		_ = mp.SetProposalController(controller)
+
+		return mp.ProcessBlock(createHeader(txResults), haveTime)
+	}
+
+	t.Run("missing tx results", func(t *testing.T) {
+		t.Parallel()
+
+		assert.Equal(t, process.ErrInvalidTXResultsCount, processBlock(t, nil, nil))
+	})
+
+	t.Run("more tx results than tx hashes", func(t *testing.T) {
+		t.Parallel()
+
+		assert.Equal(t, process.ErrInvalidTXResultsCount, processBlock(t, []uint32{0, 0}, nil))
+	})
+
+	t.Run("fork disabled: mismatch is not rejected here", func(t *testing.T) {
+		t.Parallel()
+
+		err := processBlock(t, nil, func(arguments *blproc.ArgMetaProcessor) {
+			arguments.ForkController = mock.NewForkControllerStub().
+				SetFork("FixAuditChangesV5", false)
+		})
+
+		// The gate being inert must be observable, so pin the check the header
+		// falls through to instead of merely asserting the gate's error is absent.
+		assert.Equal(t, process.ErrTxRootHashDoesNotMatch, err)
+	})
+}
+
+// TestMetaProcessor_ProcessBlockRejectsMismatchedTxResultsOnFirstBlockOfActivationEpoch pins
+// the boundary the gate is read at. ProcessBlock validates (block.go:127) before it advances
+// the epoch notifier (block.go:167), so a gate read from the notifier's current epoch still
+// holds the previous epoch's value while the first block of the activation epoch is being
+// processed - and that block would be fully executed, with the per-tx result comparison
+// bypassed by the empty TxResults, before commitBlock's second checkBlockValidity rejected it.
+//
+// This uses a real forkController rather than the stub so the flag genuinely lags: registration
+// confirms epoch 0, and nothing advances it to epoch 1 before validation runs.
+func TestMetaProcessor_ProcessBlockRejectsMismatchedTxResultsOnFirstBlockOfActivationEpoch(t *testing.T) {
+	t.Parallel()
+
+	const activationEpoch = uint32(1)
+
+	arguments := createMockMetaArguments()
+
+	epochNotifier := &mock.EpochNotifierStub{}
+	forkController, err := fork.NewForkController(
+		config.EnableEpochs{FixAuditChangesV5: activationEpoch},
+		epochNotifier,
+	)
+	require.NoError(t, err)
+
+	// Wire the notifier to the controller the way the node does, and record whether the
+	// epoch had already been advanced by the time the header was rejected.
+	epochAdvanced := false
+	epochNotifier.CheckEpochCalled = func(epoch uint32) {
+		epochAdvanced = true
+		forkController.EpochConfirmed(epoch)
+	}
+
+	// The flag is off for the epoch the node is currently on: a gate read from it skips.
+	require.False(t, forkController.FixAuditChangesV5())
+	require.True(t, forkController.FixAuditChangesV5InEpoch(activationEpoch))
+
+	blkc := blockchain.NewBlockChain()
+	_ = blkc.SetCurrentBlockHeader(
+		&block.Block{Header: &block.BlockHeader{Nonce: 1, Slot: 10, Epoch: activationEpoch - 1}},
+	)
+	_ = blkc.SetGenesisHeader(&block.Block{Header: &block.BlockHeader{Nonce: 0}})
+	arguments.BlockChain = blkc
+	arguments.EpochNotifier = epochNotifier
+	arguments.ForkController = forkController
+
+	mp, err := blproc.NewMetaProcessor(arguments)
+	require.NoError(t, err)
+
+	controller, _ := kapps.NewProposalController(arguments.ForkController)
+	_ = mp.SetProposalController(controller)
+
+	// First block of the activation epoch, with TxResults omitted.
+	header := &block.Block{
+		Header: &block.BlockHeader{
+			Nonce:   2,
+			Slot:    11,
+			Epoch:   activationEpoch,
+			TxCount: 1,
+		},
+		TxHashes:  [][]byte{[]byte("txHash")},
+		TxResults: nil,
+	}
+
+	err = mp.ProcessBlock(header, haveTime)
+
+	assert.Equal(t, process.ErrInvalidTXResultsCount, err)
+	assert.False(t, epochAdvanced,
+		"the header must be rejected before the epoch notifier is advanced, otherwise the "+
+			"gate is being read from the notifier instead of from the header's own epoch")
+}
+
 func TestMetaProcessor_ProcessWithHeaderNotFirstShouldErr(t *testing.T) {
 	t.Parallel()
 

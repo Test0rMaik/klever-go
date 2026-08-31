@@ -470,6 +470,10 @@ var ErrInvalidMiningRewards = errors.New("invalid block mining rewards")
 // ErrInvalidTXCount signals a block was proposed with invalid tx count
 var ErrInvalidTXCount = errors.New("invalid block tx count")
 
+// ErrInvalidTXResultsCount signals a block was proposed with a TxResults list that does not
+// pair up with its TxHashes
+var ErrInvalidTXResultsCount = errors.New("invalid block tx results count")
+
 // ErrInvalidTXFees signals a block was proposed with invalid tx fees
 var ErrInvalidTXFees = errors.New("invalid block tx fees")
 

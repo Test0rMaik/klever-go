@@ -308,6 +308,11 @@ func (hhs *HeaderHandlerStub) GetTxHashes() [][]byte {
 	panic("implement me")
 }
 
+// GetTxResults -
+func (hhs *HeaderHandlerStub) GetTxResults() []uint32 {
+	panic("implement me")
+}
+
 func (hhs *HeaderHandlerStub) ComputeRootHash(_ hashing.Hasher) ([]byte, error) {
 	return make([]byte, 0), nil
 }
