@@ -15,6 +15,7 @@ type ForkControllerStub struct {
 	FixMarketBuyOverflowCalled    func() bool
 	FixAuditChangesV3Called       func() bool
 	FixAuditChangesV4Called       func() bool
+	FixAuditChangesV5Called       func() bool
 }
 
 // ProcessorFlowITOPrice -
@@ -128,6 +129,14 @@ func (fc *ForkControllerStub) FixAuditChangesV3() bool {
 func (fc *ForkControllerStub) FixAuditChangesV4() bool {
 	if fc.FixAuditChangesV4Called != nil {
 		return fc.FixAuditChangesV4Called()
+	}
+
+	return false
+}
+
+func (fc *ForkControllerStub) FixAuditChangesV5() bool {
+	if fc.FixAuditChangesV5Called != nil {
+		return fc.FixAuditChangesV5Called()
 	}
 
 	return false

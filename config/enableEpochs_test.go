@@ -11,12 +11,45 @@ func TestEnableEpochs_Validate(t *testing.T) {
 	t.Parallel()
 
 	assert.NoError(t, config.EnableEpochs{}.Validate(), "template placeholder")
-	assert.NoError(t, config.EnableEpochs{FixMarketBuyOverflow: 100, FixAuditChangesV4: 101}.Validate())
+	assert.NoError(t, config.EnableEpochs{
+		FixMarketBuyOverflow: 100,
+		FixAuditChangesV4:    101,
+		FixAuditChangesV5:    102,
+	}.Validate())
 
-	assert.Error(t, config.EnableEpochs{FixMarketBuyOverflow: 100, FixAuditChangesV4: 100}.Validate(),
-		"same epoch leaves an empty freeze window")
-	assert.Error(t, config.EnableEpochs{FixMarketBuyOverflow: 100, FixAuditChangesV4: 99}.Validate(),
-		"thaw before freeze leaves an empty freeze window")
+	assert.Error(t, config.EnableEpochs{
+		FixMarketBuyOverflow: 100,
+		FixAuditChangesV4:    100,
+		FixAuditChangesV5:    102,
+	}.Validate(), "same epoch leaves an empty freeze window")
+	assert.Error(t, config.EnableEpochs{
+		FixMarketBuyOverflow: 100,
+		FixAuditChangesV4:    99,
+		FixAuditChangesV5:    102,
+	}.Validate(), "thaw before freeze leaves an empty freeze window")
 	assert.Error(t, config.EnableEpochs{FixMarketBuyOverflow: 100}.Validate(),
 		"thaw left at the placeholder leaves an empty freeze window")
+}
+
+func TestEnableEpochs_Validate_AuditChangesV5AfterV4(t *testing.T) {
+	t.Parallel()
+
+	// V4 still at the placeholder is a template rather than a real schedule, so the
+	// ordering is not enforced against it.
+	assert.NoError(t, config.EnableEpochs{}.Validate(), "template placeholder")
+
+	assert.Error(t, config.EnableEpochs{
+		FixMarketBuyOverflow: 100,
+		FixAuditChangesV4:    101,
+		FixAuditChangesV5:    101,
+	}.Validate(), "sharing V4's epoch applies the V5 changes retroactively")
+	assert.Error(t, config.EnableEpochs{
+		FixMarketBuyOverflow: 100,
+		FixAuditChangesV4:    101,
+		FixAuditChangesV5:    100,
+	}.Validate(), "V5 before V4 applies the V5 changes retroactively")
+	assert.Error(t, config.EnableEpochs{
+		FixMarketBuyOverflow: 100,
+		FixAuditChangesV4:    101,
+	}.Validate(), "V5 left at the placeholder activates from genesis")
 }

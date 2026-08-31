@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	blockchainConfig "github.com/klever-io/klever-go/config"
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/data/transaction"
 	"github.com/klever-io/klever-go/kapps"
@@ -79,6 +80,141 @@ func Test_ManagedBufferToHex(t *testing.T) {
 				Ok()
 		})
 	assert.Nil(t, err)
+}
+
+// runManagedHookForkGateTest is a shared helper for the KLC-2566 [Certik KLR-43] fork-gate
+// tests below: build a single mock contract that runs body against the real host, then hand
+// the VM output to checkResult. The gas-scaling and size-cap math these hooks now enforce is
+// tested directly against the hook functions in vmhost/vmhooks/managedei_test.go (mock
+// ManagedTypes/Metering contexts, no need for a full host/instance) - what genuinely needs
+// this real-host, real-instance setup is proving the fork gate itself behaves correctly
+// end-to-end, which is all the tests below check.
+func runManagedHookForkGateTest(
+	t *testing.T,
+	enableEpochs *blockchainConfig.EnableEpochs,
+	body func(host vmhost.VMHost),
+	checkResult func(*test.VMOutputVerifier),
+) {
+	t.Helper()
+	testConfig := baseTestConfig
+
+	builder := test.BuildMockInstanceCallTest(t)
+	if enableEpochs != nil {
+		builder = builder.WithEnableEpochs(*enableEpochs)
+	}
+
+	_, err := builder.
+		WithContracts(
+			test.CreateMockContract(test.ParentAddress).
+				WithBalance(testConfig.ParentBalance).
+				WithConfig(testConfig).
+				WithMethods(func(parentInstance *mock.InstanceMock, config interface{}) {
+					parentInstance.AddMockMethod("testFunction", func() *mock.InstanceMock {
+						body(parentInstance.Host)
+						return parentInstance
+					})
+				}),
+		).
+		WithInput(test.CreateTestContractCallInputBuilder().
+			WithRecipientAddr(test.ParentAddress).
+			WithGasProvided(testConfig.GasProvided).
+			WithFunction("testFunction").
+			Build()).
+		AndAssertResults(func(world *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+			checkResult(verify)
+		})
+	require.Nil(t, err)
+}
+
+// Test_ManagedBufferToHex_RejectsOversizedBuffer_PostFork and its _PreFork counterpart below
+// prove the KLC-2566 [Certik KLR-43] mitigation is correctly fork-gated: post-fork, a source
+// buffer over the protocol maximum must be rejected outright (unbounded allocation inside the
+// uninterruptible Fast-hook window is what this fix closes); pre-fork, behavior must stay
+// exactly as it was, so a rolling upgrade never causes upgraded and non-upgraded nodes to
+// disagree on the same transaction.
+func Test_ManagedBufferToHex_RejectsOversizedBuffer_PostFork(t *testing.T) {
+	oversizedBuffer := bytes.Repeat([]byte{7}, 16000001)
+
+	runManagedHookForkGateTest(t, nil,
+		func(host vmhost.VMHost) {
+			managedTypes := host.ManagedTypes()
+			sourceHandle := managedTypes.NewManagedBufferFromBytes(oversizedBuffer)
+			destHandle := managedTypes.NewManagedBuffer()
+			vmhooks.ManagedBufferToHexWithHost(host, sourceHandle, destHandle)
+		},
+		func(verify *test.VMOutputVerifier) {
+			verify.
+				ExecutionFailed().
+				ReturnMessageContains("managed buffer length exceeds maximum")
+		},
+	)
+}
+
+func Test_ManagedBufferToHex_AllowsOversizedBuffer_PreFork(t *testing.T) {
+	oversizedBuffer := bytes.Repeat([]byte{7}, 16000001)
+
+	runManagedHookForkGateTest(t, &blockchainConfig.EnableEpochs{FixAuditChangesV5: 1},
+		func(host vmhost.VMHost) {
+			managedTypes := host.ManagedTypes()
+			sourceHandle := managedTypes.NewManagedBufferFromBytes(oversizedBuffer)
+			destHandle := managedTypes.NewManagedBuffer()
+			vmhooks.ManagedBufferToHexWithHost(host, sourceHandle, destHandle)
+
+			bytesResult, _ := managedTypes.GetBytes(destHandle)
+			if string(bytesResult) != hex.EncodeToString(oversizedBuffer) {
+				host.Runtime().SignalUserError("assert failed")
+			}
+		},
+		func(verify *test.VMOutputVerifier) {
+			verify.Ok()
+		},
+	)
+}
+
+// Test_ManagedIsBuiltinFunction_CapsOversizedName_PostFork and its _PreFork counterpart below
+// are the ManagedIsBuiltinFunction equivalent of the ToHex fork-gate pair above. Post-fork
+// this hook no longer reverts on an oversized name (see managedei.go: it's a pure predicate,
+// so returning a truthful "not a builtin" is correct and avoids a new failure mode), so the
+// post-fork proof here is that the call still succeeds and returns 0, not that it fails.
+func Test_ManagedIsBuiltinFunction_CapsOversizedName_PostFork(t *testing.T) {
+	oversizedName := bytes.Repeat([]byte("b"), 257)
+
+	runManagedHookForkGateTest(t, nil,
+		func(host vmhost.VMHost) {
+			managedTypes := host.ManagedTypes()
+			nameHandle := managedTypes.NewManagedBufferFromBytes(oversizedName)
+			result := vmhooks.ManagedIsBuiltinFunctionWithHost(host, nameHandle)
+			if result != 0 {
+				host.Runtime().SignalUserError("assert failed")
+			}
+		},
+		func(verify *test.VMOutputVerifier) {
+			// Gas is the only pre/post-fork observable here: the hook returns 0 either
+			// way (a 257-byte name is not a builtin under either path), so without this
+			// assertion the pair would still pass with the whole fork-gated block removed.
+			// 305 = 49 (pre-fork baseline below) + 256 bytes charged at the capped length.
+			verify.Ok().
+				GasUsed(test.ParentAddress, 305)
+		},
+	)
+}
+
+func Test_ManagedIsBuiltinFunction_AllowsOversizedName_PreFork(t *testing.T) {
+	oversizedName := bytes.Repeat([]byte("b"), 257)
+
+	runManagedHookForkGateTest(t, &blockchainConfig.EnableEpochs{FixAuditChangesV5: 1},
+		func(host vmhost.VMHost) {
+			managedTypes := host.ManagedTypes()
+			nameHandle := managedTypes.NewManagedBufferFromBytes(oversizedName)
+			vmhooks.ManagedIsBuiltinFunctionWithHost(host, nameHandle)
+		},
+		func(verify *test.VMOutputVerifier) {
+			// Pre-fork the name is never charged per-byte, so the cost stays at the
+			// baseline - this is what the post-fork 305 above is measured against.
+			verify.Ok().
+				GasUsed(test.ParentAddress, 49)
+		},
+	)
 }
 
 func Test_BigIntToString(t *testing.T) {

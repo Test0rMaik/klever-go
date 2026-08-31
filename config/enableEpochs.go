@@ -31,6 +31,7 @@ type EnableEpochs struct {
 	FixMarketBuyOverflow    uint32 `yaml:"fixMarketBuyOverflow"`
 	FixAuditChangesV3       uint32 `yaml:"fixAuditChangesV3"`
 	FixAuditChangesV4       uint32 `yaml:"fixAuditChangesV4"`
+	FixAuditChangesV5       uint32 `yaml:"fixAuditChangesV5"`
 }
 
 // Validate checks that the configured activation epochs are mutually consistent. It runs
@@ -46,6 +47,15 @@ func (e EnableEpochs) Validate() error {
 		return fmt.Errorf("fixAuditChangesV4 (%d) must be after fixMarketBuyOverflow (%d), "+
 			"otherwise the account freeze window is empty",
 			e.FixAuditChangesV4, e.FixMarketBuyOverflow)
+	}
+
+	// fixAuditChangesV5 must be strictly after fixAuditChangesV4: sharing or preceding
+	// it would apply the V5 changes to blocks already committed under V4 rules. A V4
+	// left at the placeholder is not checked.
+	if e.FixAuditChangesV4 != 0 && e.FixAuditChangesV5 <= e.FixAuditChangesV4 {
+		return fmt.Errorf("fixAuditChangesV5 (%d) must be after fixAuditChangesV4 (%d), "+
+			"otherwise the V5 changes apply retroactively to blocks committed under V4 rules",
+			e.FixAuditChangesV5, e.FixAuditChangesV4)
 	}
 
 	return nil

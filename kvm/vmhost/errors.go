@@ -269,3 +269,7 @@ var ErrInvalidGasProvided = errors.New("invalid gas provided")
 
 // ErrRAndSExceedsMax32BytesSecp256k1 signals that r and s are greater than 32 bytes max allowed on Secp256k1
 var ErrRAndSExceedsMax32BytesSecp256k1 = errors.New("invalid length of secp256k1 r and s")
+
+// ErrManagedBufferToHexLengthExceedsMaximum signals that the source buffer passed to
+// managedBufferToHex exceeds the protocol maximum
+var ErrManagedBufferToHexLengthExceedsMaximum = errors.New("managed buffer length exceeds maximum allowed for hex encoding")

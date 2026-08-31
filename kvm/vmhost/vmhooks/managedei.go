@@ -950,6 +950,12 @@ func (context *VMHooksImpl) ManagedBufferToHex(sourceHandle int32, destHandle in
 	ManagedBufferToHexWithHost(host, sourceHandle, destHandle)
 }
 
+// maxManagedBufferToHexLength bounds the source buffer ManagedBufferToHex will encode,
+// so the hex-encoded output (always exactly 2x the source length) is bounded to 32MB.
+// Reuses maxTotalArgumentsBytes (baseOps.go), the established ceiling in this package for
+// a single VM-hook-processed blob, rather than duplicating the literal.
+const maxManagedBufferToHexLength = maxTotalArgumentsBytes
+
 func ManagedBufferToHexWithHost(host vmhost.VMHost, sourceHandle int32, destHandle int32) {
 	runtime := host.Runtime()
 	metering := host.Metering()
@@ -964,8 +970,46 @@ func ManagedBufferToHexWithHost(host vmhost.VMHost, sourceHandle int32, destHand
 		return
 	}
 
-	encoded := hex.EncodeToString(mBuff)
-	managedType.SetBytes(destHandle, []byte(encoded))
+	if host.ForkController().FixAuditChangesV5() {
+		if len(mBuff) > maxManagedBufferToHexLength {
+			WithFaultAndHost(host, vmhost.ErrManagedBufferToHexLengthExceedsMaximum, runtime.BaseOpsErrorShouldFailExecution())
+			return
+		}
+		// Hex-encoding doubles the byte count: charge once for the source read (N)
+		// and once more for the encoded output, at its real size (2N) - both before
+		// any encoding happens (CertiK KLR-43 recommendation - charge source and
+		// output, fail before allocation). Uses UseGasBounded directly rather than
+		// ConsumeGasForBytes, which never fails on insufficient gas - the whole
+		// point here is to actually stop execution before the allocation, not just
+		// account for it after the fact.
+		dataCopyPerByte := metering.GasSchedule().BaseOperationCost.DataCopyPerByte
+		readGas := math.MulUint64(dataCopyPerByte, uint64(len(mBuff)))
+		err = metering.UseGasBounded(readGas)
+		if err != nil {
+			WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution())
+			return
+		}
+
+		writeGas := math.MulUint64(dataCopyPerByte, 2*uint64(len(mBuff)))
+		err = metering.UseGasBounded(writeGas)
+		if err != nil {
+			WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution())
+			return
+		}
+	}
+
+	// Encodes directly into a preallocated destination buffer and hands it to SetBytes as
+	// []byte, instead of hex.EncodeToString (make(2N) + an unavoidable string(dst) copy,
+	// since dst escapes into the return value) followed by a []byte(encoded) conversion back.
+	// This cuts total churn from ~9x source to ~5x (GetBytes' N-byte clone + this 2N encode
+	// buffer + SetBytes' own 2N defensive clone) - not all the way to 2x, since SetBytes'
+	// clone-on-write is unavoidable from this call site and must stay (it's what closes the
+	// managed-buffer aliasing class of bug fixed by KLC-2551 / KLR-28). Peak memory matters
+	// here regardless, since this hook runs uninterruptible and the timeout cannot abort it
+	// mid-call.
+	encoded := make([]byte, hex.EncodedLen(len(mBuff)))
+	hex.Encode(encoded, mBuff)
+	managedType.SetBytes(destHandle, encoded)
 }
 
 // ManagedGetCodeMetadata VMHooks implementation.
@@ -1010,6 +1054,19 @@ func (context *VMHooksImpl) ManagedIsBuiltinFunction(functionNameHandle int32) i
 	return ManagedIsBuiltinFunctionWithHost(host, functionNameHandle)
 }
 
+// maxBuiltinFunctionNameLength mirrors maxLengthOfFunctionName (contexts/validator.go),
+// the existing protocol limit for contract-exported function names - a built-in function
+// name is the same kind of identifier and can never legitimately exceed it. Uses >=, not >,
+// to actually mirror it: validator.go rejects at exactly 256, so a real maximum is 255.
+//
+// The >= vs > distinction is cosmetic rather than consensus-observable. Since this hook now
+// returns 0 instead of reverting, both spellings produce the same result and the same gas at
+// exactly 256: the charge is clamped to the cap either way, and the fall-through under > would
+// reach IsBuiltinFunctionName, which returns false for a 256-byte name regardless. The only
+// delta is an unpaid string copy plus a map lookup, so no test can pin it without asserting on
+// an implementation detail - see TestManagedIsBuiltinFunctionWithHost_CapsGasAndReturnsFalseAboveMax.
+const maxBuiltinFunctionNameLength = 256
+
 func ManagedIsBuiltinFunctionWithHost(host vmhost.VMHost, functionNameHandle int32) int32 {
 	runtime := host.Runtime()
 	metering := host.Metering()
@@ -1022,6 +1079,25 @@ func ManagedIsBuiltinFunctionWithHost(host vmhost.VMHost, functionNameHandle int
 	if err != nil {
 		WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution())
 		return -1
+	}
+
+	if host.ForkController().FixAuditChangesV5() {
+		chargeLen := len(mBuffFunctionName)
+		if chargeLen > maxBuiltinFunctionNameLength {
+			chargeLen = maxBuiltinFunctionNameLength
+		}
+		managedType.ConsumeGasForBytes(mBuffFunctionName[:chargeLen])
+
+		if len(mBuffFunctionName) >= maxBuiltinFunctionNameLength {
+			// This is a pure predicate ("is this a builtin function name?"), and a
+			// name at or over the cap can never be a real builtin (the same length
+			// is already rejected for exported names by verifyValidFunctionName),
+			// so a truthful "not a builtin" is the correct answer here - reverting
+			// the whole tx would be a new failure mode this call never had before
+			// the fork, for input that used to just return false (CertiK KLR-43).
+			// The gas charge above still bounds the work regardless of input size.
+			return 0
+		}
 	}
 
 	isBuiltinFunction := host.IsBuiltinFunctionName(string(mBuffFunctionName))

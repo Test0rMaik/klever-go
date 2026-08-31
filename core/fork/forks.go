@@ -27,6 +27,7 @@ type forkController struct {
 	flagFixMarketBuyOverflow         atomic.Flag
 	flagFixAuditChangesV3            atomic.Flag
 	flagFixAuditChangesV4            atomic.Flag
+	flagFixAuditChangesV5            atomic.Flag
 }
 
 func NewForkController(cfg config.EnableEpochs, epochNotifier process.EpochNotifier) (*forkController, error) {
@@ -98,6 +99,10 @@ func (f *forkController) FixAuditChangesV4() bool {
 	return f.flagFixAuditChangesV4.IsSet()
 }
 
+func (f *forkController) FixAuditChangesV5() bool {
+	return f.flagFixAuditChangesV5.IsSet()
+}
+
 // EpochConfirmed is called whenever a new epoch is confirmed
 func (f *forkController) EpochConfirmed(epoch uint32) {
 	f.flagClaimKFIEnabled.Toggle(epoch >= f.enableEpochs.ClaimKFI)
@@ -141,6 +146,9 @@ func (f *forkController) EpochConfirmed(epoch uint32) {
 
 	f.flagFixAuditChangesV4.Toggle(epoch >= f.enableEpochs.FixAuditChangesV4)
 	log.Debug("forkController: FixAuditChangesV4", "enabled", f.flagFixAuditChangesV4.IsSet())
+
+	f.flagFixAuditChangesV5.Toggle(epoch >= f.enableEpochs.FixAuditChangesV5)
+	log.Debug("forkController: FixAuditChangesV5", "enabled", f.flagFixAuditChangesV5.IsSet())
 }
 
 // IsInterfaceNil returns true if there is no value under the interface

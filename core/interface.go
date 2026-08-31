@@ -83,6 +83,7 @@ type ForkController interface {
 	FixMarketBuyOverflow() bool
 	FixAuditChangesV3() bool
 	FixAuditChangesV4() bool
+	FixAuditChangesV5() bool
 	IsInterfaceNil() bool
 }
 
