@@ -100,6 +100,10 @@ var ErrNilPeerShardResolver = errors.New("nil PeerShardResolver")
 // ErrNilNetworkShardingCollector signals that the network sharding collector provided is nil
 var ErrNilNetworkShardingCollector = errors.New("nil network sharding collector")
 
+// ErrAuthPidMismatch signals that an authentication message declared a peer ID other than the one
+// of the peer that actually sent it
+var ErrAuthPidMismatch = errors.New("authentication peer id mismatch")
+
 // ErrNilSignerVerifier signals that the signer-verifier instance provided is nil
 var ErrNilSignerVerifier = errors.New("nil signer-verifier")
 

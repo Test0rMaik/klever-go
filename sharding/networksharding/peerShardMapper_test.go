@@ -193,6 +193,154 @@ func TestPeerShardMapper_UpdatePeerIDPublicKeyShouldWorkConcurrently(t *testing.
 	assert.Equal(t, pk, pkRecovered)
 }
 
+//------- RemovePeerIDAssociation
+
+func TestPeerShardMapper_RemovePeerIDAssociationShouldRemoveAllTheAssociatedData(t *testing.T) {
+	t.Parallel()
+
+	pk := []byte("dummy pk")
+	psm, _ := networksharding.NewPeerShardMapper(
+		testscommon.NewCacherMock(),
+		testscommon.NewCacherMock(),
+		&nodesCoordinatorStub{
+			GetValidatorWithPublicKeyCalled: func(publicKey []byte) (sharding.Validator, error) {
+				return nil, nil
+			},
+		},
+		epochZero,
+	)
+	pid := core.PeerID("dummy peer ID")
+	psm.UpdatePeerIDPublicKey(pid, pk)
+	psm.FallbackPidShard().Put([]byte(pid), uint32(3), 4)
+
+	assert.Equal(t, core.ValidatorPeer, psm.GetPeerInfo(pid).PeerType)
+
+	psm.RemovePeerIDAssociation(pid)
+
+	assert.Nil(t, psm.GetPkFromPidPk(pid))
+	assert.Nil(t, psm.GetFromPkPeerID(pk))
+	_, foundInFallback := psm.FallbackPidShard().Get([]byte(pid))
+	assert.False(t, foundInFallback)
+
+	expectedPeerInfo := core.P2PPeerInfo{
+		PeerType: core.UnknownPeer,
+		ShardID:  0,
+	}
+	assert.Equal(t, expectedPeerInfo, psm.GetPeerInfo(pid))
+}
+
+func TestPeerShardMapper_RemovePeerIDAssociationShouldKeepTheOtherPidsOfTheSamePk(t *testing.T) {
+	t.Parallel()
+
+	psm := createPeerShardMapper()
+	pk := []byte("dummy pk")
+	pidToRemove := core.PeerID("pid to remove")
+	pidToKeep := core.PeerID("pid to keep")
+	psm.UpdatePeerIDPublicKey(pidToRemove, pk)
+	psm.UpdatePeerIDPublicKey(pidToKeep, pk)
+
+	psm.RemovePeerIDAssociation(pidToRemove)
+
+	assert.Nil(t, psm.GetPkFromPidPk(pidToRemove))
+	assert.Equal(t, pk, psm.GetPkFromPidPk(pidToKeep))
+	assert.Equal(t, []core.PeerID{pidToKeep}, psm.GetFromPkPeerID(pk))
+}
+
+func TestPeerShardMapper_RemovePeerIDAssociationUnknownPidShouldNotPanic(t *testing.T) {
+	t.Parallel()
+
+	defer func() {
+		r := recover()
+		if r != nil {
+			assert.Fail(t, fmt.Sprintf("should have not panicked %v", r))
+		}
+	}()
+
+	psm := createPeerShardMapper()
+	pk := []byte("dummy pk")
+	existingPid := core.PeerID("existing pid")
+	psm.UpdatePeerIDPublicKey(existingPid, pk)
+
+	psm.RemovePeerIDAssociation(core.PeerID("unknown pid"))
+
+	assert.Equal(t, pk, psm.GetPkFromPidPk(existingPid))
+	assert.Equal(t, []core.PeerID{existingPid}, psm.GetFromPkPeerID(pk))
+}
+
+func TestPeerShardMapper_RemovePeerIDAssociationWrongTypePkInPeerIDPkShouldRemove(t *testing.T) {
+	t.Parallel()
+
+	psm := createPeerShardMapper()
+	pid := core.PeerID("dummy peer ID")
+	wrongTypePk := uint64(7)
+	psm.PeerIDPk().Put([]byte(pid), wrongTypePk, 8)
+
+	psm.RemovePeerIDAssociation(pid)
+
+	_, found := psm.PeerIDPk().Get([]byte(pid))
+	assert.False(t, found)
+}
+
+func TestPeerShardMapper_RemovePeerIDAssociationPkNotInPkPeerIDShouldRemoveOnlyThePid(t *testing.T) {
+	t.Parallel()
+
+	psm := createPeerShardMapper()
+	pk := []byte("dummy pk")
+	pid := core.PeerID("dummy peer ID")
+	psm.UpdatePeerIDPublicKey(pid, pk)
+	psm.PkPeerID().Remove(pk)
+
+	psm.RemovePeerIDAssociation(pid)
+
+	assert.Nil(t, psm.GetPkFromPidPk(pid))
+	assert.Nil(t, psm.GetFromPkPeerID(pk))
+}
+
+func TestPeerShardMapper_RemovePeerIDAssociationWrongTypeInPkPeerIDShouldRemove(t *testing.T) {
+	t.Parallel()
+
+	psm := createPeerShardMapper()
+	pk := []byte("dummy pk")
+	pid := core.PeerID("dummy peer ID")
+	psm.UpdatePeerIDPublicKey(pid, pk)
+
+	wrongTypePidsQueue := uint64(7)
+	psm.PkPeerID().Put(pk, wrongTypePidsQueue, 8)
+
+	psm.RemovePeerIDAssociation(pid)
+
+	assert.Nil(t, psm.GetPkFromPidPk(pid))
+	_, found := psm.PkPeerID().Get(pk)
+	assert.False(t, found)
+}
+
+func TestPeerShardMapper_RemovePeerIDAssociationShouldWorkConcurrently(t *testing.T) {
+	t.Parallel()
+
+	psm := createPeerShardMapper()
+	pk := []byte("dummy pk")
+	pid := core.PeerID("dummy peer ID")
+
+	numUpdates := 100
+	wg := sync.WaitGroup{}
+	wg.Add(numUpdates * 2)
+	for i := 0; i < numUpdates; i++ {
+		go func() {
+			defer wg.Done()
+			psm.UpdatePeerIDPublicKey(pid, pk)
+		}()
+		go func() {
+			defer wg.Done()
+			psm.RemovePeerIDAssociation(pid)
+		}()
+	}
+	wg.Wait()
+
+	psm.RemovePeerIDAssociation(pid)
+	assert.Nil(t, psm.GetPkFromPidPk(pid))
+	assert.Nil(t, psm.GetFromPkPeerID(pk))
+}
+
 //------- GetPeerInfo
 
 func TestPeerShardMapper_GetPeerInfoPkNotFoundShouldReturnUnknown(t *testing.T) {

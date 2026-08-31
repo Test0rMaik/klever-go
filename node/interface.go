@@ -49,6 +49,7 @@ type P2PMessenger interface {
 type NetworkShardingCollector interface {
 	UpdatePeerIDPublicKey(pid core.PeerID, pk []byte)
 	UpdatePeerID(pid core.PeerID)
+	RemovePeerIDAssociation(pid core.PeerID)
 	GetPeerInfo(pid core.PeerID) core.P2PPeerInfo
 	IsInterfaceNil() bool
 }

@@ -65,6 +65,7 @@ type HeartbeatStorageHandler interface {
 type NetworkShardingCollector interface {
 	UpdatePeerIDPublicKey(pid core.PeerID, pk []byte)
 	UpdatePeerID(pid core.PeerID)
+	RemovePeerIDAssociation(pid core.PeerID)
 	IsInterfaceNil() bool
 }
 

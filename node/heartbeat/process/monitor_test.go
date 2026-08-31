@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/klever-io/klever-go/core"
+	coreProcess "github.com/klever-io/klever-go/core/process"
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/network/p2p"
 	"github.com/klever-io/klever-go/node/heartbeat"
@@ -700,6 +701,155 @@ func TestMonitor_ProcessReceivedMessageImpersonatedMessageShouldErr(t *testing.T
 	assert.True(t, errors.Is(err, heartbeat.ErrHeartbeatPidMismatch))
 	assert.True(t, originatorWasBlacklisted)
 	assert.True(t, connectedPeerWasBlacklisted)
+}
+
+func TestMonitor_ProcessReceivedMessageNilMessageShouldErr(t *testing.T) {
+	t.Parallel()
+
+	arg := createMockArgHeartbeatMonitor()
+	mon, _ := process.NewMonitor(arg)
+
+	err := mon.ProcessReceivedMessage(nil, fromConnectedPeerId)
+	assert.Equal(t, heartbeat.ErrNilMessage, err)
+}
+
+func TestMonitor_ProcessReceivedMessageNilDataShouldErr(t *testing.T) {
+	t.Parallel()
+
+	arg := createMockArgHeartbeatMonitor()
+	mon, _ := process.NewMonitor(arg)
+
+	err := mon.ProcessReceivedMessage(&mock.P2PMessageStub{DataField: nil}, fromConnectedPeerId)
+	assert.Equal(t, heartbeat.ErrNilDataToProcess, err)
+}
+
+func TestMonitor_ProcessReceivedMessageAntifloodCanNotProcessMessageShouldErr(t *testing.T) {
+	t.Parallel()
+
+	expectedErr := errors.New("can not process message")
+	arg := createMockArgHeartbeatMonitor()
+	arg.AntifloodHandler = &mock.P2PAntifloodHandlerStub{
+		CanProcessMessageCalled: func(message p2p.MessageP2P, fromConnectedPeer core.PeerID) error {
+			return expectedErr
+		},
+	}
+	arg.MessageHandler = &mock.MessageHandlerStub{
+		CreateHeartbeatFromP2PMessageCalled: func(message p2p.MessageP2P) (*data.Heartbeat, error) {
+			assert.Fail(t, "should have not created the heartbeat")
+			return nil, nil
+		},
+	}
+	mon, _ := process.NewMonitor(arg)
+
+	err := mon.ProcessReceivedMessage(&mock.P2PMessageStub{DataField: []byte("data")}, fromConnectedPeerId)
+	assert.Equal(t, expectedErr, err)
+}
+
+func TestMonitor_ProcessReceivedMessageAntifloodCanNotProcessMessagesOnTopicShouldErr(t *testing.T) {
+	t.Parallel()
+
+	expectedErr := errors.New("can not process messages on topic")
+	arg := createMockArgHeartbeatMonitor()
+	arg.AntifloodHandler = &mock.P2PAntifloodHandlerStub{
+		CanProcessMessagesOnTopicCalled: func(peer core.PeerID, topic string, numMessages uint32, totalSize uint64, sequence []byte) error {
+			return expectedErr
+		},
+	}
+	arg.MessageHandler = &mock.MessageHandlerStub{
+		CreateHeartbeatFromP2PMessageCalled: func(message p2p.MessageP2P) (*data.Heartbeat, error) {
+			assert.Fail(t, "should have not created the heartbeat")
+			return nil, nil
+		},
+	}
+	mon, _ := process.NewMonitor(arg)
+
+	err := mon.ProcessReceivedMessage(&mock.P2PMessageStub{DataField: []byte("data")}, fromConnectedPeerId)
+	assert.Equal(t, expectedErr, err)
+}
+
+func TestMonitor_ProcessReceivedMessageInvalidHeartbeatShouldBlacklistBothPeers(t *testing.T) {
+	t.Parallel()
+
+	originator := core.PeerID("message originator")
+	expectedErr := errors.New("invalid heartbeat")
+	arg := createMockArgHeartbeatMonitor()
+	arg.MessageHandler = &mock.MessageHandlerStub{
+		CreateHeartbeatFromP2PMessageCalled: func(message p2p.MessageP2P) (*data.Heartbeat, error) {
+			return nil, expectedErr
+		},
+	}
+	blacklistReasons := make(map[core.PeerID]string)
+	arg.AntifloodHandler = &mock.P2PAntifloodHandlerStub{
+		BlacklistPeerCalled: func(pid core.PeerID, reason string, duration time.Duration) {
+			blacklistReasons[pid] = reason
+			assert.Equal(t, core.InvalidMessageBlacklistDuration, duration)
+		},
+	}
+	mon, _ := process.NewMonitor(arg)
+
+	message := &mock.P2PMessageStub{
+		DataField: []byte("data"),
+		PeerField: originator,
+	}
+
+	err := mon.ProcessReceivedMessage(message, fromConnectedPeerId)
+	assert.Equal(t, expectedErr, err)
+	assert.Equal(t, coreProcess.BlacklistReasonInvalidHeartbeat, blacklistReasons[originator])
+	assert.Equal(t, coreProcess.BlacklistReasonInvalidHeartbeat, blacklistReasons[fromConnectedPeerId])
+}
+
+func TestMonitor_ProcessReceivedMessagePidMismatchOnCreateShouldBlacklistAsInconsistent(t *testing.T) {
+	t.Parallel()
+
+	originator := core.PeerID("message originator")
+	expectedErr := fmt.Errorf("%w heartbeat pid %s, message pid %s",
+		heartbeat.ErrHeartbeatPidMismatch, "hb pid", originator)
+	arg := createMockArgHeartbeatMonitor()
+	arg.MessageHandler = &mock.MessageHandlerStub{
+		CreateHeartbeatFromP2PMessageCalled: func(message p2p.MessageP2P) (*data.Heartbeat, error) {
+			return nil, expectedErr
+		},
+	}
+	blacklistReasons := make(map[core.PeerID]string)
+	arg.AntifloodHandler = &mock.P2PAntifloodHandlerStub{
+		BlacklistPeerCalled: func(pid core.PeerID, reason string, duration time.Duration) {
+			blacklistReasons[pid] = reason
+			assert.Equal(t, core.InvalidMessageBlacklistDuration, duration)
+		},
+	}
+	mon, _ := process.NewMonitor(arg)
+
+	message := &mock.P2PMessageStub{
+		DataField: []byte("data"),
+		PeerField: originator,
+	}
+
+	err := mon.ProcessReceivedMessage(message, fromConnectedPeerId)
+	assert.Equal(t, expectedErr, err)
+	assert.Equal(t, coreProcess.BlacklistReasonInconsistentHeartbeat, blacklistReasons[originator])
+	assert.Equal(t, coreProcess.BlacklistReasonInconsistentHeartbeat, blacklistReasons[fromConnectedPeerId])
+}
+
+//------- SetAppStatusHandler
+
+func TestMonitor_SetAppStatusHandlerNilShouldErr(t *testing.T) {
+	t.Parallel()
+
+	arg := createMockArgHeartbeatMonitor()
+	mon, _ := process.NewMonitor(arg)
+
+	err := mon.SetAppStatusHandler(nil)
+	assert.Equal(t, heartbeat.ErrNilAppStatusHandler, err)
+}
+
+func TestMonitor_SetAppStatusHandlerShouldWork(t *testing.T) {
+	t.Parallel()
+
+	arg := createMockArgHeartbeatMonitor()
+	mon, _ := process.NewMonitor(arg)
+
+	err := mon.SetAppStatusHandler(&mock.AppStatusHandlerStub{})
+	assert.Nil(t, err)
 }
 
 func sendHbMessageFromPubKey(pubKey string, mon *process.Monitor) error {

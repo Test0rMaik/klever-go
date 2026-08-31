@@ -206,6 +206,19 @@ func (psm *PeerShardMapper) UpdatePeerIDPublicKey(pid core.PeerID, pk []byte) {
 	psm.peerIDPk.Put([]byte(pid), pk, len(pk))
 }
 
+// RemovePeerIDAssociation removes any public key and fallback shard association previously learned for the
+// provided peer ID. It is used whenever an association can no longer be trusted, so a stale entry can not
+// keep resolving the peer as a validator
+func (psm *PeerShardMapper) RemovePeerIDAssociation(pid core.PeerID) {
+	psm.mutUpdatePeerIDPublicKey.Lock()
+	defer psm.mutUpdatePeerIDPublicKey.Unlock()
+
+	psm.removePidAssociation(pid)
+
+	psm.peerIDPk.Remove([]byte(pid))
+	psm.fallbackPidShard.Remove([]byte(pid))
+}
+
 func (psm *PeerShardMapper) removePidAssociation(pid core.PeerID) {
 	oldPk, found := psm.peerIDPk.Get([]byte(pid))
 	if !found {

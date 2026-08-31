@@ -124,8 +124,8 @@ func (ip *identityProvider) HandleStreams(s network.Stream) {
 	ip.handleStreams(s)
 }
 
-func (ip *identityProvider) ProcessReceivedData(recvBuff []byte) error {
-	return ip.processReceivedData(recvBuff)
+func (ip *identityProvider) ProcessReceivedData(recvBuff []byte, fromPid core.PeerID) error {
+	return ip.processReceivedData(recvBuff, fromPid)
 }
 
 // CreateP2PPrivKey exports createP2PPrivKey for testing.

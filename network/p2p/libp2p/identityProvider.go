@@ -1,8 +1,10 @@
 package libp2p
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
+	"fmt"
 	"time"
 
 	"github.com/klever-io/klever-go/core"
@@ -164,7 +166,7 @@ func (ip *identityProvider) handleStreams(s network.Stream) {
 	select {
 	case recvBuff := <-chData:
 		log.Trace("message received", "payload hex", hex.EncodeToString(recvBuff))
-		err := ip.processReceivedData(recvBuff)
+		err := ip.processReceivedData(recvBuff, core.PeerID(s.Conn().RemotePeer()))
 		if err != nil {
 			log.Debug("identity provider processReceivedData", "error", err)
 		}
@@ -180,13 +182,30 @@ func (ip *identityProvider) handleStreams(s network.Stream) {
 	}
 }
 
-func (ip *identityProvider) processReceivedData(recvBuff []byte) error {
+func (ip *identityProvider) processReceivedData(recvBuff []byte, fromPid core.PeerID) error {
 	receivedAm := &data.AuthMessage{
 		AuthMessagePb: &data.AuthMessagePb{},
 	}
 	err := ip.marshalizer.Unmarshal(receivedAm, recvBuff)
 	if err != nil {
 		return err
+	}
+
+	//the signature only binds the public key to receivedAm.Message, which the sender chooses, so a
+	//message declaring another peer's id must be discarded before any association is stored -
+	//otherwise that peer's id would be re-mapped onto the signer's public key and would stop
+	//resolving as a validator peer. This is the sibling of the heartbeat check in
+	//MessageProcessor.CreateHeartbeatFromP2PMessage (KLR-48): every other writer of a pid/pubkey
+	//association takes the pid from the transport layer, and this one must too.
+	if !bytes.Equal(receivedAm.Message, fromPid.Bytes()) {
+		//drop any association previously learned for the sender, it can no longer be trusted
+		ip.networkShardingCollector.RemovePeerIDAssociation(fromPid)
+
+		return fmt.Errorf("%w auth pid %s, stream pid %s",
+			p2p.ErrAuthPidMismatch,
+			p2p.PeerIDToShortString(core.PeerID(receivedAm.Message)),
+			p2p.PeerIDToShortString(fromPid),
+		)
 	}
 
 	copiedAm := *receivedAm.Clone()

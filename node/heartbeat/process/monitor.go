@@ -2,6 +2,7 @@ package process
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -340,15 +341,21 @@ func (m *Monitor) ProcessReceivedMessage(message p2p.MessageP2P, fromConnectedPe
 	if err != nil {
 		//this situation is so severe that we have to black list both the message originator and the connected peer
 		//that disseminated this message.
+		blacklistReason := process.BlacklistReasonInvalidHeartbeat
+		if errors.Is(err, heartbeat.ErrHeartbeatPidMismatch) {
+			blacklistReason = process.BlacklistReasonInconsistentHeartbeat
+		}
 		log.Debug("Monitor: invalid heartbeat message",
 			"originator", p2p.PeerIDToShortString(message.Peer()),
 			"err", process.SanitizeBlacklistReason(err.Error()))
-		m.antifloodHandler.BlacklistPeer(message.Peer(), process.BlacklistReasonInvalidHeartbeat, core.InvalidMessageBlacklistDuration)
-		m.antifloodHandler.BlacklistPeer(fromConnectedPeer, process.BlacklistReasonInvalidHeartbeat, core.InvalidMessageBlacklistDuration)
+		m.antifloodHandler.BlacklistPeer(message.Peer(), blacklistReason, core.InvalidMessageBlacklistDuration)
+		m.antifloodHandler.BlacklistPeer(fromConnectedPeer, blacklistReason, core.InvalidMessageBlacklistDuration)
 
 		return err
 	}
 
+	//kept as defense in depth: the message handler already rejects a heartbeat whose pid is not the message
+	//originator, before storing any peer id - public key association
 	if !bytes.Equal(hbRecv.Pid, message.Peer().Bytes()) {
 		//this situation is so severe that we have to black list both the message originator and the connected peer
 		//that disseminated this message.

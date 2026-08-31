@@ -6,12 +6,20 @@ import (
 
 // NetworkShardingCollectorStub -
 type NetworkShardingCollectorStub struct {
-	UpdatePeerIDPublicKeyCalled func(pid core.PeerID, pk []byte)
+	UpdatePeerIDPublicKeyCalled   func(pid core.PeerID, pk []byte)
+	RemovePeerIDAssociationCalled func(pid core.PeerID)
 }
 
 // UpdatePeerIDPublicKey -
 func (nscs *NetworkShardingCollectorStub) UpdatePeerIDPublicKey(pid core.PeerID, pk []byte) {
 	nscs.UpdatePeerIDPublicKeyCalled(pid, pk)
+}
+
+// RemovePeerIDAssociation -
+func (nscs *NetworkShardingCollectorStub) RemovePeerIDAssociation(pid core.PeerID) {
+	if nscs.RemovePeerIDAssociationCalled != nil {
+		nscs.RemovePeerIDAssociationCalled(pid)
+	}
 }
 
 // IsInterfaceNil -

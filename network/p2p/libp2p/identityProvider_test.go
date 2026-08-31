@@ -9,6 +9,7 @@ import (
 
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/network/p2p"
+	"github.com/klever-io/klever-go/network/p2p/data"
 	"github.com/klever-io/klever-go/network/p2p/libp2p"
 	"github.com/klever-io/klever-go/network/p2p/mock"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -19,8 +20,14 @@ import (
 
 var marshalizerOutput = []byte("marshalizer byte output")
 
+// stubRemotePeerID is the peer on the other end of the stub stream's connection. handleStreams
+// binds the declared auth pid to it, so a test that expects the association to be stored has to
+// declare this pid.
+const stubRemotePeerID = core.PeerID("remote ID")
+
 func createStubHostForIdentityProvider() (*mock.ConnectableHostStub, network.Stream) {
 	newStream := mock.NewStreamMock()
+	newStream.SetConn(createStubConnForIdentityProvider())
 
 	return &mock.ConnectableHostStub{
 		SetStreamHandlerCalled: func(pid protocol.ID, handler network.StreamHandler) {},
@@ -36,7 +43,7 @@ func createStubHostForIdentityProvider() (*mock.ConnectableHostStub, network.Str
 func createStubConnForIdentityProvider() network.Conn {
 	return &mock.ConnStub{
 		RemotePeerCalled: func() peer.ID {
-			return "remote ID"
+			return peer.ID(stubRemotePeerID)
 		},
 	}
 }
@@ -254,7 +261,7 @@ func TestIdentityProvider_ProcessReceivedDataUnmarshalFailsShouldError(t *testin
 		time.Second,
 	)
 
-	err := ip.ProcessReceivedData(make([]byte, 0))
+	err := ip.ProcessReceivedData(make([]byte, 0), core.PeerID(""))
 
 	assert.Equal(t, errExpected, err)
 }
@@ -279,7 +286,7 @@ func TestIdentityProvider_ProcessReceivedDataMarshalFailsShouldError(t *testing.
 		time.Second,
 	)
 
-	err := ip.ProcessReceivedData(make([]byte, 0))
+	err := ip.ProcessReceivedData(make([]byte, 0), core.PeerID(""))
 
 	assert.Equal(t, errExpected, err)
 }
@@ -301,7 +308,7 @@ func TestIdentityProvider_ProcessReceivedDataSignerErrorsShouldError(t *testing.
 		time.Second,
 	)
 
-	err := ip.ProcessReceivedData(make([]byte, 0))
+	err := ip.ProcessReceivedData(make([]byte, 0), core.PeerID(""))
 
 	assert.Equal(t, errExpected, err)
 }
@@ -327,10 +334,114 @@ func TestIdentityProvider_ProcessReceivedDataShouldUpdateCollector(t *testing.T)
 		time.Second,
 	)
 
-	err := ip.ProcessReceivedData(make([]byte, 0))
+	err := ip.ProcessReceivedData(make([]byte, 0), core.PeerID(""))
 
 	assert.Nil(t, err)
 	assert.True(t, updateWasCalled)
+}
+
+// createAuthMarshalizerForIdentityProvider returns a marshalizer whose Unmarshal populates the
+// AuthMessage with a caller-chosen declared pid, so the pid binding can actually be exercised.
+func createAuthMarshalizerForIdentityProvider(declaredPid core.PeerID) p2p.Marshalizer {
+	return &mock.MarshalizerStub{
+		MarshalCalled: func(obj interface{}) (bytes []byte, e error) {
+			return marshalizerOutput, nil
+		},
+		UnmarshalCalled: func(obj interface{}, buff []byte) error {
+			am, ok := obj.(*data.AuthMessage)
+			if !ok {
+				return errors.New("unexpected type passed to Unmarshal")
+			}
+
+			am.Message = declaredPid.Bytes()
+			am.Pubkey = []byte("sender pk")
+			am.Sig = []byte("sig")
+
+			return nil
+		},
+	}
+}
+
+// An auth message is signed by whoever sends it, and the signature covers the sender's own choice
+// of AuthMessage.Message. Without binding that field to the stream's remote peer, anyone can open a
+// klever-node-auth stream, declare a validator's pid and sign with a throwaway key: the association
+// would be re-pointed at the throwaway pk and the real validator would stop resolving as
+// ValidatorPeer, so IsOriginatorElectedForTopic would then reject it from validator-only topics.
+// Same invariant as the heartbeat check in KLR-48, in the demote direction.
+func TestIdentityProvider_ProcessReceivedDataForeignPidShouldErrorAndNotUpdateCollector(t *testing.T) {
+	t.Parallel()
+
+	victimPid := core.PeerID("a validator pid")
+	attackerPid := core.PeerID("an attacker pid")
+
+	updateWasCalled := false
+	verifyWasCalled := false
+	removedPid := core.PeerID("")
+
+	host, _ := createStubHostForIdentityProvider()
+	ip, _ := libp2p.NewIdentityProvider(
+		host,
+		&mock.NetworkShardingCollectorStub{
+			UpdatePeerIDPublicKeyCalled: func(pid core.PeerID, pk []byte) {
+				updateWasCalled = true
+			},
+			RemovePeerIDAssociationCalled: func(pid core.PeerID) {
+				removedPid = pid
+			},
+		},
+		&mock.SignerVerifierStub{
+			VerifyCalled: func(message []byte, sig []byte, pk []byte) error {
+				verifyWasCalled = true
+				// a real attacker signs with their own key, so the signature is valid
+				return nil
+			},
+		},
+		createAuthMarshalizerForIdentityProvider(victimPid),
+		time.Second,
+	)
+
+	err := ip.ProcessReceivedData(make([]byte, 0), attackerPid)
+
+	assert.True(t, errors.Is(err, p2p.ErrAuthPidMismatch))
+	assert.False(t, updateWasCalled, "the forged association must never be stored")
+	assert.False(t, verifyWasCalled, "a foreign pid is rejected before the signature check")
+	assert.Equal(t, attackerPid, removedPid,
+		"the sender's own association is dropped, never the declared victim's")
+}
+
+func TestIdentityProvider_ProcessReceivedDataOwnPidShouldUpdateCollector(t *testing.T) {
+	t.Parallel()
+
+	senderPid := core.PeerID("the sender pid")
+
+	updatedPid := core.PeerID("")
+	removeWasCalled := false
+
+	host, _ := createStubHostForIdentityProvider()
+	ip, _ := libp2p.NewIdentityProvider(
+		host,
+		&mock.NetworkShardingCollectorStub{
+			UpdatePeerIDPublicKeyCalled: func(pid core.PeerID, pk []byte) {
+				updatedPid = pid
+			},
+			RemovePeerIDAssociationCalled: func(pid core.PeerID) {
+				removeWasCalled = true
+			},
+		},
+		&mock.SignerVerifierStub{
+			VerifyCalled: func(message []byte, sig []byte, pk []byte) error {
+				return nil
+			},
+		},
+		createAuthMarshalizerForIdentityProvider(senderPid),
+		time.Second,
+	)
+
+	err := ip.ProcessReceivedData(make([]byte, 0), senderPid)
+
+	assert.Nil(t, err)
+	assert.Equal(t, senderPid, updatedPid)
+	assert.False(t, removeWasCalled)
 }
 
 //------- handleStreams
@@ -352,7 +463,7 @@ func TestIdentityProvider_HandleStreamsReceivedMessageShouldUpdateCollector(t *t
 				return nil
 			},
 		},
-		createStubMarshalizerForIdentityProvider(),
+		createAuthMarshalizerForIdentityProvider(stubRemotePeerID),
 		time.Second,
 	)
 	_, _ = stream.Write([]byte("mock data"))
@@ -461,6 +572,7 @@ func TestIdentityProvider_HandleStreamsSuccessShouldCloseStream(t *testing.T) {
 	t.Parallel()
 
 	newStream := mock.NewStreamMock()
+	newStream.SetConn(createStubConnForIdentityProvider())
 	host := &mock.ConnectableHostStub{
 		SetStreamHandlerCalled: func(pid protocol.ID, handler network.StreamHandler) {},
 		IDCalled: func() peer.ID {
@@ -477,7 +589,7 @@ func TestIdentityProvider_HandleStreamsSuccessShouldCloseStream(t *testing.T) {
 				return nil
 			},
 		},
-		createStubMarshalizerForIdentityProvider(),
+		createAuthMarshalizerForIdentityProvider(stubRemotePeerID),
 		time.Second,
 	)
 	_, _ = newStream.Write([]byte("mock data"))

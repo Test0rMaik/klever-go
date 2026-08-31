@@ -1,6 +1,9 @@
 package process
 
 import (
+	"bytes"
+	"fmt"
+
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/crypto"
 	"github.com/klever-io/klever-go/network/p2p"
@@ -60,6 +63,20 @@ func (mp *MessageProcessor) CreateHeartbeatFromP2PMessage(message p2p.MessageP2P
 	err = verifyLengths(hbRecv)
 	if err != nil {
 		return nil, err
+	}
+
+	//the heartbeat signature only binds the public key to hbRecv.Pid, so a heartbeat relayed by another peer
+	//must be discarded before any association is stored, otherwise the originator's pid would be mapped to
+	//the signer's public key and would later be resolved as a validator peer
+	if !bytes.Equal(hbRecv.Pid, message.Peer().Bytes()) {
+		//drop any association previously learned for this originator, it can no longer be trusted
+		mp.networkShardingCollector.RemovePeerIDAssociation(message.Peer())
+
+		return nil, fmt.Errorf("%w heartbeat pid %s, message pid %s",
+			heartbeat.ErrHeartbeatPidMismatch,
+			p2p.PeerIDToShortString(core.PeerID(hbRecv.Pid)),
+			p2p.PeerIDToShortString(message.Peer()),
+		)
 	}
 
 	err = mp.peerSignatureHandler.VerifyPeerSignature(hbRecv.Pubkey, core.PeerID(hbRecv.Pid), hbRecv.Signature)
