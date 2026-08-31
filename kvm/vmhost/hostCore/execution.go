@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"slices"
 
 	logger "github.com/klever-io/klever-go-logger"
 	"github.com/klever-io/klever-go/common"
@@ -1146,6 +1147,7 @@ func (host *vmHost) callBuiltinFunction(input *vmcommon.ContractCallInput) (*vmc
 	}
 
 	var parsedTransfer *vmcommon.ParsedKDATransfers
+	var transfersOwedToRecipient []*vmcommon.KDATransfer
 
 	if input.Function == core.BuiltInFunctionTransfer {
 		var err error
@@ -1156,17 +1158,34 @@ func (host *vmHost) callBuiltinFunction(input *vmcommon.ContractCallInput) (*vmc
 		}
 
 		input.KDATransfers = append(input.KDATransfers, parsedTransfer.KDATransfers...)
+
+		// A transfer already flagged executed here was settled to input.RecipientAddr as it stands
+		// now, by the caller's TransferKDANFTExecuteWithTypedArgs - the only producer of executed
+		// transfers reaching this function. When the parser retargets the call to an address taken
+		// from args[0], those transfers belong to somebody else and are not the new recipient's call
+		// value. ProcessBuiltInFunction below marks the pending ones executed too, so this is the
+		// last point where the two can be told apart.
+		transfersOwedToRecipient = input.KDATransfers
+		if !bytes.Equal(input.RecipientAddr, parsedTransfer.RcvAddr) && host.ForkController().FixAuditChangesV5() {
+			transfersOwedToRecipient = slices.DeleteFunc(
+				slices.Clone(input.KDATransfers), (*vmcommon.KDATransfer).IsExecuted)
+
+			log.Trace("callBuiltinFunction skip transfers settled to another recipient",
+				"settledTo", input.RecipientAddr, "recipient", parsedTransfer.RcvAddr,
+				"carried", len(transfersOwedToRecipient), "of", len(input.KDATransfers))
+		}
+
 		// recipient may be updated by the parser
 		input.RecipientAddr = parsedTransfer.RcvAddr
 	}
-
+	//ProcessBuiltInFunction must never resize input.KDATransfers; the legacy branch depends on it too.
 	vmOutput, err := host.Blockchain().ProcessBuiltInFunction(input)
 	if err != nil {
 		metering.UseGas(input.GasProvided)
 		return nil, nil, err
 	}
 
-	newVMInput, err := host.isSCExecutionAfterBuiltInFunc(parsedTransfer, input, vmOutput)
+	newVMInput, err := host.isSCExecutionAfterBuiltInFunc(parsedTransfer, input, vmOutput, transfersOwedToRecipient)
 	if err != nil {
 		metering.UseGas(input.GasProvided)
 		return nil, nil, err
@@ -1189,10 +1208,15 @@ func (host *vmHost) callBuiltinFunction(input *vmcommon.ContractCallInput) (*vmc
 	return newVMInput, vmOutput, nil
 }
 
+// isSCExecutionAfterBuiltInFunc builds the follow-up SC call input from a built-in function call.
+//
+// transfersOwedToRecipient holds the transfers parsedTransfer.RcvAddr is actually owed, selected by
+// callBuiltinFunction before the built-in ran, and is what the callee gets to observe as call value.
 func (host *vmHost) isSCExecutionAfterBuiltInFunc(
 	parsedTransfer *vmcommon.ParsedKDATransfers,
 	vmInput *vmcommon.ContractCallInput,
 	vmOutput *vmcommon.VMOutput,
+	transfersOwedToRecipient []*vmcommon.KDATransfer,
 ) (*vmcommon.ContractCallInput, error) {
 	if vmOutput.ReturnCode != vmcommon.Ok {
 		return nil, nil
@@ -1211,7 +1235,7 @@ func (host *vmHost) isSCExecutionAfterBuiltInFunc(
 			GasProvided:        vmOutput.GasRemaining,
 			OriginalTxHash:     vmInput.OriginalTxHash,
 			CurrentTxHash:      vmInput.CurrentTxHash,
-			KDATransfers:       make([]*vmcommon.KDATransfer, len(vmInput.KDATransfers)),
+			KDATransfers:       make([]*vmcommon.KDATransfer, 0, len(transfersOwedToRecipient)),
 		},
 		RecipientAddr:     parsedTransfer.RcvAddr,
 		Function:          parsedTransfer.CallFunction,
@@ -1219,9 +1243,9 @@ func (host *vmHost) isSCExecutionAfterBuiltInFunc(
 	}
 
 	// load from inputs and mark as executed
-	for i, transfer := range vmInput.KDATransfers {
+	for _, transfer := range transfersOwedToRecipient {
 		t := transfer.Clone()
-		newVMInput.KDATransfers[i] = t.SetExecuted()
+		newVMInput.KDATransfers = append(newVMInput.KDATransfers, t.SetExecuted())
 	}
 
 	return newVMInput, nil
