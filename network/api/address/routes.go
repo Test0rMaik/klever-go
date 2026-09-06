@@ -1,11 +1,14 @@
 package address
 
 import (
+	"fmt"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
+	logger "github.com/klever-io/klever-go-logger"
 	"github.com/klever-io/klever-go/data/state"
 
 	"github.com/klever-io/klever-go/kapps"
@@ -14,6 +17,8 @@ import (
 	"github.com/klever-io/klever-go/network/api/shared"
 	"github.com/klever-io/klever-go/network/api/wrapper"
 )
+
+var log = logger.GetOrCreate("api/address")
 
 const (
 	getAccountPath            = "/:address"
@@ -24,6 +29,21 @@ const (
 	getAvailableClaimListPath = "/:address/allowance/list"
 
 	defaultAsset = "KLV"
+
+	// maxAssetsPerClaimList bounds the per-request fanout. Each asset costs three exclusive
+	// AccountsDB.LoadAccount acquisitions (the user account plus the Staking and KDA kapp
+	// accounts), on mutexes shared with block processing, so the cap is set from that cost
+	// rather than from what a client might conceivably ask for. Raise it once the invariant
+	// loads are hoisted out of the fanout (KLC-2652), which drops the per-request cost from
+	// 3n acquisitions to 3.
+	maxAssetsPerClaimList = 25
+	// maxConcurrentClaimLookups bounds in-flight lookups per request. Useful parallelism here
+	// is about two: LoadAccount holds an exclusive mutex for its whole call, and each asset
+	// takes one acquisition on the user adapter and two on the kapps adapter, so extra
+	// goroutines queue rather than overlap. Only the trie reads outside LoadAccount overlap,
+	// which is what the remaining headroom is for. Node-wide this multiplies by
+	// webServer.simultaneousRequests, so the constant is deliberately small.
+	maxConcurrentClaimLookups = 4
 )
 
 // FacadeHandler interface defines methods that can be used by the gin webserver
@@ -337,11 +357,39 @@ func GetAvailableClaim(c *gin.Context) {
 	)
 }
 
+// parseRequestedAssets splits a comma-separated asset query into distinct, non-empty asset IDs.
+//
+// It deliberately returns up to maxAssetsPerClaimList+1 entries rather than truncating at the cap,
+// so the caller can distinguish an at-cap request from an over-cap one and reject the latter with
+// HTTP 400. Breaking one element earlier would silently serve partial results with HTTP 200.
+func parseRequestedAssets(assets string) []string {
+	raw := strings.Split(assets, ",")
+	assetList := make([]string, 0, min(len(raw), maxAssetsPerClaimList+1))
+	requested := make(map[string]struct{}, cap(assetList))
+
+	for _, s := range raw {
+		t := strings.TrimSpace(s)
+		if t == "" {
+			continue
+		}
+		if _, alreadyRequested := requested[t]; alreadyRequested {
+			continue
+		}
+		requested[t] = struct{}{}
+		assetList = append(assetList, t)
+		if len(assetList) > maxAssetsPerClaimList {
+			break
+		}
+	}
+
+	return assetList
+}
+
 // @Summary returns the rewards available for a specific list of asset in an account
 // @Tags Address
 // @Produce json
 // @Param address path string true "address"
-// @Param asset query string true "assets (comma-separated asset IDs), e.g. KLV,KFI"
+// @Param asset query string true "assets (comma-separated asset IDs, max 25), e.g. KLV,KFI"
 // @Success 200 object shared.GenericAPIResponse{data=models.AvailableClaimListResponse} "ok"
 // @Failure 400 object shared.GenericAPIResponse "some error"
 // @Failure 500 object shared.GenericAPIResponse "internal error"
@@ -357,14 +405,7 @@ func GetAvailableClaimList(c *gin.Context) {
 	assets := c.Query("asset") // need to be separated by comma
 
 	// split assets
-	raw := strings.Split(assets, ",")
-	assetList := make([]string, 0, len(raw))
-	for _, s := range raw {
-		t := strings.TrimSpace(s)
-		if t != "" {
-			assetList = append(assetList, t)
-		}
-	}
+	assetList := parseRequestedAssets(assets)
 
 	if addr == "" {
 		c.JSON(
@@ -378,7 +419,7 @@ func GetAvailableClaimList(c *gin.Context) {
 		return
 	}
 
-	if len(assetList) <= 0 || assetList[0] == "" {
+	if len(assetList) == 0 {
 		c.JSON(
 			http.StatusBadRequest,
 			shared.GenericAPIResponse{
@@ -390,15 +431,54 @@ func GetAvailableClaimList(c *gin.Context) {
 		return
 	}
 
+	if len(assetList) > maxAssetsPerClaimList {
+		c.JSON(
+			http.StatusBadRequest,
+			shared.GenericAPIResponse{
+				Data: nil,
+				Error: errors.APIErrorString(
+					errors.ErrGetAvailableClaimList,
+					fmt.Errorf("%w: maximum is %d", errors.ErrTooManyAssets, maxAssetsPerClaimList),
+				),
+				Code: shared.ReturnCodeRequestError,
+			},
+		)
+		return
+	}
+
 	var wg sync.WaitGroup
 	var lock sync.Mutex
 	allowanceError := make(map[string]error)
 	assetData := make(map[string]*models.AvailableClaimResponse, len(assetList))
 
+	sem := make(chan struct{}, maxConcurrentClaimLookups)
+
 	for _, asset := range assetList {
 		wg.Add(1)
+		sem <- struct{}{}
 		go func(assetId string) {
 			defer wg.Done()
+			defer func() { <-sem }()
+			// gin.Recovery only wraps the handler goroutine, so an unrecovered panic here
+			// would terminate the node process rather than fail the request.
+			defer func() {
+				r := recover()
+				if r == nil {
+					return
+				}
+
+				log.Error("recovered from panic while computing available claim",
+					"address", addr,
+					"asset", assetId,
+					"panic", r,
+					"stack", string(debug.Stack()),
+				)
+
+				lock.Lock()
+				defer lock.Unlock()
+				allowanceError[assetId] = errors.ErrClaimLookupFailed
+			}()
+
 			claimResponse, err := facade.GetAvailableClaim(addr, assetId)
 
 			lock.Lock()

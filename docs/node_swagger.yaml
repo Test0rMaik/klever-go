@@ -1626,7 +1626,7 @@ paths:
         name: address
         required: true
         type: string
-      - description: assets (comma-separated asset IDs), e.g. KLV,KFI
+      - description: assets (comma-separated asset IDs, max 25), e.g. KLV,KFI
         in: query
         name: asset
         required: true

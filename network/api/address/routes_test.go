@@ -5,7 +5,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -14,12 +18,14 @@ import (
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/kapps"
 	"github.com/klever-io/klever-go/network/api/address"
+	apiErrors "github.com/klever-io/klever-go/network/api/errors"
 	"github.com/klever-io/klever-go/network/api/middleware"
 	"github.com/klever-io/klever-go/network/api/mock"
 	"github.com/klever-io/klever-go/network/api/models"
 	"github.com/klever-io/klever-go/network/api/shared"
 	"github.com/klever-io/klever-go/network/api/wrapper"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const validAddress = "klv17e8zzgn73h6ehe3c6q9vlt77kuxk5euddmhymy5uhv2rhv0dc0nqlfp0ap"
@@ -545,6 +551,365 @@ func TestGetAvailableClaimList(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetAvailableClaimListDeduplicatesRequestedAssets(t *testing.T) {
+	t.Parallel()
+
+	var lock sync.Mutex
+	callsPerAsset := make(map[string]int)
+
+	facade := mock.Facade{
+		RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
+			lock.Lock()
+			callsPerAsset[assetId]++
+			lock.Unlock()
+
+			return &models.AvailableClaimResponse{
+				StakingRewards:    100,
+				AllStakingRewards: map[string]int64{assetId: 200},
+				Allowance:         300,
+			}, nil
+		},
+	}
+
+	ws := startNodeServer(&facade)
+	url := fmt.Sprintf("/address/%s/allowance/list?asset=%s", validAddress, "KLV,BTC,KLV,%20KLV%20,BTC,,KFI,KLV")
+
+	req, _ := http.NewRequest("GET", url, nil)
+	resp := httptest.NewRecorder()
+	ws.ServeHTTP(resp, req)
+
+	assert.Equal(t, http.StatusOK, resp.Code)
+
+	var response shared.GenericAPIResponse
+	err := json.Unmarshal(resp.Body.Bytes(), &response)
+	assert.NoError(t, err)
+	assert.Empty(t, response.Error)
+
+	lock.Lock()
+	defer lock.Unlock()
+	assert.Equal(t, map[string]int{"KLV": 1, "BTC": 1, "KFI": 1}, callsPerAsset)
+
+	assets := extractClaimListAssets(t, response)
+	assert.Len(t, assets, 3)
+	assert.Contains(t, assets, "KLV")
+	assert.Contains(t, assets, "BTC")
+	assert.Contains(t, assets, "KFI")
+}
+
+func TestGetAvailableClaimListRejectsExcessiveAssetCount(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		assetCount    int
+		expectedCode  int
+		expectedErr   string
+		expectedCalls int64
+	}{
+		{
+			name:          "at the maximum allowed asset count",
+			assetCount:    address.MaxAssetsPerClaimList,
+			expectedCode:  http.StatusOK,
+			expectedCalls: int64(address.MaxAssetsPerClaimList),
+		},
+		{
+			name:         "one asset above the maximum allowed asset count",
+			assetCount:   address.MaxAssetsPerClaimList + 1,
+			expectedCode: http.StatusBadRequest,
+			expectedErr: fmt.Sprintf(
+				"could not get rewards for requested account asset list: too many assets requested: maximum is %d",
+				address.MaxAssetsPerClaimList,
+			),
+			expectedCalls: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int64
+
+			facade := mock.Facade{
+				RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
+					calls.Add(1)
+
+					return &models.AvailableClaimResponse{
+						StakingRewards:    100,
+						AllStakingRewards: map[string]int64{assetId: 200},
+						Allowance:         300,
+					}, nil
+				},
+			}
+
+			ws := startNodeServer(&facade)
+			url := fmt.Sprintf(
+				"/address/%s/allowance/list?asset=%s",
+				validAddress,
+				strings.Join(buildRequestedAssets(tc.assetCount), ","),
+			)
+
+			req, _ := http.NewRequest("GET", url, nil)
+			resp := httptest.NewRecorder()
+			ws.ServeHTTP(resp, req)
+
+			assert.Equal(t, tc.expectedCode, resp.Code)
+			assert.Equal(t, tc.expectedCalls, calls.Load())
+
+			var response shared.GenericAPIResponse
+			err := json.Unmarshal(resp.Body.Bytes(), &response)
+			assert.NoError(t, err)
+
+			if tc.expectedErr != "" {
+				assert.Equal(t, tc.expectedErr, response.Error)
+				assert.Equal(t, shared.ReturnCodeRequestError, response.Code)
+				assert.Nil(t, response.Data)
+				return
+			}
+
+			assert.Empty(t, response.Error)
+			assert.Len(t, extractClaimListAssets(t, response), tc.assetCount)
+		})
+	}
+}
+
+func TestGetAvailableClaimListReturnsAllRequestedAssets(t *testing.T) {
+	t.Parallel()
+
+	requestedAssets := buildRequestedAssets(25)
+	rewardsPerAsset := make(map[string]int64, len(requestedAssets))
+	for i, asset := range requestedAssets {
+		rewardsPerAsset[asset] = int64(100 + i)
+	}
+
+	facade := mock.Facade{
+		RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
+			return &models.AvailableClaimResponse{
+				StakingRewards:    rewardsPerAsset[assetId],
+				AllStakingRewards: map[string]int64{assetId: 200},
+				Allowance:         300,
+			}, nil
+		},
+	}
+
+	ws := startNodeServer(&facade)
+	url := fmt.Sprintf(
+		"/address/%s/allowance/list?asset=%s",
+		validAddress,
+		strings.Join(requestedAssets, ","),
+	)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	resp := httptest.NewRecorder()
+	ws.ServeHTTP(resp, req)
+
+	assert.Equal(t, http.StatusOK, resp.Code)
+
+	var response shared.GenericAPIResponse
+	err := json.Unmarshal(resp.Body.Bytes(), &response)
+	assert.NoError(t, err)
+	assert.Empty(t, response.Error)
+	assert.Equal(t, shared.ReturnCodeSuccess, response.Code)
+
+	assets := extractClaimListAssets(t, response)
+	assert.Len(t, assets, len(requestedAssets))
+
+	for _, asset := range requestedAssets {
+		entry, ok := assets[asset].(map[string]interface{})
+		if !assert.True(t, ok, asset) {
+			continue
+		}
+
+		assert.Equal(t, float64(rewardsPerAsset[asset]), entry["stakingRewards"])
+		assert.Equal(t, map[string]interface{}{asset: float64(200)}, entry["allStakingRewards"])
+		assert.Equal(t, float64(300), entry["allowance"])
+	}
+}
+
+func TestGetAvailableClaimListBoundsConcurrentLookups(t *testing.T) {
+	t.Parallel()
+
+	const expectedMaxConcurrentLookups = int64(address.MaxConcurrentClaimLookups)
+
+	var inFlight atomic.Int64
+	var peakInFlight atomic.Int64
+
+	facade := mock.Facade{
+		RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
+			current := inFlight.Add(1)
+			for {
+				peak := peakInFlight.Load()
+				if current <= peak || peakInFlight.CompareAndSwap(peak, current) {
+					break
+				}
+			}
+
+			time.Sleep(2 * time.Millisecond)
+			inFlight.Add(-1)
+
+			return &models.AvailableClaimResponse{
+				StakingRewards:    100,
+				AllStakingRewards: map[string]int64{assetId: 200},
+				Allowance:         300,
+			}, nil
+		},
+	}
+
+	requestedAssets := buildRequestedAssets(address.MaxAssetsPerClaimList)
+
+	ws := startNodeServer(&facade)
+	url := fmt.Sprintf(
+		"/address/%s/allowance/list?asset=%s",
+		validAddress,
+		strings.Join(requestedAssets, ","),
+	)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	resp := httptest.NewRecorder()
+	ws.ServeHTTP(resp, req)
+
+	assert.Equal(t, http.StatusOK, resp.Code)
+
+	var response shared.GenericAPIResponse
+	err := json.Unmarshal(resp.Body.Bytes(), &response)
+	assert.NoError(t, err)
+	assert.Empty(t, response.Error)
+	assert.Len(t, extractClaimListAssets(t, response), len(requestedAssets))
+
+	assert.Zero(t, inFlight.Load())
+	assert.LessOrEqual(t, peakInFlight.Load(), expectedMaxConcurrentLookups)
+	assert.Greater(t, peakInFlight.Load(), int64(1))
+}
+
+func TestGetAvailableClaimListReleasesSlotsOnLookupError(t *testing.T) {
+	t.Parallel()
+
+	const expectedMaxConcurrentLookups = int64(address.MaxConcurrentClaimLookups)
+
+	var calls atomic.Int64
+	var inFlight atomic.Int64
+	var peakInFlight atomic.Int64
+
+	facade := mock.Facade{
+		RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
+			current := inFlight.Add(1)
+			for {
+				peak := peakInFlight.Load()
+				if current <= peak || peakInFlight.CompareAndSwap(peak, current) {
+					break
+				}
+			}
+
+			time.Sleep(time.Millisecond)
+			inFlight.Add(-1)
+
+			// Fail most lookups: if a failing lookup did not release its semaphore slot,
+			// the dispatch loop would block once the bound is exhausted and never return.
+			if calls.Add(1)%3 != 0 {
+				return nil, fmt.Errorf("lookup failed for %s", assetId)
+			}
+
+			return &models.AvailableClaimResponse{
+				StakingRewards:    100,
+				AllStakingRewards: map[string]int64{assetId: 200},
+				Allowance:         300,
+			}, nil
+		},
+	}
+
+	requestedAssets := buildRequestedAssets(address.MaxAssetsPerClaimList)
+
+	ws := startNodeServer(&facade)
+	url := fmt.Sprintf(
+		"/address/%s/allowance/list?asset=%s",
+		validAddress,
+		strings.Join(requestedAssets, ","),
+	)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	resp := httptest.NewRecorder()
+	ws.ServeHTTP(resp, req)
+
+	assert.Equal(t, http.StatusBadRequest, resp.Code)
+
+	var response shared.GenericAPIResponse
+	err := json.Unmarshal(resp.Body.Bytes(), &response)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, response.Error)
+
+	// Every asset was dispatched, so no slot was leaked by a failing lookup.
+	assert.Equal(t, int64(len(requestedAssets)), calls.Load())
+	assert.Zero(t, inFlight.Load())
+	assert.LessOrEqual(t, peakInFlight.Load(), expectedMaxConcurrentLookups)
+}
+
+func TestGetAvailableClaimListRecoversFromLookupPanic(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int64
+
+	facade := mock.Facade{
+		RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
+			// Panic on a subset; gin.Recovery cannot reach these goroutines, so an
+			// unrecovered panic here would take the whole process down.
+			if calls.Add(1)%2 == 0 {
+				panic("simulated lookup panic for " + assetId)
+			}
+
+			return &models.AvailableClaimResponse{
+				StakingRewards:    100,
+				AllStakingRewards: map[string]int64{assetId: 200},
+				Allowance:         300,
+			}, nil
+		},
+	}
+
+	requestedAssets := buildRequestedAssets(20)
+
+	ws := startNodeServer(&facade)
+	url := fmt.Sprintf(
+		"/address/%s/allowance/list?asset=%s",
+		validAddress,
+		strings.Join(requestedAssets, ","),
+	)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	resp := httptest.NewRecorder()
+
+	require.NotPanics(t, func() { ws.ServeHTTP(resp, req) })
+
+	assert.Equal(t, http.StatusBadRequest, resp.Code)
+	assert.Equal(t, int64(len(requestedAssets)), calls.Load())
+
+	var response shared.GenericAPIResponse
+	err := json.Unmarshal(resp.Body.Bytes(), &response)
+	assert.NoError(t, err)
+	assert.Contains(t, fmt.Sprint(response.Error), apiErrors.ErrClaimLookupFailed.Error())
+}
+
+func buildRequestedAssets(count int) []string {
+	assets := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		assets = append(assets, fmt.Sprintf("KDA%d-A1B2", i))
+	}
+
+	return assets
+}
+
+func extractClaimListAssets(t *testing.T, response shared.GenericAPIResponse) map[string]interface{} {
+	t.Helper()
+
+	data, ok := response.Data.(map[string]interface{})
+	if !assert.True(t, ok) {
+		return nil
+	}
+
+	assets, ok := data["assets"].(map[string]interface{})
+	if !assert.True(t, ok) {
+		return nil
+	}
+
+	return assets
 }
 
 func TestInvalidFacade(t *testing.T) {
