@@ -20,6 +20,11 @@ import (
 
 var fromConnectedPeer = core.PeerID("from connected peer")
 
+// maxP2PSendBuffSize mirrors maxSendBuffSize of network/p2p/libp2p/netMessenger.go: a response
+// larger than this is rejected with ErrMessageTooLarge and the requester gets nothing, so it is
+// the real bound the aggregate budget has to keep the response under.
+const maxP2PSendBuffSize = (1 << 20) - 64*1024
+
 func createMockArgTrieNodeResolver() resolvers.ArgTrieNodeResolver {
 	return resolvers.ArgTrieNodeResolver{
 		SenderResolver:   &mock.TopicResolverSenderStub{},
@@ -452,4 +457,252 @@ func TestTrieNodeResolver_ProcessReceivedMessage_RecoversFromPanic(t *testing.T)
 		"expected ErrProcessReceivedMessagePanicked, got %v", processErr)
 	assert.True(t, arg.Throttler.(*mock.ThrottlerStub).StartWasCalled)
 	assert.True(t, arg.Throttler.(*mock.ThrottlerStub).EndWasCalled)
+}
+
+func TestTrieNodeResolver_ProcessReceivedMessageResolvesDuplicateHashesOnce(t *testing.T) {
+	t.Parallel()
+
+	marshalizer := &mock.MarshalizerMock{}
+	resolvedHashes := 0
+
+	tr := &mock.TrieStub{
+		GetSerializedNodesCalled: func(_ []byte, maxSize uint64) ([][]byte, uint64, error) {
+			resolvedHashes++
+			return [][]byte{[]byte("node")}, maxSize - 4, nil
+		},
+	}
+
+	arg := createMockArgTrieNodeResolver()
+	arg.Marshalizer = marshalizer
+	arg.TrieDataGetter = tr
+	tnRes, err := resolvers.NewTrieNodeResolver(arg)
+	require.NoError(t, err)
+
+	repeated := &batch.Batch{Data: [][]byte{[]byte("h1"), []byte("h1"), []byte("h1"), []byte("h1")}}
+	buff, err := marshalizer.Marshal(repeated)
+	require.NoError(t, err)
+
+	data, err := marshalizer.Marshal(&retriever.RequestData{
+		Type:  retriever.RequestDataType_HashArrayType,
+		Value: buff,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, tnRes.ProcessReceivedMessage(&mock.P2PMessageMock{DataField: data}, fromConnectedPeer))
+	require.Equal(t, 1, resolvedHashes)
+}
+
+func TestTrieNodeResolver_ProcessReceivedMessageStopsAtAggregateResponseCap(t *testing.T) {
+	t.Parallel()
+
+	marshalizer := &mock.MarshalizerMock{}
+	largeNode := bytes.Repeat([]byte{0xAB}, 200*1024)
+	resolvedHashes := 0
+	var sentNodes [][]byte
+
+	tr := &mock.TrieStub{
+		GetSerializedNodesCalled: func(_ []byte, maxSize uint64) ([][]byte, uint64, error) {
+			resolvedHashes++
+			return [][]byte{largeNode}, maxSize, nil
+		},
+	}
+
+	arg := createMockArgTrieNodeResolver()
+	arg.Marshalizer = marshalizer
+	arg.TrieDataGetter = tr
+	arg.SenderResolver = &mock.TopicResolverSenderStub{
+		SendCalled: func(buff []byte, _ core.PeerID) error {
+			b := &batch.Batch{}
+			require.NoError(t, marshalizer.Unmarshal(b, buff))
+			sentNodes = b.Data
+			return nil
+		},
+	}
+	tnRes, err := resolvers.NewTrieNodeResolver(arg)
+	require.NoError(t, err)
+
+	hashes := &batch.Batch{Data: [][]byte{[]byte("h1"), []byte("h2"), []byte("h3"), []byte("h4")}}
+	buff, err := marshalizer.Marshal(hashes)
+	require.NoError(t, err)
+
+	data, err := marshalizer.Marshal(&retriever.RequestData{
+		Type:  retriever.RequestDataType_HashArrayType,
+		Value: buff,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, tnRes.ProcessReceivedMessage(&mock.P2PMessageMock{DataField: data}, fromConnectedPeer))
+	require.Equal(t, 1, len(sentNodes))
+	// every hash is still attempted: a sub-trie that does not fit the space left is dropped,
+	// not treated as the end of the response, so a smaller later hash can still be served
+	require.Equal(t, 4, resolvedHashes)
+}
+
+func TestTrieNodeResolver_ProcessReceivedMessageOverBudgetHashDoesNotDropTheRest(t *testing.T) {
+	t.Parallel()
+
+	marshalizer := &mock.MarshalizerMock{}
+	largeNode := bytes.Repeat([]byte{0xAB}, 200*1024)
+	smallNode := bytes.Repeat([]byte{0x01}, 1024)
+	var sentNodes [][]byte
+
+	tr := &mock.TrieStub{
+		GetSerializedNodesCalled: func(hash []byte, maxSize uint64) ([][]byte, uint64, error) {
+			node := largeNode
+			if string(hash) == "small" {
+				node = smallNode
+			}
+			// mirrors the trie: the first node is served even when it does not fit
+			if uint64(len(node)) >= maxSize {
+				return [][]byte{node}, 0, nil
+			}
+
+			return [][]byte{node}, maxSize - uint64(len(node)), nil
+		},
+	}
+
+	arg := createMockArgTrieNodeResolver()
+	arg.Marshalizer = marshalizer
+	arg.TrieDataGetter = tr
+	arg.SenderResolver = &mock.TopicResolverSenderStub{
+		SendCalled: func(buff []byte, _ core.PeerID) error {
+			b := &batch.Batch{}
+			require.NoError(t, marshalizer.Unmarshal(b, buff))
+			sentNodes = b.Data
+			return nil
+		},
+	}
+	tnRes, err := resolvers.NewTrieNodeResolver(arg)
+	require.NoError(t, err)
+
+	// h2 alone fits the 256KB budget but not the ~56KB left after h1, so it is dropped; the
+	// 1KB hash behind it still fits and must not be lost with it
+	hashes := &batch.Batch{Data: [][]byte{[]byte("h1"), []byte("h2"), []byte("small")}}
+	buff, err := marshalizer.Marshal(hashes)
+	require.NoError(t, err)
+
+	data, err := marshalizer.Marshal(&retriever.RequestData{
+		Type:  retriever.RequestDataType_HashArrayType,
+		Value: buff,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, tnRes.ProcessReceivedMessage(&mock.P2PMessageMock{DataField: data}, fromConnectedPeer))
+	require.Equal(t, [][]byte{largeNode, smallNode}, sentNodes)
+}
+
+func TestTrieNodeResolver_ProcessReceivedMessageServesOversizedLeafAtAnyPosition(t *testing.T) {
+	t.Parallel()
+
+	// the real wire marshalizer: the mock is JSON and inflates []byte by 4/3, which would
+	// make the send-limit assertion measure the encoding instead of the response
+	marshalizer := marshal.NewProtoMarshalizer()
+	// large enough that appending the leaf on top of them would blow the p2p send limit
+	largeNodePrefix := bytes.Repeat([]byte{0x01}, 200*1024)
+	// a leaf at state.MaxLeafSize, three times the 256KB response budget
+	oversizedLeaf := bytes.Repeat([]byte{0x02}, (1<<18)+(1<<19))
+
+	tr := &mock.TrieStub{
+		GetSerializedNodesCalled: func(hash []byte, maxSize uint64) ([][]byte, uint64, error) {
+			node := largeNodePrefix
+			if string(hash) == "oversized" {
+				node = oversizedLeaf
+			}
+			if uint64(len(node)) >= maxSize {
+				return [][]byte{node}, 0, nil
+			}
+
+			return [][]byte{node}, maxSize - uint64(len(node)), nil
+		},
+	}
+
+	var sentNodes [][]byte
+	sentBuffLen := 0
+	arg := createMockArgTrieNodeResolver()
+	arg.Marshalizer = marshalizer
+	arg.TrieDataGetter = tr
+	arg.SenderResolver = &mock.TopicResolverSenderStub{
+		SendCalled: func(buff []byte, _ core.PeerID) error {
+			b := &batch.Batch{}
+			require.Nil(t, marshalizer.Unmarshal(b, buff))
+			sentNodes = b.Data
+			sentBuffLen = len(buff)
+			return nil
+		},
+	}
+	tnRes, err := resolvers.NewTrieNodeResolver(arg)
+	require.Nil(t, err)
+
+	// the requester builds its hash list by ranging over a map (data/trie/sync.go), so the
+	// oversized leaf lands at an arbitrary position of the request
+	positions := [][][]byte{
+		{[]byte("oversized"), []byte("h2"), []byte("h3")},
+		{[]byte("h1"), []byte("oversized"), []byte("h3")},
+		{[]byte("h1"), []byte("h2"), []byte("oversized")},
+	}
+
+	for _, hashes := range positions {
+		sentNodes = nil
+		buff, errMarshal := marshalizer.Marshal(&batch.Batch{Data: hashes})
+		require.Nil(t, errMarshal)
+
+		data, errMarshal := marshalizer.Marshal(&retriever.RequestData{
+			Type:  retriever.RequestDataType_HashArrayType,
+			Value: buff,
+		})
+		require.Nil(t, errMarshal)
+
+		require.Nil(t, tnRes.ProcessReceivedMessage(&mock.P2PMessageMock{DataField: data}, fromConnectedPeer))
+		// served alone: appended to the other nodes the batch would be rejected as too large
+		assert.Equal(t, [][]byte{oversizedLeaf}, sentNodes)
+		assert.Less(t, sentBuffLen, maxP2PSendBuffSize)
+	}
+}
+
+func TestTrieNodeResolver_ProcessReceivedMessageUnresolvableHashKeepsBudgetForTheRest(t *testing.T) {
+	t.Parallel()
+
+	marshalizer := &mock.MarshalizerMock{}
+	smallNode := bytes.Repeat([]byte{0x01}, 1024)
+
+	tr := &mock.TrieStub{
+		GetSerializedNodesCalled: func(hash []byte, maxSize uint64) ([][]byte, uint64, error) {
+			if string(hash) == "missing" {
+				return nil, 0, errors.New("hash not found")
+			}
+			if uint64(len(smallNode)) >= maxSize {
+				return [][]byte{smallNode}, 0, nil
+			}
+
+			return [][]byte{smallNode}, maxSize - uint64(len(smallNode)), nil
+		},
+	}
+
+	var sentNodes [][]byte
+	arg := createMockArgTrieNodeResolver()
+	arg.Marshalizer = marshalizer
+	arg.TrieDataGetter = tr
+	arg.SenderResolver = &mock.TopicResolverSenderStub{
+		SendCalled: func(buff []byte, _ core.PeerID) error {
+			b := &batch.Batch{}
+			require.Nil(t, marshalizer.Unmarshal(b, buff))
+			sentNodes = b.Data
+			return nil
+		},
+	}
+	tnRes, err := resolvers.NewTrieNodeResolver(arg)
+	require.Nil(t, err)
+
+	hashes := &batch.Batch{Data: [][]byte{[]byte("missing"), []byte("h2"), []byte("h3"), []byte("h4"), []byte("h5")}}
+	buff, err := marshalizer.Marshal(hashes)
+	require.Nil(t, err)
+
+	data, err := marshalizer.Marshal(&retriever.RequestData{
+		Type:  retriever.RequestDataType_HashArrayType,
+		Value: buff,
+	})
+	require.Nil(t, err)
+
+	require.Nil(t, tnRes.ProcessReceivedMessage(&mock.P2PMessageMock{DataField: data}, fromConnectedPeer))
+	assert.Equal(t, 4, len(sentNodes))
 }

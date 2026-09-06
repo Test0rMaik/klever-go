@@ -121,26 +121,68 @@ func (tnRes *TrieNodeResolver) resolveMultipleHashes(hashesBuff []byte, message 
 			return err
 		}
 	}
-	hashes := b.Data
 
-	remainingSpace := maxBuffToSendTrieNodes
-	nodes := make([][]byte, 0, maxBuffToSendTrieNodes)
-	var nextNodes [][]byte
+	return tnRes.sendResponse(tnRes.collectSubTries(b.Data), message)
+}
+
+func (tnRes *TrieNodeResolver) collectSubTries(hashes [][]byte) [][]byte {
+	nodes := make([][]byte, 0, len(hashes))
+	seenHashes := make(map[string]struct{}, len(hashes))
+	totalSize := uint64(0)
 	for _, hash := range hashes {
-		nextNodes, remainingSpace, err = tnRes.getSubTrie(hash, remainingSpace)
+		if _, alreadySeen := seenHashes[string(hash)]; alreadySeen {
+			continue
+		}
+		seenHashes[string(hash)] = struct{}{}
+
+		// The budget offered to the trie is always what the aggregate cap still allows, never
+		// what GetSerializedNodes reported back: on error it reports a remaining space of 0,
+		// and adopting that would zero the budget for every hash left in the request just
+		// because one hash could not be resolved.
+		remainingSpace := maxBuffToSendTrieNodes - totalSize
+		nextNodes, _, err := tnRes.getSubTrie(hash, remainingSpace)
 		if err != nil {
 			continue
 		}
 
-		nodes = append(nodes, nextNodes...)
+		// A sub-trie larger than the whole budget is always the single over-budget node that
+		// GetSerializedNodes serves unconditionally (a leaf may reach state.MaxLeafSize, 3x
+		// this budget). It can never fit in any response, so dropping it here would starve the
+		// requester whenever its hash is not the first one of the request. Serve it alone,
+		// discarding what was collected so far: appended on top of a full budget the response
+		// would exceed the p2p send limit and the whole batch would be rejected. Sending it by
+		// itself keeps the node reachable from any request position and bounds the response by
+		// state.MaxLeafSize.
+		subTrieSize := serializedNodesSize(nextNodes)
+		if subTrieSize > maxBuffToSendTrieNodes {
+			return nextNodes
+		}
 
-		lenNextNodes := uint64(len(nextNodes))
-		if lenNextNodes == 0 || remainingSpace == 0 {
+		// Fits the budget on its own but not in what is left of it: drop this sub-trie and keep
+		// going, a later hash may still fit in the remaining space.
+		if totalSize+subTrieSize > maxBuffToSendTrieNodes {
+			continue
+		}
+
+		nodes = append(nodes, nextNodes...)
+		totalSize += subTrieSize
+
+		// Budget exhausted, or the trie has nothing more to serve for this hash.
+		if len(nextNodes) == 0 || totalSize == maxBuffToSendTrieNodes {
 			break
 		}
 	}
 
-	return tnRes.sendResponse(nodes, message)
+	return nodes
+}
+
+func serializedNodesSize(nodes [][]byte) uint64 {
+	size := uint64(0)
+	for _, node := range nodes {
+		size += uint64(len(node))
+	}
+
+	return size
 }
 
 func (tnRes *TrieNodeResolver) resolveOneHash(hash []byte, message p2p.MessageP2P) error {

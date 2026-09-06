@@ -484,7 +484,21 @@ func getDbThatContainsHash(trieStorage data.StorageManager, rootHash []byte) dat
 	}
 }
 
-// GetSerializedNodes returns a batch of serialized nodes from the trie, starting from the given hash
+func remainingBuffSpace(maxBuffToSend uint64, size uint64) uint64 {
+	if size >= maxBuffToSend {
+		return 0
+	}
+
+	return maxBuffToSend - size
+}
+
+// GetSerializedNodes returns a batch of serialized nodes from the trie, starting from the given hash.
+//
+// The node at rootHash is always returned, even when it alone exceeds maxBuffToSend: a single leaf may
+// reach state.MaxLeafSize (786KB, three times the resolver's 256KB response budget), and rejecting it
+// would leave those leaves unreachable to a syncing peer. The returned batch may therefore be larger
+// than maxBuffToSend; in that case remainingSpace is 0. Callers must derive any aggregate bound from
+// the size of the returned nodes, never from maxBuffToSend alone.
 func (tr *patriciaMerkleTrie) GetSerializedNodes(rootHash []byte, maxBuffToSend uint64) ([][]byte, uint64, error) {
 	tr.mutOperation.Lock()
 	defer tr.mutOperation.Unlock()
@@ -522,6 +536,10 @@ func (tr *patriciaMerkleTrie) GetSerializedNodes(rootHash []byte, maxBuffToSend 
 	nodes = append(nodes, encNode)
 	size += uint64(len(encNode))
 
+	if size >= maxBuffToSend {
+		return nodes, 0, nil
+	}
+
 	for it.HasNext() {
 		err = it.Next()
 		if err != nil {
@@ -540,9 +558,7 @@ func (tr *patriciaMerkleTrie) GetSerializedNodes(rootHash []byte, maxBuffToSend 
 		size += uint64(len(encNode))
 	}
 
-	remainingSpace := maxBuffToSend - size
-
-	return nodes, remainingSpace, nil
+	return nodes, remainingBuffSpace(maxBuffToSend, size), nil
 }
 
 // GetAllLeavesOnChannel streams all the trie leaves on the returned channels. The traversal runs in

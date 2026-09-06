@@ -6,6 +6,7 @@ import (
 	cryptoRand "crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 	"github.com/klever-io/klever-go/crypto/hashing"
 	"github.com/klever-io/klever-go/crypto/hashing/keccak"
 	"github.com/klever-io/klever-go/data"
+	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/data/trie"
 	"github.com/klever-io/klever-go/storage"
 	"github.com/klever-io/klever-go/storage/storageUnit"
@@ -461,6 +463,64 @@ func TestPatriciaMerkleTrie_GetSerializedNodesTinyBufferShouldNotGetAllNodes(t *
 	serializedNodes, _, err := tr.GetSerializedNodes(rootHash, maxBuffToSend)
 	assert.Nil(t, err)
 	assert.Equal(t, expectedNodes, len(serializedNodes))
+}
+
+func TestPatriciaMerkleTrie_GetSerializedNodesLeafBiggerThanBufferShouldStillBeServed(t *testing.T) {
+	t.Parallel()
+
+	tr := emptyTrie()
+	bigValue := make([]byte, state.MaxLeafSize-uint64(1<<10))
+	_, _ = cryptoRand.Read(bigValue)
+	_ = tr.Update([]byte("bigLeaf"), bigValue)
+	_ = tr.Commit()
+	rootHash, _ := tr.RootHash()
+
+	maxBuffToSend := uint64(1 << 18)
+	require.Greater(t, state.MaxLeafSize, maxBuffToSend)
+
+	serializedNodes, remainingSpace, err := tr.GetSerializedNodes(rootHash, maxBuffToSend)
+	require.Nil(t, err)
+	require.Equal(t, 1, len(serializedNodes))
+	require.Greater(t, uint64(len(serializedNodes[0])), maxBuffToSend)
+	require.Equal(t, uint64(0), remainingSpace)
+}
+
+func TestPatriciaMerkleTrie_GetSerializedNodesOversizedFirstNodeShouldNotWrapRemainingSpace(t *testing.T) {
+	t.Parallel()
+
+	tr := emptyTrie()
+	_ = tr.Update([]byte("dog"), bytes.Repeat([]byte{0xAB}, 1024))
+	_ = tr.Commit()
+	rootHash, _ := tr.RootHash()
+
+	for _, maxBuffToSend := range []uint64{1, 10, 100} {
+		serializedNodes, remainingSpace, err := tr.GetSerializedNodes(rootHash, maxBuffToSend)
+		require.Nil(t, err)
+		require.Equal(t, 1, len(serializedNodes))
+		require.Equal(t, uint64(0), remainingSpace)
+	}
+}
+
+func TestPatriciaMerkleTrie_GetSerializedNodesExactFitBufferShouldLeaveNoRemainingSpace(t *testing.T) {
+	t.Parallel()
+
+	tr := initTrie()
+	_ = tr.Commit()
+	rootHash, _ := tr.RootHash()
+
+	allNodes, _, err := tr.GetSerializedNodes(rootHash, math.MaxUint64)
+	require.Nil(t, err)
+	require.Greater(t, len(allNodes), 1)
+
+	exactBuffSize := uint64(0)
+	for _, node := range allNodes {
+		exactBuffSize += uint64(len(node))
+	}
+
+	serializedNodes, remainingSpace, err := tr.GetSerializedNodes(rootHash, exactBuffSize)
+	require.Nil(t, err)
+	require.Equal(t, len(allNodes), len(serializedNodes))
+	require.Equal(t, uint64(0), remainingSpace)
 }
 
 func TestPatriciaMerkleTrie_GetSerializedNodesGetFromSnapshot(t *testing.T) {
