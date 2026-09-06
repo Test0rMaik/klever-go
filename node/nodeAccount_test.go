@@ -443,6 +443,35 @@ func TestGetAvailableClaim(t *testing.T) {
 	marshalizer := &mock.ProtoMarshalizerMock{}
 	stakingBytes, _ := marshalizer.Marshal(&kapps.StakingData{TotalStaked: 1000})
 
+	t.Run("returns error when there is no current block header", func(t *testing.T) {
+		t.Parallel()
+
+		userAcc := &mock.UserAccountHandlerStub{
+			AddressBytesCalled: func() []byte { return []byte{0xAA, 0xBB} },
+			ComputeAvailableClaimCalled: func([]byte, uint32, int64, *kapps.UserKDA, *kapps.StakingData, core.ForkController) (map[string]int64, error) {
+				require.Fail(t, "ComputeAvailableClaim must not be called without a current block header")
+				return nil, nil
+			},
+		}
+
+		kdaBytes, _ := marshalizer.Marshal(&kapps.KDAData{Name: []byte("KLV")})
+
+		n, err := createNodeWithOptions(t, nodeTestOptions{
+			accAdapter:   createAccDBWithUser(userAcc),
+			kappsAdapter: createKappsDBWithStakingAndKDA(stakingBytes, kdaBytes),
+			blockchain: &mock.BlockChainMock{
+				GetCurrentBlockHeaderCalled: func() data.HeaderHandler { return nil },
+			},
+		})
+		require.NoError(t, err)
+
+		rewards, rewardsMap, allowance, err := n.GetAvailableClaim("AABB", "KLV")
+		require.ErrorIs(t, err, common.ErrNilHeader)
+		require.Zero(t, rewards)
+		require.Nil(t, rewardsMap)
+		require.Zero(t, allowance)
+	})
+
 	successTests := []struct {
 		name            string
 		assetID         string

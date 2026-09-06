@@ -233,6 +233,10 @@ func (n *Node) GetAvailableClaim(address string, assetId string) (int64, map[str
 	}
 
 	currentBlockHeader := n.blkc.GetCurrentBlockHeader()
+	if check.IfNil(currentBlockHeader) {
+		return 0, nil, 0, common.ErrNilHeader
+	}
+
 	rewards, err := userAccount.ComputeAvailableClaim(
 		[]byte(assetId),
 		currentBlockHeader.GetEpoch(),
