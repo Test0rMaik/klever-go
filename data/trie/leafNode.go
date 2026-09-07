@@ -330,7 +330,11 @@ func (ln *leafNode) getChildren(_ data.DBWriteCacher) ([]node, error) {
 }
 
 func (ln *leafNode) isValid() bool {
-	return len(ln.Value) > 0
+	if len(ln.Value) == 0 {
+		return false
+	}
+
+	return isCanonicalLeafKey(ln.Key)
 }
 
 func (ln *leafNode) setDirty(dirty bool) {

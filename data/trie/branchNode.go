@@ -233,7 +233,7 @@ func (bn *branchNode) hashNode() ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("hashNode error %w", err)
 	}
-	for i := range bn.EncodedChildren {
+	for i := 0; i < nrOfChildren; i++ {
 		if bn.children[i] != nil {
 			var encChild []byte
 			encChild, err = encodeNodeAndGetHash(bn.children[i])
@@ -493,7 +493,10 @@ func (bn *branchNode) updateChildReference(childPos byte, newNode node) {
 
 // Helper function to reduce the node if there is only one child
 func (bn *branchNode) reduceNodeIfNecessary(oldHashes [][]byte, db data.DBWriteCacher) (bool, node, [][]byte, error) {
-	numChildren, pos := getChildPosition(bn)
+	numChildren, pos, err := getChildPosition(bn)
+	if err != nil {
+		return false, nil, oldHashes, err
+	}
 
 	if numChildren == 1 {
 		if err := resolveIfCollapsed(bn, byte(pos), db); err != nil {
@@ -571,14 +574,20 @@ func (bn *branchNode) reduceNode(pos int) (node, bool, error) {
 	return newEn, false, nil
 }
 
-func getChildPosition(n *branchNode) (nrOfChildren int, childPos int) {
-	for i := range n.children {
+func getChildPosition(n *branchNode) (nrChildren int, childPos int, err error) {
+	// EncodedChildren is wire-controlled, so a length mismatch means the node shape is corrupt.
+	// Report it rather than returning a child count: (0, 0) is indistinguishable from a genuine
+	// "not exactly one child", which would silently keep the malformed branch and mark it dirty.
+	if len(n.EncodedChildren) != nrOfChildren {
+		return 0, 0, ErrInvalidBranchNodeChildrenCount
+	}
+	for i := 0; i < nrOfChildren; i++ {
 		if n.children[i] != nil || len(n.EncodedChildren[i]) != 0 {
-			nrOfChildren++
+			nrChildren++
 			childPos = i
 		}
 	}
-	return
+	return nrChildren, childPos, nil
 }
 
 func (bn *branchNode) clone() *branchNode {
@@ -594,7 +603,13 @@ func (bn *branchNode) isEmptyOrNil() error {
 	if bn == nil {
 		return ErrNilBranchNode
 	}
-	for i := range bn.children {
+	// EncodedChildren is wire-controlled; refuse to index it alongside children unless the
+	// lengths agree. decodeNode already rejects this shape; this is the same bound for
+	// callers that never went through decode.
+	if len(bn.EncodedChildren) != nrOfChildren {
+		return ErrInvalidBranchNodeChildrenCount
+	}
+	for i := 0; i < nrOfChildren; i++ {
 		if bn.children[i] != nil || len(bn.EncodedChildren[i]) != 0 {
 			return nil
 		}
@@ -609,6 +624,15 @@ func (bn *branchNode) print(writer io.Writer, index int, db data.DBWriteCacher) 
 
 	str := fmt.Sprintf("B: %v - %v", hex.EncodeToString(bn.hash), bn.dirty)
 	_, _ = fmt.Fprintln(writer, str)
+
+	// A shape mismatch fails every child resolve for the same reason. Report it once here rather
+	// than logging nrOfChildren identical errors from the loop below, which can then index
+	// EncodedChildren directly.
+	if len(bn.EncodedChildren) != nrOfChildren {
+		log.Debug("branch node: print trie err", "error", ErrInvalidBranchNodeChildrenCount)
+		return
+	}
+
 	for i := 0; i < len(bn.children); i++ {
 		err := resolveIfCollapsed(bn, byte(i), db)
 		if err != nil {
@@ -719,8 +743,12 @@ func (bn *branchNode) getChildren(db data.DBWriteCacher) ([]node, error) {
 }
 
 func (bn *branchNode) isValid() bool {
+	if len(bn.EncodedChildren) != nrOfChildren {
+		return false
+	}
+
 	nrChildren := 0
-	for i := range bn.EncodedChildren {
+	for i := 0; i < nrOfChildren; i++ {
 		if len(bn.EncodedChildren[i]) != 0 || bn.children[i] != nil {
 			nrChildren++
 		}
@@ -741,7 +769,7 @@ func (bn *branchNode) loadChildren(getNode func([]byte) (node, error)) ([][]byte
 
 	existingChildren := make([]node, 0)
 	missingChildren := make([][]byte, 0)
-	for i := range bn.EncodedChildren {
+	for i := 0; i < nrOfChildren; i++ {
 		if len(bn.EncodedChildren[i]) == 0 {
 			continue
 		}
@@ -834,6 +862,9 @@ func (bn *branchNode) getAllHashes(db data.DBWriteCacher) ([][]byte, error) {
 
 func (bn *branchNode) getNextHashAndKey(key []byte) (bool, []byte, []byte) {
 	if len(key) == 0 || bn.isInterfaceNil() {
+		return false, nil, nil
+	}
+	if childPosOutOfRange(key[0]) || len(bn.EncodedChildren) != nrOfChildren {
 		return false, nil, nil
 	}
 

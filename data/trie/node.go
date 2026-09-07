@@ -163,10 +163,32 @@ func decodeNode(encNode []byte, marshalizer marshal.Marshalizer, hasher hashing.
 		return nil, err
 	}
 
+	err = checkDecodedNodeShape(newNode)
+	if err != nil {
+		return nil, err
+	}
+
 	newNode.setMarshalizer(marshalizer)
 	newNode.setHasher(hasher)
 
 	return newNode, nil
+}
+
+// checkDecodedNodeShape rejects a decoded branch whose EncodedChildren length is not nrOfChildren.
+// EncodedChildren is a protobuf repeated field, so Unmarshal can produce any length, while children
+// is a [nrOfChildren]node array. Indexing one from a loop over the other panics when they disagree.
+// Honest nodes always serialize exactly nrOfChildren slots, empty ones included.
+func checkDecodedNodeShape(n node) error {
+	bn, ok := n.(*branchNode)
+	if !ok {
+		return nil
+	}
+
+	if len(bn.EncodedChildren) != nrOfChildren {
+		return ErrInvalidBranchNodeChildrenCount
+	}
+
+	return nil
 }
 
 func getEmptyNodeOfType(t byte) (node, error) {
@@ -206,8 +228,26 @@ func keyBytesToHex(str []byte) []byte {
 
 // hexToKeyBytes transforms hex nibbles into key bytes. The hex terminator is removed from the end of the hex slice,
 // and then the hex slice is reversed when forming the key bytes.
+//
+// A leaf carries only its own key suffix, so isCanonicalLeafKey cannot check the parity of the full
+// path and an odd accumulated path only fails here, mid-walk. Callers of getAllLeavesOnChannel must
+// therefore treat any error as "the leaf set is incomplete": the walk aborts on the first bad path
+// rather than skipping that leaf and carrying on.
 func hexToKeyBytes(hex []byte) ([]byte, error) {
+	if len(hex) == 0 || hex[len(hex)-1] != hexTerminator {
+		return nil, ErrInvalidHexKey
+	}
+
 	hex = hex[:len(hex)-1]
+
+	// Checked before the parity test: an input that is both odd and carries an out-of-range
+	// nibble reports the corruption rather than the less specific length complaint.
+	for _, nibble := range hex {
+		if nibble >= hexTerminator {
+			return nil, ErrInvalidHexKey
+		}
+	}
+
 	length := len(hex)
 	if length%2 != 0 {
 		return nil, ErrInvalidLength
@@ -238,4 +278,26 @@ func prefixLen(a, b []byte) int {
 	}
 
 	return i
+}
+
+func isCanonicalLeafKey(key []byte) bool {
+	if len(key) == 0 {
+		return true
+	}
+
+	if key[len(key)-1] != hexTerminator {
+		return false
+	}
+
+	return hasOnlyNibbles(key[:len(key)-1])
+}
+
+func hasOnlyNibbles(key []byte) bool {
+	for _, nibble := range key {
+		if nibble >= hexTerminator {
+			return false
+		}
+	}
+
+	return true
 }

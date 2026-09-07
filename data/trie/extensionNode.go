@@ -550,11 +550,7 @@ func (en *extensionNode) isValid() bool {
 		return false
 	}
 
-	if len(en.Key) == 0 {
-		return false
-	}
-
-	return true
+	return len(en.Key) > 0 && hasOnlyNibbles(en.Key)
 }
 
 func (en *extensionNode) setDirty(dirty bool) {
@@ -638,6 +634,11 @@ func (en *extensionNode) getAllHashes(db data.DBWriteCacher) ([][]byte, error) {
 
 func (en *extensionNode) getNextHashAndKey(key []byte) (bool, []byte, []byte) {
 	if len(key) == 0 || en.isInterfaceNil() {
+		return false, nil, nil
+	}
+	// Same bound as tryGet/getNext: VerifyProof's key is caller-supplied and is not
+	// hash-chained the way the proof nodes are. A short key used to panic on the slice.
+	if len(key) < len(en.Key) || !bytes.Equal(en.Key, key[:len(en.Key)]) {
 		return false, nil, nil
 	}
 

@@ -904,9 +904,38 @@ func TestBranchNode_getChildPosition(t *testing.T) {
 	t.Parallel()
 
 	bn, _ := getBnAndCollapsedBn(getTestMarshalizerAndHasher())
-	nr, pos := getChildPosition(bn)
+	nr, pos, err := getChildPosition(bn)
+	assert.Nil(t, err)
 	assert.Equal(t, 3, nr)
 	assert.Equal(t, 13, pos)
+}
+
+func TestBranchNode_getChildPositionOnShortEncodedChildren(t *testing.T) {
+	t.Parallel()
+
+	bn, _ := getBnAndCollapsedBn(getTestMarshalizerAndHasher())
+	bn.EncodedChildren = bn.EncodedChildren[:nrOfChildren-1]
+
+	// A corrupt shape must surface as an error. Reporting (0, 0) here would be read by
+	// reduceNodeIfNecessary as a valid "not exactly one child" and keep the malformed branch.
+	nr, pos, err := getChildPosition(bn)
+	assert.Equal(t, ErrInvalidBranchNodeChildrenCount, err)
+	assert.Equal(t, 0, nr)
+	assert.Equal(t, 0, pos)
+}
+
+func TestBranchNode_reduceNodeIfNecessaryOnShortEncodedChildren(t *testing.T) {
+	t.Parallel()
+
+	bn, _ := getBnAndCollapsedBn(getTestMarshalizerAndHasher())
+	bn.EncodedChildren = bn.EncodedChildren[:nrOfChildren-1]
+	bn.dirty = false
+
+	dirty, newNode, _, err := bn.reduceNodeIfNecessary(make([][]byte, 0), mock.NewMemDbMock())
+	assert.Equal(t, ErrInvalidBranchNodeChildrenCount, err)
+	assert.False(t, dirty)
+	assert.Nil(t, newNode)
+	assert.False(t, bn.dirty)
 }
 
 func TestBranchNode_clone(t *testing.T) {
@@ -1036,6 +1065,85 @@ func TestBranchNode_isValid(t *testing.T) {
 	bn.children[2] = nil
 	bn.children[6] = nil
 	assert.False(t, bn.isValid())
+}
+
+func TestBranchNode_isValidRejectsWrongChildrenCount(t *testing.T) {
+	t.Parallel()
+
+	bn, _ := getBnAndCollapsedBn(getTestMarshalizerAndHasher())
+	assert.True(t, bn.isValid())
+
+	// EncodedChildren is a protobuf `repeated bytes`, so a peer controls its length while children
+	// stays a [nrOfChildren]node array. isValid used to walk the wire slice and index the array.
+	bn.EncodedChildren = append(bn.EncodedChildren, []byte("extra"))
+	assert.False(t, bn.isValid())
+
+	bn.EncodedChildren = bn.EncodedChildren[:nrOfChildren-1]
+	assert.False(t, bn.isValid())
+}
+
+func TestBranchNode_isEmptyOrNilRejectsWrongChildrenCount(t *testing.T) {
+	t.Parallel()
+
+	bn, _ := getBnAndCollapsedBn(getTestMarshalizerAndHasher())
+	assert.Nil(t, bn.isEmptyOrNil())
+
+	// isEmptyOrNil is reached from setHash(), which runs before isValid() ever does, so this is the
+	// first place a mismatched pair can be indexed.
+	bn.EncodedChildren = nil
+	assert.Equal(t, ErrInvalidBranchNodeChildrenCount, bn.isEmptyOrNil())
+}
+
+func TestDecodeNodeRejectsBranchWithWrongChildrenCount(t *testing.T) {
+	t.Parallel()
+
+	marsh, hsh := getTestMarshalizerAndHasher()
+
+	encodeBranchWithChildren := func(encodedChildren [][]byte) []byte {
+		bn := &branchNode{
+			CollapsedBn: &CollapsedBn{EncodedChildren: encodedChildren},
+			baseNode:    &baseNode{marsh: marsh, hasher: hsh},
+		}
+		buff, err := marsh.Marshal(bn)
+		assert.Nil(t, err)
+
+		return append(buff, byte(branch))
+	}
+
+	// a single type tag with an empty protobuf body: EncodedChildren decodes to length 0 while
+	// children stays [nrOfChildren]node, and the old isEmptyOrNil panicked on children[0]
+	n, err := decodeNode([]byte{byte(branch)}, marsh, hsh)
+	assert.Nil(t, n)
+	assert.Equal(t, ErrInvalidBranchNodeChildrenCount, err)
+
+	// 18 children with the last one empty: the || in the old isValid did not short-circuit, so
+	// children[17] was evaluated and panicked out of InterceptedTrieNode.CheckValidity
+	tooMany := make([][]byte, nrOfChildren+1)
+	for i := 0; i < nrOfChildren; i++ {
+		tooMany[i] = []byte{byte(i + 1)}
+	}
+	tooMany[nrOfChildren] = []byte{}
+	n, err = decodeNode(encodeBranchWithChildren(tooMany), marsh, hsh)
+	assert.Nil(t, n)
+	assert.Equal(t, ErrInvalidBranchNodeChildrenCount, err)
+
+	// 20 non-empty children: this used to decode and validate cleanly, entering the TrieNodes pool
+	// and only panicking later at bn.children[i] = child inside the syncer's loadChildren
+	overlong := make([][]byte, 20)
+	for i := range overlong {
+		overlong[i] = []byte{byte(i + 1)}
+	}
+	n, err = decodeNode(encodeBranchWithChildren(overlong), marsh, hsh)
+	assert.Nil(t, n)
+	assert.Equal(t, ErrInvalidBranchNodeChildrenCount, err)
+
+	// a well-formed branch still decodes: every entry is on the wire, empty ones included
+	wellFormed := make([][]byte, nrOfChildren)
+	wellFormed[3] = []byte("hashA")
+	wellFormed[nrOfChildren-1] = []byte("hashB")
+	n, err = decodeNode(encodeBranchWithChildren(wellFormed), marsh, hsh)
+	assert.Nil(t, err)
+	assert.Equal(t, nrOfChildren, len(n.(*branchNode).EncodedChildren))
 }
 
 func TestBranchNode_setDirty(t *testing.T) {
@@ -1261,8 +1369,10 @@ func TestBranchNode_setRootHashCollapsedChildren(t *testing.T) {
 	t.Parallel()
 
 	marsh, hasher := getTestMarshalizerAndHasher()
+	// a branch node always carries exactly nrOfChildren encoded children, empty ones included --
+	// newBranchNode, emptyDirtyBranchNode and decodeNode all guarantee it, and the child loops rely on it
 	bn := &branchNode{
-		CollapsedBn: &CollapsedBn{},
+		CollapsedBn: &CollapsedBn{EncodedChildren: make([][]byte, nrOfChildren)},
 		baseNode: &baseNode{
 			marsh:  marsh,
 			hasher: hasher,
@@ -1305,6 +1415,17 @@ func TestBranchNode_reduceNodeBnChild(t *testing.T) {
 	assert.Nil(t, err)
 	assert.Equal(t, expectedNode, newNode)
 	assert.False(t, newChildHash)
+}
+
+func TestBranchNode_printDoesNotPanicOnShortEncodedChildren(t *testing.T) {
+	t.Parallel()
+
+	bn, _ := getBnAndCollapsedBn(getTestMarshalizerAndHasher())
+	bn.EncodedChildren = nil
+
+	assert.NotPanics(t, func() {
+		bn.print(bytes.NewBuffer(nil), 0, mock.NewMemDbMock())
+	})
 }
 
 func TestBranchNode_printShouldNotPanicEvenIfNodeIsCollapsed(t *testing.T) {

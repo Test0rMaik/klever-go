@@ -15,6 +15,10 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// getEnAndCollapsedEn keys the extension with []byte("d") = [100], a raw byte rather than a
+// nibble, so the nodes it returns do not pass isValid(). That is harmless for the insert and
+// delete tests built around this raw key space, but a test that pairs this fixture with
+// isValid() will fail for reasons unrelated to the code under test - use getCanonicalEn().
 func getEnAndCollapsedEn() (*extensionNode, *extensionNode) {
 	child, collapsedChild := getBnAndCollapsedBn(getTestMarshalizerAndHasher())
 	en, _ := newExtensionNode([]byte("d"), child, child.marsh, child.hasher)
@@ -24,6 +28,15 @@ func getEnAndCollapsedEn() (*extensionNode, *extensionNode) {
 	collapsedEn.marsh = child.marsh
 	collapsedEn.hasher = child.hasher
 	return en, collapsedEn
+}
+
+// getCanonicalEn returns an extension node with a nibble path for a key, the only shape the key
+// validity rules accept.
+func getCanonicalEn() *extensionNode {
+	child, _ := getBnAndCollapsedBn(getTestMarshalizerAndHasher())
+	en, _ := newExtensionNode([]byte{4}, child, child.marsh, child.hasher)
+
+	return en
 }
 
 func TestExtensionNode_newExtensionNode(t *testing.T) {
@@ -828,10 +841,25 @@ func TestExtensionNode_getChildrenCollapsedEn(t *testing.T) {
 func TestExtensionNode_isValid(t *testing.T) {
 	t.Parallel()
 
-	en, _ := getEnAndCollapsedEn()
+	en := getCanonicalEn()
 	assert.True(t, en.isValid())
 
 	en.child = nil
+	assert.False(t, en.isValid())
+}
+
+func TestExtensionNode_isValidRejectsNonCanonicalKey(t *testing.T) {
+	t.Parallel()
+
+	en := getCanonicalEn()
+
+	en.Key = []byte{}
+	assert.False(t, en.isValid())
+
+	en.Key = []byte{1, hexTerminator}
+	assert.False(t, en.isValid())
+
+	en.Key = []byte{1, 200}
 	assert.False(t, en.isValid())
 }
 
@@ -1063,6 +1091,32 @@ func TestExtensionNode_getNextHashAndKey(t *testing.T) {
 	assert.False(t, proofVerified)
 	assert.Equal(t, collapsedEn.EncodedChild, nextHash)
 	assert.Equal(t, []byte{}, nextKey)
+}
+
+func TestExtensionNode_getNextHashAndKeyShortKeyDoesNotPanic(t *testing.T) {
+	t.Parallel()
+
+	en := getCanonicalEn()
+	en.Key = []byte{1, 2, 3, 4}
+
+	assert.NotPanics(t, func() {
+		proofVerified, nextHash, nextKey := en.getNextHashAndKey([]byte{1})
+		assert.False(t, proofVerified)
+		assert.Nil(t, nextHash)
+		assert.Nil(t, nextKey)
+	})
+}
+
+func TestExtensionNode_getNextHashAndKeyPrefixMismatchDoesNotContinue(t *testing.T) {
+	t.Parallel()
+
+	en := getCanonicalEn()
+	en.Key = []byte{1, 2, 3, 4}
+
+	proofVerified, nextHash, nextKey := en.getNextHashAndKey([]byte{9, 9, 9, 9, 9})
+	assert.False(t, proofVerified)
+	assert.Nil(t, nextHash)
+	assert.Nil(t, nextKey)
 }
 
 func TestExtensionNode_getNextHashAndKeyNilKey(t *testing.T) {

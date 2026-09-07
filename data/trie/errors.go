@@ -54,6 +54,13 @@ var ErrNilNode = errors.New("the node is nil")
 // ErrInvalidLength signals that length of the array is invalid
 var ErrInvalidLength = errors.New("invalid array length")
 
+// ErrInvalidHexKey signals that a hex key is not a canonical nibble path
+var ErrInvalidHexKey = errors.New("invalid hex key")
+
+// ErrInvalidBranchNodeChildrenCount signals that a branch node does not carry exactly nrOfChildren
+// encoded children, so its wire-controlled slice cannot be indexed alongside the fixed children array
+var ErrInvalidBranchNodeChildrenCount = errors.New("branch node does not have the expected number of encoded children")
+
 // ErrWrongTypeAssertion signals that wrong type was provided
 var ErrWrongTypeAssertion = errors.New("wrong type assertion")
 

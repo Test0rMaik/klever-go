@@ -512,11 +512,32 @@ func TestLeafNode_getChildren(t *testing.T) {
 func TestLeafNode_isValid(t *testing.T) {
 	t.Parallel()
 
-	ln := getLn(getTestMarshalizerAndHasher())
+	marsh, hasher := getTestMarshalizerAndHasher()
+	ln, _ := newLeafNode(keyBytesToHex([]byte("dog")), []byte("dog"), marsh, hasher)
 	assert.True(t, ln.isValid())
 
 	ln.Value = []byte{}
 	assert.False(t, ln.isValid())
+
+	// nrOfChildren is 17, so a split at the terminator stores an empty-keyed leaf at branch child
+	// slot 16 -- the standard MPT terminal-value slot. That shape must stay valid.
+	emptyKeyAtBranchTerminatorSlot, _ := newLeafNode([]byte{}, []byte("dog"), marsh, hasher)
+	assert.True(t, emptyKeyAtBranchTerminatorSlot.isValid())
+}
+
+func TestLeafNode_isValidRejectsNonCanonicalKey(t *testing.T) {
+	t.Parallel()
+
+	marsh, hasher := getTestMarshalizerAndHasher()
+
+	nonTerminated, _ := newLeafNode([]byte{1, 2, 3}, []byte("dog"), marsh, hasher)
+	assert.False(t, nonTerminated.isValid())
+
+	interiorTerminator, _ := newLeafNode([]byte{1, hexTerminator, 3, hexTerminator}, []byte("dog"), marsh, hasher)
+	assert.False(t, interiorTerminator.isValid())
+
+	outOfRangeNibble, _ := newLeafNode([]byte{1, 200, hexTerminator}, []byte("dog"), marsh, hasher)
+	assert.False(t, outOfRangeNibble.isValid())
 }
 
 func TestLeafNode_setDirty(t *testing.T) {

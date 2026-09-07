@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/klever-io/klever-go/common/mock"
+	"github.com/klever-io/klever-go/config"
 	"github.com/klever-io/klever-go/data"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/protobuf/proto"
@@ -436,12 +437,30 @@ func TestHexToKeyBytes(t *testing.T) {
 	}
 }
 
-func TestHexToKeyBytesInvalidLength(t *testing.T) {
+func TestHexToKeyBytesRejectsNonCanonicalInput(t *testing.T) {
 	t.Parallel()
 
-	key, err := hexToKeyBytes([]byte{6, 4, 6, 15, 6, 5})
-	assert.Nil(t, key)
-	assert.Equal(t, ErrInvalidLength, err)
+	tests := []struct {
+		name    string
+		hex     []byte
+		wantErr error
+	}{
+		{"odd nibble count", []byte{6, 4, 6, 15, 6, hexTerminator}, ErrInvalidLength},
+		{"empty input", []byte{}, ErrInvalidHexKey},
+		{"missing terminator", []byte{6, 4, 6, 15, 6, 5}, ErrInvalidHexKey},
+		{"out of range nibble", []byte{6, 200, hexTerminator}, ErrInvalidHexKey},
+		// Both odd-length and out of range: the corruption is the more diagnostic of the two facts.
+		{"odd count and out of range nibble", []byte{6, 200, 6, hexTerminator}, ErrInvalidHexKey},
+		{"interior terminator", []byte{6, hexTerminator, 6, 6, hexTerminator}, ErrInvalidHexKey},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			key, err := hexToKeyBytes(test.hex)
+			assert.Nil(t, key)
+			assert.Equal(t, test.wantErr, err)
+		})
+	}
 }
 
 func TestPrefixLen(t *testing.T) {
@@ -703,4 +722,108 @@ func TestPatriciaMerkleTrie_newHashesAndOldHashesAreResetAfterEveryCommit(t *tes
 	assert.Nil(t, err)
 	assert.Equal(t, 0, len(tr.oldHashes))
 	assert.Equal(t, 0, len(tr.newHashes))
+}
+
+func TestTrieNodesBuiltFromRealKeysPassCanonicalValidation(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.DBConfig{}
+	db := mock.NewMemDbMock()
+	marsh, hsh := getTestMarshalizerAndHasher()
+	trieStorage, _ := NewTrieStorageManager(db, marsh, hsh, cfg, &mock.EvictionWaitingList{}, config.TrieStorageManagerConfig{})
+	tr, _ := NewTrie(trieStorage, marsh, hsh, uint(5))
+
+	// keyBytesToHex puts the LAST byte's nibbles first, so one hex path is a prefix of another only
+	// when the keys share a byte suffix. Prefix-sharing keys such as "d"/"do" diverge at the first
+	// nibble and never build the empty-key leaf this test exists to cover.
+	keys := [][]byte{
+		[]byte("g"),
+		[]byte("og"),
+		[]byte("dog"),
+		[]byte("hotdog"),
+		[]byte("horse"),
+		[]byte("hors"),
+	}
+	expected := make(map[string][]byte, len(keys))
+	for _, key := range keys {
+		_ = tr.Update(key, []byte("value"))
+		expected[string(key)] = []byte("value")
+	}
+	_ = tr.Commit()
+
+	visited := 0
+	emptyKeyLeaves := 0
+	var walk func(n node)
+	walk = func(n node) {
+		if n == nil {
+			return
+		}
+
+		visited++
+		assert.True(t, n.isValid())
+
+		if ln, ok := n.(*leafNode); ok && len(ln.Key) == 0 {
+			emptyKeyLeaves++
+		}
+
+		children, err := n.getChildren(db)
+		assert.Nil(t, err)
+		for _, child := range children {
+			walk(child)
+		}
+	}
+
+	walk(tr.root)
+	assert.Greater(t, visited, 3)
+
+	// the point of the suffix-sharing fixture: a leaf stored at branch child slot 16 with an empty
+	// key. isCanonicalLeafKey must keep accepting it, so a tightening that rejects it fails here.
+	assert.Greater(t, emptyKeyLeaves, 0)
+
+	// end-to-end: every key survives the round trip through the hardened hexToKeyBytes
+	rootHash, _ := tr.RootHash()
+	leavesChannels, err := tr.GetAllLeavesOnChannel(rootHash, context.Background())
+	assert.Nil(t, err)
+
+	recovered := make(map[string][]byte)
+	for leaf := range leavesChannels.LeavesChan {
+		recovered[string(leaf.Key())] = leaf.Value()
+	}
+	assert.Equal(t, expected, recovered)
+	assert.Nil(t, leavesChannels.Err())
+}
+
+func TestGetAllLeavesOnChannelAbortsWholeWalkOnOddLengthLeafPath(t *testing.T) {
+	t.Parallel()
+
+	marsh, hsh := getTestMarshalizerAndHasher()
+	db := mock.NewMemDbMock()
+
+	// A leaf carries only its own key suffix, so isCanonicalLeafKey cannot check the parity of the
+	// full path and accepts this node. The odd accumulated path is only caught by hexToKeyBytes,
+	// mid-walk, and that aborts the entire traversal rather than skipping the offending leaf.
+	oddPathLeaf, _ := newLeafNode([]byte{1, 2, 3, hexTerminator}, []byte("value"), marsh, hsh)
+	assert.True(t, oddPathLeaf.isValid())
+
+	leavesChan := make(chan data.KeyValueHolder, 10)
+	err := oddPathLeaf.getAllLeavesOnChannel(leavesChan, []byte{}, db, marsh, context.Background())
+	assert.Equal(t, ErrInvalidLength, err)
+	assert.Equal(t, 0, len(leavesChan))
+
+	// Behind a branch the parity flips, since the child index contributes one nibble: a two-nibble
+	// leaf key is what makes the accumulated path odd here. The sibling at the lower index is
+	// emitted first, then the walk stops -- so the consumer sees a partial leaf set and must treat
+	// the error as "incomplete", never as "done".
+	goodLeaf, _ := newLeafNode([]byte{2, hexTerminator}, []byte("good"), marsh, hsh)
+	oddPathChild, _ := newLeafNode([]byte{1, 2, hexTerminator}, []byte("value"), marsh, hsh)
+	assert.True(t, oddPathChild.isValid())
+
+	bn, _ := newBranchNode(marsh, hsh)
+	bn.children[1] = goodLeaf
+	bn.children[2] = oddPathChild
+
+	leavesChan = make(chan data.KeyValueHolder, 10)
+	err = bn.getAllLeavesOnChannel(leavesChan, []byte{}, db, marsh, context.Background())
+	assert.Equal(t, ErrInvalidLength, err)
+	assert.Equal(t, 1, len(leavesChan))
 }
