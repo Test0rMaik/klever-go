@@ -40,6 +40,23 @@ func newMockVMHostForHexAndBuiltinFunctionWithPerByteCost(fixAuditChangesV5 bool
 		},
 	}
 
+	// Keep GetLength consistent with whatever GetBytes the test installs, so
+	// ManagedIsBuiltinFunctionWithHost's length-first path sees the same buffer the copy
+	// path would return. Read through managedTypes at call time because tests assign
+	// GetBytesCalled after this returns. Clone-avoidance tests must stub GetLengthCalled
+	// so it does not call GetBytesCalled - otherwise a GetBytes count cannot tell the hook
+	// from this helper.
+	managedTypes.GetLengthCalled = func(handle int32) int32 {
+		if managedTypes.GetBytesCalled == nil {
+			return 0
+		}
+		b, err := managedTypes.GetBytesCalled(handle)
+		if err != nil {
+			return -1
+		}
+		return int32(len(b)) // #nosec G115 - test buffers are small
+	}
+
 	metering := &contextmock.MeteringContextMock{
 		GasCost: &config.GasCost{
 			ManagedBufferAPICost: config.ManagedBufferAPICost{
@@ -241,6 +258,48 @@ func TestManagedIsBuiltinFunctionWithHost_GasCost(t *testing.T) {
 	}
 }
 
+// TestManagedIsBuiltinFunctionWithHost_UnderCapStillClonesAndEvaluatesPredicate pins that
+// the length-first path is not "never clone": names under the cap must still GetBytes and
+// run IsBuiltinFunctionName. A bug that charged from GetLength and then returned 0 for
+// every name would leave GasCost green.
+func TestManagedIsBuiltinFunctionWithHost_UnderCapStillClonesAndEvaluatesPredicate(t *testing.T) {
+	t.Parallel()
+
+	name := []byte("KDATransfer")
+
+	cases := []struct {
+		purpose   string
+		isBuiltin bool
+		want      int32
+	}{
+		{purpose: "known builtin returns 1", isBuiltin: true, want: 1},
+		{purpose: "unknown name returns 0", isBuiltin: false, want: 0},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.purpose, func(t *testing.T) {
+			host, managedTypes, gasUsed, bytesGasUsed, runtimeErr := newMockVMHostForHexAndBuiltinFunction(true)
+			host.IsBuiltinFunc = tt.isBuiltin
+
+			getBytesCalls := 0
+			managedTypes.GetBytesCalled = func(int32) ([]byte, error) {
+				getBytesCalls++
+				return name, nil
+			}
+			// Length without calling GetBytes, so a GetBytes count of 1 is the hook, not the helper.
+			managedTypes.GetLengthCalled = func(int32) int32 { return int32(len(name)) }
+
+			result := ManagedIsBuiltinFunctionWithHost(host, 1)
+
+			assert.Nil(t, *runtimeErr)
+			assert.Equal(t, tt.want, result)
+			assert.Equal(t, 1, getBytesCalls, "a name under the cap must still be cloned to evaluate the predicate")
+			assert.Equal(t, uint64(0), bytesGasUsed(), "per-byte charge must go through UseGasBounded, not ConsumeGasForBytes")
+			assert.Equal(t, uint64(10+len(name)), gasUsed())
+		})
+	}
+}
+
 // TestManagedIsBuiltinFunctionWithHost_CapsGasAndReturnsFalseAboveMax covers the gas cap and
 // the behavior change from reverting the whole tx to returning a plain "not a builtin" (0):
 // this is a pure predicate, and a name at or over the cap can never be a real builtin function
@@ -264,14 +323,15 @@ func TestManagedIsBuiltinFunctionWithHost_CapsGasAndReturnsFalseAboveMax(t *test
 
 	for _, tt := range cases {
 		t.Run(tt.purpose, func(t *testing.T) {
-			host, managedTypes, _, bytesGasUsed, runtimeErr := newMockVMHostForHexAndBuiltinFunction(true)
+			host, managedTypes, gasUsed, bytesGasUsed, runtimeErr := newMockVMHostForHexAndBuiltinFunction(true)
 			managedTypes.GetBytesCalled = func(int32) ([]byte, error) { return tt.name, nil }
 
 			result := ManagedIsBuiltinFunctionWithHost(host, 1)
 
 			assert.Nil(t, *runtimeErr, "must not revert the tx - this is a pure predicate")
 			assert.Equal(t, int32(0), result, "a name at/over the cap can never be a real builtin")
-			assert.Equal(t, uint64(maxBuiltinFunctionNameLength), bytesGasUsed(), "the charge must stay capped regardless of the actual input length")
+			assert.Equal(t, uint64(0), bytesGasUsed(), "per-byte charge must go through UseGasBounded, not ConsumeGasForBytes")
+			assert.Equal(t, uint64(10+maxBuiltinFunctionNameLength), gasUsed(), "the charge must stay capped regardless of the actual input length")
 		})
 	}
 }
@@ -326,4 +386,106 @@ func TestManagedIsBuiltinFunctionWithHost_GasCostUnderShippedSchedule(t *testing
 	assert.Nil(t, *runtimeErr)
 	// 10 base + 11 bytes at 50/byte.
 	assert.Equal(t, uint64(10+11*shippedDataCopyPerByte), gasUsed())
+}
+
+// TestManagedIsBuiltinFunctionWithHost_DoesNotCloneOversizedName pins the actual fix: the
+// oversized-name decision is made from GetLength, so the buffer is never handed to GetBytes.
+// Before this change the hook cloned the whole buffer first (GetBytes always does a
+// bytes.Clone) and only then charged a price capped at maxBuiltinFunctionNameLength, which
+// let a contract force an unbounded copy for a fixed, tiny amount of gas on every call.
+func TestManagedIsBuiltinFunctionWithHost_DoesNotCloneOversizedName(t *testing.T) {
+	t.Parallel()
+
+	host, managedTypes, gasUsed, _, runtimeErr := newMockVMHostForHexAndBuiltinFunction(true)
+
+	getBytesCalls := 0
+	managedTypes.GetBytesCalled = func(int32) ([]byte, error) {
+		getBytesCalls++
+		return bytes.Repeat([]byte{'a'}, 16_000_000), nil
+	}
+	// Override the helper's derive-length-from-GetBytes wiring on purpose: the point of the
+	// assertion below is that the hook decides without ever asking for the bytes.
+	managedTypes.GetLengthCalled = func(int32) int32 { return 16_000_000 }
+
+	result := ManagedIsBuiltinFunctionWithHost(host, 1)
+
+	assert.Nil(t, *runtimeErr, "must not revert the tx - this is still a pure predicate")
+	assert.Equal(t, int32(0), result, "a name over the cap can never be a real builtin")
+	assert.Equal(t, 0, getBytesCalls, "an oversized name must never be cloned")
+	assert.Equal(t, uint64(10+maxBuiltinFunctionNameLength), gasUsed(), "charge stays capped")
+}
+
+// TestManagedIsBuiltinFunctionWithHost_FailsClosedOnInsufficientGas covers the second half of
+// the problem: the per-byte charge now goes through UseGasBounded, so it can actually stop the
+// call. ConsumeGasForBytes routed to UseAndTraceGas, which only accumulates and never fails,
+// so the clone still ran even when remaining gas could not cover it.
+//
+// Remaining gas is set to cover the unbounded 10-gas base (UseGasAndAddTracedGas) but not the
+// per-byte UseGasBounded, matching ToHex's InsufficientGasFailsBeforeAllocation. GasLeft below
+// the base alone would also fail closed, but would not pin which charge did it.
+func TestManagedIsBuiltinFunctionWithHost_FailsClosedOnInsufficientGas(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		purpose    string
+		nameLength int32
+	}{
+		{purpose: "under the cap", nameLength: 128},
+		{purpose: "well over the cap: the shared UseGasBounded before the early return must still fail closed", nameLength: 16_000_000},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.purpose, func(t *testing.T) {
+			host, managedTypes, _, _, runtimeErr := newMockVMHostForHexAndBuiltinFunction(true)
+
+			getBytesCalls := 0
+			managedTypes.GetBytesCalled = func(int32) ([]byte, error) {
+				getBytesCalls++
+				return bytes.Repeat([]byte{'a'}, int(tt.nameLength)), nil
+			}
+			managedTypes.GetLengthCalled = func(int32) int32 { return tt.nameLength }
+
+			metering, ok := host.MeteringContext.(*contextmock.MeteringContextMock)
+			require.True(t, ok)
+			// 50 covers the 10-gas base and not a 128- or 256-byte per-byte charge at 1/byte.
+			metering.GasProvidedMock = 50
+			metering.GasLeftMock = 50
+
+			result := ManagedIsBuiltinFunctionWithHost(host, 1)
+
+			require.ErrorIs(t, *runtimeErr, vmhost.ErrNotEnoughGas)
+			assert.Equal(t, int32(-1), result)
+			assert.Equal(t, 0, getBytesCalls, "must fail before the clone, not after it")
+		})
+	}
+}
+
+// TestManagedIsBuiltinFunctionWithHost_MissingHandleFaults pins the new GetLength < 0 path:
+// a missing handle must fault as ErrNoManagedBufferUnderThisHandle and return -1 without
+// cloning. Remaining gas is in (base, base+capped-length] so dropping the < 0 guard would
+// charge uint64(-1) capped to 256 via UseGasBounded and surface ErrNotEnoughGas instead.
+func TestManagedIsBuiltinFunctionWithHost_MissingHandleFaults(t *testing.T) {
+	t.Parallel()
+
+	host, managedTypes, _, _, runtimeErr := newMockVMHostForHexAndBuiltinFunction(true)
+
+	getBytesCalls := 0
+	managedTypes.GetBytesCalled = func(int32) ([]byte, error) {
+		getBytesCalls++
+		return nil, vmhost.ErrNoManagedBufferUnderThisHandle
+	}
+	// Override the helper's derive-length-from-GetBytes wiring: a GetBytes count of 0 is
+	// only meaningful if GetLength does not call through.
+	managedTypes.GetLengthCalled = func(int32) int32 { return -1 }
+
+	metering, ok := host.MeteringContext.(*contextmock.MeteringContextMock)
+	require.True(t, ok)
+	metering.GasProvidedMock = 50
+	metering.GasLeftMock = 50
+
+	result := ManagedIsBuiltinFunctionWithHost(host, 1)
+
+	require.ErrorIs(t, *runtimeErr, vmhost.ErrNoManagedBufferUnderThisHandle)
+	assert.Equal(t, int32(-1), result)
+	assert.Equal(t, 0, getBytesCalls, "must fault from GetLength, without cloning")
 }

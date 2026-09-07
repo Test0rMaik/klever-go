@@ -1061,10 +1061,10 @@ func (context *VMHooksImpl) ManagedIsBuiltinFunction(functionNameHandle int32) i
 //
 // The >= vs > distinction is cosmetic rather than consensus-observable. Since this hook now
 // returns 0 instead of reverting, both spellings produce the same result and the same gas at
-// exactly 256: the charge is clamped to the cap either way, and the fall-through under > would
-// reach IsBuiltinFunctionName, which returns false for a 256-byte name regardless. The only
-// delta is an unpaid string copy plus a map lookup, so no test can pin it without asserting on
-// an implementation detail - see TestManagedIsBuiltinFunctionWithHost_CapsGasAndReturnsFalseAboveMax.
+// exactly 256: the charge is clamped to the cap either way. At 256, > would still charge that
+// capped gas but would GetBytes (clone), convert to string, and map-lookup; >= skips all three.
+// CapsGas cannot pin the spelling without asserting on that implementation detail - see
+// TestManagedIsBuiltinFunctionWithHost_CapsGasAndReturnsFalseAboveMax.
 const maxBuiltinFunctionNameLength = 256
 
 func ManagedIsBuiltinFunctionWithHost(host vmhost.VMHost, functionNameHandle int32) int32 {
@@ -1075,29 +1075,51 @@ func ManagedIsBuiltinFunctionWithHost(host vmhost.VMHost, functionNameHandle int
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.IsBuiltinFunction
 	metering.UseGasAndAddTracedGas(managedIsBuiltinFunction, gasToUse)
 
-	mBuffFunctionName, err := managedType.GetBytes(functionNameHandle)
-	if err != nil {
-		WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution())
-		return -1
-	}
-
 	if host.ForkController().FixAuditChangesV5() {
-		chargeLen := len(mBuffFunctionName)
-		if chargeLen > maxBuiltinFunctionNameLength {
-			chargeLen = maxBuiltinFunctionNameLength
+		// Decide and charge from the length alone, before any copy. GetBytes always clones
+		// (managedTypesContext.GetBytes -> bytes.Clone), so reading first and only then
+		// charging a price of at most maxBuiltinFunctionNameLength bytes at DataCopyPerByte
+		// let a contract force an unbounded copy for a fixed, tiny amount of gas - repeatedly,
+		// on a hook that runs uninterruptible and cannot be aborted by the execution timeout.
+		// ConsumeGasForBytes could not have stopped it either: it routes to UseAndTraceGas,
+		// which only accumulates and never fails on insufficient gas. UseGasBounded is the
+		// fail-closed half already applied to ManagedBufferToHex, which still clones first
+		// and then charges so it can stop before hex allocation, not to skip GetBytes
+		// (CertiK KLR-43).
+		nameLength := managedType.GetLength(functionNameHandle)
+		if nameLength < 0 {
+			WithFaultAndHost(host, vmhost.ErrNoManagedBufferUnderThisHandle, runtime.BaseOpsErrorShouldFailExecution())
+			return -1
 		}
-		managedType.ConsumeGasForBytes(mBuffFunctionName[:chargeLen])
 
-		if len(mBuffFunctionName) >= maxBuiltinFunctionNameLength {
+		chargeLength := uint64(nameLength) // #nosec G115 - guarded non-negative above
+		if chargeLength > maxBuiltinFunctionNameLength {
+			chargeLength = maxBuiltinFunctionNameLength
+		}
+
+		dataCopyPerByte := metering.GasSchedule().BaseOperationCost.DataCopyPerByte
+		err := metering.UseGasBounded(math.MulUint64(dataCopyPerByte, chargeLength))
+		if err != nil {
+			WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution())
+			return -1
+		}
+
+		if nameLength >= maxBuiltinFunctionNameLength {
 			// This is a pure predicate ("is this a builtin function name?"), and a
 			// name at or over the cap can never be a real builtin (the same length
 			// is already rejected for exported names by verifyValidFunctionName),
 			// so a truthful "not a builtin" is the correct answer here - reverting
 			// the whole tx would be a new failure mode this call never had before
 			// the fork, for input that used to just return false (CertiK KLR-43).
-			// The gas charge above still bounds the work regardless of input size.
+			// Returning here also means an at-or-over-cap buffer is never cloned.
 			return 0
 		}
+	}
+
+	mBuffFunctionName, err := managedType.GetBytes(functionNameHandle)
+	if err != nil {
+		WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution())
+		return -1
 	}
 
 	isBuiltinFunction := host.IsBuiltinFunctionName(string(mBuffFunctionName))
