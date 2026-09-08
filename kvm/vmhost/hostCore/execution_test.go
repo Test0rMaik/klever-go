@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/klever-io/klever-go/common"
+	blockchainConfig "github.com/klever-io/klever-go/config"
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/core/process/kda/kdautils"
 	"github.com/klever-io/klever-go/crypto/hashing"
@@ -23,6 +24,7 @@ import (
 	"github.com/klever-io/klever-go/kvm/testcommon"
 	"github.com/klever-io/klever-go/kvm/vmhost"
 	"github.com/klever-io/klever-go/kvm/vmhost/hostCore"
+	"github.com/klever-io/klever-go/kvm/vmhost/vmhooks"
 	"github.com/klever-io/klever-go/storage"
 	"github.com/klever-io/klever-go/storage/memorydb"
 	"github.com/klever-io/klever-go/storage/storageUnit"
@@ -915,4 +917,93 @@ func TestExecution_CreateContract_KLR02_RejectsOversizedTransferValue(t *testing
 	require.NoError(t, err)
 	require.Equal(t, balanceBefore, callerAfter.GetBalance(kdautils.KLVIdentifier, false),
 		"no KLV must move when an oversized transfer value is rejected")
+}
+
+// staleFlagSourceAddress is the deploy template used by the pending-verification test below.
+var staleFlagSourceAddress = testcommon.MakeTestSCAddress("staleFlagSource")
+
+// staleFlagLegacyExport was legal when the library was deployed and is rejected by today's
+// validator, so re-verifying a long-deployed contract is observable as a failed call.
+const staleFlagLegacyExport = "invalid-library-function"
+
+func zeroCodeCostsForStaleFlagTest(host vmhost.VMHost) {
+	schedule := host.Metering().GasSchedule()
+	schedule.BaseOperationCost.CompilePerByte = 0
+	schedule.BaseOperationCost.AoTPreparePerByte = 0
+	schedule.BaseOperationCost.GetCode = 0
+	schedule.BaseOperationCost.StorePerByte = 0
+	schedule.BaseOperationCost.DataCopyPerByte = 0
+	schedule.BaseOpsAPICost.ExecuteOnDestContext = 0
+}
+
+// TestCreateNewContract_FailedDeployDoesNotArmTheNextInstantiation pins CreateNewContract's disarm
+// path. It arms a pending verification before running the child's init, but that init can fail
+// before any instantiation consumes the flag -- here the KLV transfer fails because the parent has
+// no balance, so execute() is never reached. Left armed, the flag would make the parent's NEXT
+// nested call take the new-code path: a long-deployed library put through today's validator and
+// rejected for an export that was legal when it was deployed.
+func TestCreateNewContract_FailedDeployDoesNotArmTheNextInstantiation(t *testing.T) {
+	deployErr := error(nil)
+	libraryCalls := 0
+
+	_, err := testcommon.BuildMockInstanceCallTest(t).
+		WithEnableEpochs(blockchainConfig.EnableEpochs{FixAuditChangesV5: 0}).
+		WithContracts(
+			testcommon.CreateMockContract(testcommon.ChildAddress).
+				WithMethods(func(libraryInstance *contextmock.InstanceMock, _ any) {
+					libraryInstance.AddMockMethod("libraryMethod", func() *contextmock.InstanceMock {
+						libraryCalls++
+						return libraryInstance
+					})
+					libraryInstance.AddMockMethod(staleFlagLegacyExport, func() *contextmock.InstanceMock {
+						return libraryInstance
+					})
+				}),
+			testcommon.CreateMockContract(staleFlagSourceAddress).
+				WithMethods(func(sourceInstance *contextmock.InstanceMock, _ any) {
+					sourceInstance.AddMockMethod("init", func() *contextmock.InstanceMock {
+						return sourceInstance
+					})
+				}),
+			testcommon.CreateMockContract(testcommon.ParentAddress).
+				WithBalance(0).
+				WithMethods(func(parentInstance *contextmock.InstanceMock, _ any) {
+					parentInstance.AddMockMethod("deployThenCallLibrary", func() *contextmock.InstanceMock {
+						// Fails on the value transfer, before execute() runs.
+						_, deployErr = vmhooks.DeployFromSourceContractWithTypedArgs(
+							parentInstance.Host,
+							staleFlagSourceAddress,
+							[]byte{0, 0},
+							big.NewInt(1),
+							[][]byte{},
+							100000,
+						)
+
+						vmhooks.ExecuteOnDestContextWithTypedArgs(
+							parentInstance.Host,
+							100000,
+							big.NewInt(0),
+							[]byte("libraryMethod"),
+							testcommon.ChildAddress,
+							[][]byte{},
+						)
+						return parentInstance
+					})
+				}),
+		).
+		WithInput(testcommon.CreateTestContractCallInputBuilder().
+			WithRecipientAddr(testcommon.ParentAddress).
+			WithGasProvided(1000000).
+			WithFunction("deployThenCallLibrary").
+			Build()).
+		WithSetup(func(host vmhost.VMHost, _ *worldmock.MockWorld) {
+			zeroCodeCostsForStaleFlagTest(host)
+		}).
+		AndAssertResults(func(_ *worldmock.MockWorld, verify *testcommon.VMOutputVerifier) {
+			verify.Ok()
+		})
+
+	require.Nil(t, err)
+	require.Error(t, deployErr, "the deploy must fail on the value transfer")
+	require.Equal(t, 1, libraryCalls, "the library call must not inherit the failed deploy's pending verification")
 }

@@ -50,6 +50,8 @@ type RuntimeContextWrapper struct {
 	// function that will be called by the corresponding RuntimeContext function implementation (by default this will call the same wrapped context function)
 	MustVerifyNextContractCodeFunc func()
 	// function that will be called by the corresponding RuntimeContext function implementation (by default this will call the same wrapped context function)
+	DisarmPendingCodeVerificationFunc func()
+	// function that will be called by the corresponding RuntimeContext function implementation (by default this will call the same wrapped context function)
 	SetRuntimeBreakpointValueFunc func(value vmhost.BreakpointValue)
 	// function that will be called by the corresponding RuntimeContext function implementation (by default this will call the same wrapped context function)
 	GetRuntimeBreakpointValueFunc func() vmhost.BreakpointValue
@@ -190,6 +192,10 @@ func NewRuntimeContextWrapper(inputRuntimeContext *vmhost.RuntimeContext) *Runti
 
 	runtimeWrapper.MustVerifyNextContractCodeFunc = func() {
 		runtimeWrapper.runtimeContext.MustVerifyNextContractCode()
+	}
+
+	runtimeWrapper.DisarmPendingCodeVerificationFunc = func() {
+		runtimeWrapper.runtimeContext.DisarmPendingCodeVerification()
 	}
 
 	runtimeWrapper.SetRuntimeBreakpointValueFunc = func(value vmhost.BreakpointValue) {
@@ -408,6 +414,11 @@ func (contextWrapper *RuntimeContextWrapper) FailExecution(err error) {
 // MustVerifyNextContractCode calls corresponding xxxFunc function, that by default in turn calls the original method of the wrapped RuntimeContext
 func (contextWrapper *RuntimeContextWrapper) MustVerifyNextContractCode() {
 	contextWrapper.MustVerifyNextContractCodeFunc()
+}
+
+// DisarmPendingCodeVerification calls corresponding xxxFunc function, that by default in turn calls the original method of the wrapped RuntimeContext
+func (contextWrapper *RuntimeContextWrapper) DisarmPendingCodeVerification() {
+	contextWrapper.DisarmPendingCodeVerificationFunc()
 }
 
 // SetRuntimeBreakpointValue calls corresponding xxxFunc function, that by default in turn calls the original method of the wrapped RuntimeContext

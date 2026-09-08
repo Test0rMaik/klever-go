@@ -131,7 +131,37 @@ func (context *runtimeContext) GetInstanceTracker() vmhost.InstanceTracker {
 }
 
 // StartWasmerInstance creates a new wasmer instance if the maxInstanceStackSize has not been reached.
+//
+// KLC-2583: MustVerifyNextContractCode arms a pending verification, but until now that flag was
+// honoured only when a caller independently passed newCode=true -- two sources of truth for one
+// question. The nested execution path passed false, so a contract deployed indirectly reached its
+// init without the wasm validator ever running. The flag is owned by this context, so the decision
+// is made here rather than re-derived by each caller.
+//
+// The flag is consumed by this call whether or not it succeeds. Several returns below (max
+// instances, start section, instantiation failure) happen before VerifyContractCode would clear
+// it, and leaving it armed would apply the new-code path to the next, unrelated instantiation.
 func (context *runtimeContext) StartWasmerInstance(contract []byte, gasLimit uint64, newCode bool) error {
+	if !context.host.ForkController().FixAuditChangesV5() || !context.verifyCode {
+		return context.startWasmerInstance(contract, gasLimit, newCode)
+	}
+
+	defer func() { context.verifyCode = false }()
+
+	err := context.startWasmerInstance(contract, gasLimit, true)
+	if err == nil || errors.Is(err, vmhost.ErrContractInvalid) {
+		return err
+	}
+
+	// Collapse as performCodeDeployment and executeUpgrade do at their own call sites, so the two
+	// deploy paths report identically for identical bytecode. Without this the raw validator error
+	// carries the offending export name into the consensus-visible ReturnMessage. ErrMaxInstances
+	// Reached is collapsed too, deliberately: the direct paths already do so, and diverging here
+	// would reintroduce exactly the inconsistency this is meant to remove.
+	return vmhost.ErrContractInvalid
+}
+
+func (context *runtimeContext) startWasmerInstance(contract []byte, gasLimit uint64, newCode bool) error {
 	context.iTracker.UnsetInstance()
 
 	if context.GetInstanceStackSize() >= context.maxInstanceStackSize {
@@ -432,6 +462,13 @@ func (context *runtimeContext) saveWarmInstance() {
 // MustVerifyNextContractCode sets the verifyCode field to true
 func (context *runtimeContext) MustVerifyNextContractCode() {
 	context.verifyCode = true
+}
+
+// DisarmPendingCodeVerification clears a pending verification that no instantiation will consume.
+// StartWasmerInstance consumes the flag itself, so this is for the callers that arm it and then
+// fail before reaching one.
+func (context *runtimeContext) DisarmPendingCodeVerification() {
+	context.verifyCode = false
 }
 
 // SetMaxInstanceStackSize sets the maximum number of allowed Wasmer instances on

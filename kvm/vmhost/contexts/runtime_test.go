@@ -1385,3 +1385,109 @@ func TestRuntimeContext_VerifyContractCode_StopsAtFirstFailedValidation(t *testi
 	require.Error(t, runtimeCtx.VerifyContractCode(),
 		"declaring a protected function must fail validation")
 }
+
+// TestRuntimeContext_StartWasmerInstanceConsumesPendingVerification pins the KLC-2583 contract.
+// MustVerifyNextContractCode arms exactly one instantiation, and StartWasmerInstance must consume
+// the flag even when it fails: several of its returns happen before VerifyContractCode would clear
+// it, and an armed flag would put the next, unrelated contract through the new-code path.
+//
+// The failure is deliberately ErrMaxInstancesReached (no stack budget). It wraps ErrExecutionFailed,
+// so it is the branch that exercises the collapse; a wasm decode failure would not, because
+// ErrContractCodeNotDecodable already wraps ErrContractInvalid and passes through untouched.
+func TestRuntimeContext_StartWasmerInstanceConsumesPendingVerification(t *testing.T) {
+	epochNotifier := &commonMock.EpochNotifierStub{}
+	forkController, err := fork.NewForkController(blockchainConfig.EnableEpochs{
+		FixAuditChangesV4: 0,
+		FixAuditChangesV5: 0,
+	}, epochNotifier)
+	require.NoError(t, err)
+
+	host := InitializeVMAndWasmer()
+	host.ForkControllerContext = forkController
+
+	runtimeCtx := makeDefaultRuntimeContext(t, host)
+	defer runtimeCtx.ClearWarmInstanceCache()
+
+	runtimeCtx.MustVerifyNextContractCode()
+	require.True(t, runtimeCtx.verifyCode)
+
+	err = runtimeCtx.StartWasmerInstance([]byte("not a wasm module"), 1000, false)
+
+	// Collapsed: the flag drove the new-code path, and that path reports as the direct deploy
+	// sites do, so an attacker-chosen export name cannot reach the consensus-visible ReturnMessage.
+	require.ErrorIs(t, err, vmhost.ErrContractInvalid)
+	require.NotErrorIs(t, err, vmhost.ErrMaxInstancesReached)
+	require.False(t, runtimeCtx.verifyCode, "a failed instantiation must still consume the flag")
+}
+
+// TestRuntimeContext_StartWasmerInstancePreservesContractInvalidDetail covers the other half of the
+// collapse: an error that already is an ErrContractInvalid is returned with its detail intact
+// rather than flattened to the bare sentinel. ErrContractCodeNotDecodable wraps ErrContractInvalid,
+// and with the flag armed the start-section check produces it for undecodable bytes -- the same
+// error the newCode=true sibling test asserts.
+func TestRuntimeContext_StartWasmerInstancePreservesContractInvalidDetail(t *testing.T) {
+	epochNotifier := &commonMock.EpochNotifierStub{}
+	forkController, err := fork.NewForkController(blockchainConfig.EnableEpochs{
+		FixAuditChangesV4: 0,
+		FixAuditChangesV5: 0,
+	}, epochNotifier)
+	require.NoError(t, err)
+
+	host := InitializeVMAndWasmer()
+	host.ForkControllerContext = forkController
+
+	runtimeCtx := makeDefaultRuntimeContext(t, host)
+	defer runtimeCtx.ClearWarmInstanceCache()
+	runtimeCtx.SetMaxInstanceStackSize(1)
+
+	runtimeCtx.MustVerifyNextContractCode()
+
+	err = runtimeCtx.StartWasmerInstance([]byte("not a wasm module"), 1000, false)
+
+	require.ErrorIs(t, err, vmhost.ErrContractCodeNotDecodable)
+	require.False(t, runtimeCtx.verifyCode, "the flag is consumed on this path too")
+}
+
+// TestRuntimeContext_StartWasmerInstanceIgnoresPendingVerificationBeforeAuditV5 is the pre-fork
+// counterpart: with the gate off the flag is not read, not consumed, and the caller sees the
+// original error, so replaying pre-fork blocks is unaffected.
+func TestRuntimeContext_StartWasmerInstanceIgnoresPendingVerificationBeforeAuditV5(t *testing.T) {
+	epochNotifier := &commonMock.EpochNotifierStub{}
+	forkController, err := fork.NewForkController(blockchainConfig.EnableEpochs{
+		FixAuditChangesV4: 0,
+		FixAuditChangesV5: 1_000_000,
+	}, epochNotifier)
+	require.NoError(t, err)
+
+	host := InitializeVMAndWasmer()
+	host.ForkControllerContext = forkController
+
+	runtimeCtx := makeDefaultRuntimeContext(t, host)
+	defer runtimeCtx.ClearWarmInstanceCache()
+
+	runtimeCtx.MustVerifyNextContractCode()
+
+	err = runtimeCtx.StartWasmerInstance([]byte("not a wasm module"), 1000, false)
+
+	require.ErrorIs(t, err, vmhost.ErrMaxInstancesReached)
+	require.True(t, runtimeCtx.verifyCode, "pre-fork the flag is neither read nor consumed")
+}
+
+// TestRuntimeContext_DisarmPendingCodeVerification covers the escape hatch for callers that arm a
+// verification and then fail before any instantiation consumes it -- CreateNewContract's error
+// path, where the child's init can fail on the value transfer, GetSCCode or the gas deduction.
+func TestRuntimeContext_DisarmPendingCodeVerification(t *testing.T) {
+	host := InitializeVMAndWasmer()
+	runtimeCtx := makeDefaultRuntimeContext(t, host)
+	defer runtimeCtx.ClearWarmInstanceCache()
+
+	runtimeCtx.MustVerifyNextContractCode()
+	require.True(t, runtimeCtx.verifyCode)
+
+	runtimeCtx.DisarmPendingCodeVerification()
+	require.False(t, runtimeCtx.verifyCode)
+
+	// Idempotent: the deferred disarm can run after StartWasmerInstance already consumed it.
+	runtimeCtx.DisarmPendingCodeVerification()
+	require.False(t, runtimeCtx.verifyCode)
+}

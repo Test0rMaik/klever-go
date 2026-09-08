@@ -139,6 +139,7 @@ type RuntimeContext interface {
 	SignalUserError(message string)
 	FailExecution(err error)
 	MustVerifyNextContractCode()
+	DisarmPendingCodeVerification()
 	SetRuntimeBreakpointValue(value BreakpointValue)
 	GetRuntimeBreakpointValue() BreakpointValue
 	GetInstanceStackSize() uint64

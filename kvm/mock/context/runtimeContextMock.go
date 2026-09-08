@@ -93,6 +93,12 @@ func (r *RuntimeContextMock) PopDiscard() {
 
 // MustVerifyNextContractCode mocked method
 func (r *RuntimeContextMock) MustVerifyNextContractCode() {
+	r.VerifyCode = true
+}
+
+// DisarmPendingCodeVerification mocked method
+func (r *RuntimeContextMock) DisarmPendingCodeVerification() {
+	r.VerifyCode = false
 }
 
 // ClearStateStack mocked method

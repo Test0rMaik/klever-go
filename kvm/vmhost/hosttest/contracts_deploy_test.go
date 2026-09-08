@@ -460,3 +460,264 @@ func requireDeployedFromNestedDeploySource(t *testing.T, result nestedDeployResu
 	require.Equal(t, []byte{0, 0}, deployedAccount.CodeMetadata)
 	require.Equal(t, test.ParentAddress, deployedAccount.CodeDeployerAddress)
 }
+
+// indirectDeployInvalidFunctionName violates the wasm validator's function-name rule, which allows
+// only letters, digits and underscores -- validCharactersOnly lowercases its input first, so case is
+// not what matters here, the hyphen is. A child exporting this name is rejected by direct
+// deployment, so indirect deployment must reject it too.
+const indirectDeployInvalidFunctionName = "invalid-child-function"
+
+// indirectDeployReservedFunctionName is a reserved VM API name, and the reserved-name rule is what
+// rejects it: validCharactersOnly lowercases its input, so "signalError" passes the character check
+// despite the uppercase "E", and IsReserved then finds the original name in the SC API set. That is
+// a different rule from the constant above, which is why both tests are kept.
+const indirectDeployReservedFunctionName = "signalError"
+
+// indirectDeployLibraryFunctionName stands in for a legacy library export that today's validator
+// would reject. The library is long-deployed, so it must never be re-verified by a nested call.
+const indirectDeployLibraryFunctionName = "invalid-library-function"
+
+func runIndirectDeployCodeVerificationTest(
+	t *testing.T,
+	fixAuditChangesV5 uint32,
+	childFunctionName string,
+) nestedDeployResult {
+	result := nestedDeployResult{}
+
+	vmOutput, err := test.BuildMockInstanceCallTest(t).
+		WithEnableEpochs(blockchainConfig.EnableEpochs{FixAuditChangesV5: fixAuditChangesV5}).
+		WithContracts(
+			test.CreateMockContract(nestedDeploySourceAddress).
+				WithMethods(func(sourceInstance *mock.InstanceMock, _ any) {
+					sourceInstance.AddMockMethod("init", func() *mock.InstanceMock {
+						result.initCalls++
+						return sourceInstance
+					})
+					sourceInstance.AddMockMethod(childFunctionName, func() *mock.InstanceMock {
+						return sourceInstance
+					})
+				}),
+			test.CreateMockContract(test.ParentAddress).
+				WithMethods(func(parentInstance *mock.InstanceMock, _ any) {
+					parentInstance.AddMockMethod("deployChild", func() *mock.InstanceMock {
+						result.outerAddress, result.outerErr = vmhooks.DeployFromSourceContractWithTypedArgs(
+							parentInstance.Host,
+							nestedDeploySourceAddress,
+							[]byte{0, 0},
+							big.NewInt(0),
+							[][]byte{},
+							100000,
+						)
+						return parentInstance
+					})
+				}),
+		).
+		WithInput(test.CreateTestContractCallInputBuilder().
+			WithRecipientAddr(test.ParentAddress).
+			WithGasProvided(1000000).
+			WithFunction("deployChild").
+			Build()).
+		WithSetup(func(host vmhost.VMHost, _ *worldmock.MockWorld) {
+			setZeroCodeCosts(host)
+		}).
+		AndAssertResults(func(_ *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+			verify.Ok()
+		})
+
+	assert.Nil(t, err)
+
+	result.vmOutput = vmOutput
+
+	return result
+}
+
+func TestDeployFromSource_IndirectDeployVerifiesChildCodeBeforeInit(t *testing.T) {
+	result := runIndirectDeployCodeVerificationTest(t, 0, indirectDeployInvalidFunctionName)
+
+	// ErrContractInvalid, not the raw validator error: execute() normalises as
+	// performCodeDeployment and executeUpgrade do, so the offending export name cannot reach
+	// the consensus-visible ReturnMessage and both deploy paths report identically.
+	require.ErrorIs(t, result.outerErr, vmhost.ErrContractInvalid)
+	require.NotContains(t, result.outerErr.Error(), indirectDeployInvalidFunctionName)
+	require.Nil(t, result.outerAddress)
+	require.Equal(t, 0, result.initCalls)
+
+	requireNoIndirectlyDeployedCode(t, result)
+}
+
+func TestDeployFromSource_IndirectDeployRejectsChildExportingReservedFunction(t *testing.T) {
+	result := runIndirectDeployCodeVerificationTest(t, 0, indirectDeployReservedFunctionName)
+
+	require.ErrorIs(t, result.outerErr, vmhost.ErrContractInvalid)
+	require.NotContains(t, result.outerErr.Error(), indirectDeployReservedFunctionName)
+	require.Nil(t, result.outerAddress)
+	require.Equal(t, 0, result.initCalls)
+
+	requireNoIndirectlyDeployedCode(t, result)
+}
+
+func TestDeployFromSource_IndirectDeploySkipsChildCodeVerificationBeforeAuditV5(t *testing.T) {
+	result := runIndirectDeployCodeVerificationTest(t, 1_000_000, indirectDeployInvalidFunctionName)
+
+	require.NoError(t, result.outerErr)
+	require.NotNil(t, result.outerAddress)
+	require.Equal(t, 1, result.initCalls)
+
+	deployedAccount := result.vmOutput.OutputAccounts[string(result.outerAddress)]
+	require.NotNil(t, deployedAccount)
+	require.Equal(t, mock.MockContractCode(nestedDeploySourceAddress), deployedAccount.Code)
+}
+
+// TestDeployFromSource_IndirectDeployDoesNotVerifyLibraryOnSameContextCall pins the code-address
+// half of the predicate. ExecuteOnSameContext sets input.RecipientAddr = input.CallerAddr and then
+// SetCodeAddress(library), so the context address (the freshly staged child) and the code actually
+// instantiated (the library's) diverge. Deriving isNewCode from an address would treat the
+// long-deployed library as new code and put it through the validator, breaking a call that has
+// always worked. The one-shot verifyCode flag was consumed by the child's own init instantiation,
+// so the library is instantiated as existing code and its legacy export is never inspected.
+func TestDeployFromSource_IndirectDeployDoesNotVerifyLibraryOnSameContextCall(t *testing.T) {
+	result := nestedDeployResult{}
+	libraryCalls := 0
+
+	vmOutput, err := test.BuildMockInstanceCallTest(t).
+		WithEnableEpochs(blockchainConfig.EnableEpochs{FixAuditChangesV5: 0}).
+		WithContracts(
+			test.CreateMockContract(test.ChildAddress).
+				WithMethods(func(libraryInstance *mock.InstanceMock, _ any) {
+					libraryInstance.AddMockMethod("libraryMethod", func() *mock.InstanceMock {
+						libraryCalls++
+						return libraryInstance
+					})
+					// A legacy export that today's validator would reject.
+					libraryInstance.AddMockMethod(indirectDeployLibraryFunctionName, func() *mock.InstanceMock {
+						return libraryInstance
+					})
+				}),
+			test.CreateMockContract(nestedDeploySourceAddress).
+				WithMethods(func(sourceInstance *mock.InstanceMock, _ any) {
+					sourceInstance.AddMockMethod("init", func() *mock.InstanceMock {
+						result.initCalls++
+						vmhooks.ExecuteOnSameContextWithTypedArgs(
+							sourceInstance.Host,
+							100000,
+							big.NewInt(0),
+							[]byte("libraryMethod"),
+							test.ChildAddress,
+							[][]byte{},
+						)
+						return sourceInstance
+					})
+				}),
+			test.CreateMockContract(test.ParentAddress).
+				WithMethods(func(parentInstance *mock.InstanceMock, _ any) {
+					parentInstance.AddMockMethod("deployChild", func() *mock.InstanceMock {
+						result.outerAddress, result.outerErr = vmhooks.DeployFromSourceContractWithTypedArgs(
+							parentInstance.Host,
+							nestedDeploySourceAddress,
+							[]byte{0, 0},
+							big.NewInt(0),
+							[][]byte{},
+							100000,
+						)
+						return parentInstance
+					})
+				}),
+		).
+		WithInput(test.CreateTestContractCallInputBuilder().
+			WithRecipientAddr(test.ParentAddress).
+			WithGasProvided(1000000).
+			WithFunction("deployChild").
+			Build()).
+		WithSetup(func(host vmhost.VMHost, _ *worldmock.MockWorld) {
+			setZeroCodeCosts(host)
+		}).
+		AndAssertResults(func(_ *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+			verify.Ok()
+		})
+
+	assert.Nil(t, err)
+	result.vmOutput = vmOutput
+
+	require.NoError(t, result.outerErr)
+	require.NotNil(t, result.outerAddress)
+	require.Equal(t, 1, result.initCalls)
+	require.Equal(t, 1, libraryCalls)
+}
+
+// TestDeployFromSource_IndirectDeployVerifiesOnlyTheInitInstantiation pins the lifetime half of the
+// predicate: a later call to the freshly deployed child in the same transaction must still succeed.
+// The one-shot verifyCode flag is consumed by init, so the second call is instantiated as existing
+// code. Note the cost difference this protects -- a cache-bypassing recompile charged at
+// AoTPreparePerByte instead of CompilePerByte -- is a gas-level effect that setZeroCodeCosts hides,
+// so this test pins the functional outcome only.
+func TestDeployFromSource_IndirectDeployVerifiesOnlyTheInitInstantiation(t *testing.T) {
+	result := nestedDeployResult{}
+	childCalls := 0
+
+	vmOutput, err := test.BuildMockInstanceCallTest(t).
+		WithEnableEpochs(blockchainConfig.EnableEpochs{FixAuditChangesV5: 0}).
+		WithContracts(
+			test.CreateMockContract(nestedDeploySourceAddress).
+				WithMethods(func(sourceInstance *mock.InstanceMock, _ any) {
+					sourceInstance.AddMockMethod("init", func() *mock.InstanceMock {
+						result.initCalls++
+						return sourceInstance
+					})
+					sourceInstance.AddMockMethod("childMethod", func() *mock.InstanceMock {
+						childCalls++
+						return sourceInstance
+					})
+				}),
+			test.CreateMockContract(test.ParentAddress).
+				WithMethods(func(parentInstance *mock.InstanceMock, _ any) {
+					parentInstance.AddMockMethod("deployThenCall", func() *mock.InstanceMock {
+						result.outerAddress, result.outerErr = vmhooks.DeployFromSourceContractWithTypedArgs(
+							parentInstance.Host,
+							nestedDeploySourceAddress,
+							[]byte{0, 0},
+							big.NewInt(0),
+							[][]byte{},
+							100000,
+						)
+						if result.outerErr != nil {
+							return parentInstance
+						}
+
+						vmhooks.ExecuteOnDestContextWithTypedArgs(
+							parentInstance.Host,
+							100000,
+							big.NewInt(0),
+							[]byte("childMethod"),
+							result.outerAddress,
+							[][]byte{},
+						)
+						return parentInstance
+					})
+				}),
+		).
+		WithInput(test.CreateTestContractCallInputBuilder().
+			WithRecipientAddr(test.ParentAddress).
+			WithGasProvided(1000000).
+			WithFunction("deployThenCall").
+			Build()).
+		WithSetup(func(host vmhost.VMHost, _ *worldmock.MockWorld) {
+			setZeroCodeCosts(host)
+		}).
+		AndAssertResults(func(_ *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+			verify.Ok()
+		})
+
+	assert.Nil(t, err)
+	result.vmOutput = vmOutput
+
+	require.NoError(t, result.outerErr)
+	require.Equal(t, 1, result.initCalls)
+	require.Equal(t, 1, childCalls)
+}
+
+func requireNoIndirectlyDeployedCode(t *testing.T, result nestedDeployResult) {
+	sourceCode := mock.MockContractCode(nestedDeploySourceAddress)
+	for _, account := range result.vmOutput.OutputAccounts {
+		require.NotEqual(t, sourceCode, account.Code)
+	}
+}

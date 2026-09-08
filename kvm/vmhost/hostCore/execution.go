@@ -789,6 +789,11 @@ func (host *vmHost) CreateNewContract(input *vmcommon.ContractCreateInput, creat
 	defer func() {
 		if err != nil {
 			output.DeleteOutputAccount(newContractAddress)
+			// KLC-2583: StartWasmerInstance consumes the pending verification, but the init call
+			// below can fail before reaching it -- a value transfer, GetSCCode or the initial gas
+			// deduction. Disarm here too, so a failure cannot leave the next, unrelated
+			// instantiation in this transaction taking the new-code path.
+			runtime.DisarmPendingCodeVerification()
 		}
 	}()
 
@@ -891,7 +896,7 @@ func (host *vmHost) executeUpgrade(input *vmcommon.ContractCallInput) error {
 
 	err = runtime.StartWasmerInstance(codeDeployInput.ContractCode, metering.GetGasForExecution(), true)
 	if err != nil {
-		log.Trace("performCodeDeployment/StartWasmerInstance", "err", err)
+		log.Trace("executeUpgrade/StartWasmerInstance", "err", err)
 		if host.ForkController().FixAuditChangesV4() && errors.Is(err, vmhost.ErrContractInvalid) {
 			return err
 		}
