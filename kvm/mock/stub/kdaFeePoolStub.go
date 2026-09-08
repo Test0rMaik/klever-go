@@ -13,7 +13,7 @@ type KDAFeesPoolKappStub struct {
 	ComputeCalled           func(klvAmount int64, info data.KDAFeeHandler) (int64, error)
 	ComputeUncachedCalled   func(klvAmount int64, info data.KDAFeeHandler) (int64, error)
 	SwapCalled              func(sender state.UserAccountHandler, klvAmount int64, info data.KDAFeeHandler) error
-	ValidateCalled          func(klvFee int64, info data.KDAFeeHandler) error
+	ValidateCalled          func(senderAddress []byte, klvFee int64, info data.KDAFeeHandler) error
 	ChangePoolOwnerCalled   func(poolID []byte, sender []byte, newOwner []byte) (transaction.Transaction_TXResultCode, error)
 	GetPoolOwnerCalled      func(assetID []byte) ([]byte, error)
 	UpdatePoolCalled        func(poolID []byte, assetOwner []byte, sender []byte, info *transaction.KDAPoolInfo) (transaction.Transaction_TXResultCode, error)
@@ -57,9 +57,9 @@ func (s *KDAFeesPoolKappStub) Swap(sender state.UserAccountHandler, klvAmount in
 	return nil
 }
 
-func (s *KDAFeesPoolKappStub) Validate(klvFee int64, info data.KDAFeeHandler) error {
+func (s *KDAFeesPoolKappStub) Validate(senderAddress []byte, klvFee int64, info data.KDAFeeHandler) error {
 	if s.ValidateCalled != nil {
-		return s.ValidateCalled(klvFee, info)
+		return s.ValidateCalled(senderAddress, klvFee, info)
 	}
 	return nil
 }

@@ -47,6 +47,8 @@ func TestForkController_FlagsToggleAtConfiguredEpoch(t *testing.T) {
 		EpochRewardsV2:          10,
 		FixAuditChangesV2:       11,
 		FixAuditChangesV3:       12,
+		FixAuditChangesV4:       13,
+		FixAuditChangesV5:       14,
 	}
 	fc := &forkController{enableEpochs: cfg}
 
@@ -67,6 +69,8 @@ func TestForkController_FlagsToggleAtConfiguredEpoch(t *testing.T) {
 		{"EpochRewardsV2", cfg.EpochRewardsV2, fc.EpochRewardsV2},
 		{"FixAuditChangesV2", cfg.FixAuditChangesV2, fc.FixAuditChangesV2},
 		{"FixAuditChangesV3", cfg.FixAuditChangesV3, fc.FixAuditChangesV3},
+		{"FixAuditChangesV4", cfg.FixAuditChangesV4, fc.FixAuditChangesV4},
+		{"FixAuditChangesV5", cfg.FixAuditChangesV5, fc.FixAuditChangesV5},
 	}
 
 	maxEpoch := uint32(0)

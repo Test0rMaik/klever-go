@@ -49,9 +49,9 @@ func (e EnableEpochs) Validate() error {
 			e.FixAuditChangesV4, e.FixMarketBuyOverflow)
 	}
 
-	// fixAuditChangesV5 must be strictly after fixAuditChangesV4: sharing or preceding
-	// it would apply the V5 changes to blocks already committed under V4 rules. A V4
-	// left at the placeholder is not checked.
+	// fixAuditChangesV5 must be strictly after fixAuditChangesV4: sharing or preceding it
+	// would apply the V5 changes to blocks already committed under V4 rules. A V4 left at
+	// the placeholder is not a real schedule, so it is not checked.
 	if e.FixAuditChangesV4 != 0 && e.FixAuditChangesV5 <= e.FixAuditChangesV4 {
 		return fmt.Errorf("fixAuditChangesV5 (%d) must be after fixAuditChangesV4 (%d), "+
 			"otherwise the V5 changes apply retroactively to blocks committed under V4 rules",

@@ -135,7 +135,7 @@ func (txv *txValidator) CheckTxValidity(interceptedTx process.TxValidatorHandler
 	kdaFee := interceptedTx.KDAFee()
 	if !check.IfNil(kdaFee) {
 		// validate if asset +fee is valid
-		err = txv.kAppController.GetKDAFeesPoolKApp().Validate(txFee, kdaFee)
+		err = txv.kAppController.GetKDAFeesPoolKApp().Validate(senderAddress, txFee, kdaFee)
 		if err != nil {
 			return fmt.Errorf("%w, fail to validate KDA fee", err)
 		}

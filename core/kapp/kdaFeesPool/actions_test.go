@@ -6,10 +6,14 @@ import (
 
 	"github.com/klever-io/klever-go/common"
 	"github.com/klever-io/klever-go/common/mock"
+	"github.com/klever-io/klever-go/core/kapp"
 	kdafeespool "github.com/klever-io/klever-go/core/kapp/kdaFeesPool"
+	"github.com/klever-io/klever-go/core/process"
 	"github.com/klever-io/klever-go/core/process/kda/kdautils"
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/data/transaction"
+	"github.com/klever-io/klever-go/kapps"
+	"github.com/klever-io/klever-go/kvm/mock/stub"
 	"github.com/klever-io/klever-go/tools/marshal"
 	"github.com/stretchr/testify/require"
 )
@@ -876,7 +880,7 @@ func TestValidate(t *testing.T) {
 			amount: 100,
 		}
 
-		err = kapp.Validate(-1, feeHandler)
+		err = kapp.Validate([]byte("sender"), -1, feeHandler)
 		require.Equal(t, common.ErrAssetPoolInvalidAmount, err)
 	})
 
@@ -914,7 +918,7 @@ func TestValidate(t *testing.T) {
 			amount: 100,
 		}
 
-		err = kapp.Validate(1000, feeHandler)
+		err = kapp.Validate([]byte("sender"), 1000, feeHandler)
 		require.Equal(t, common.ErrAssetPoolNotActive, err)
 	})
 
@@ -953,7 +957,7 @@ func TestValidate(t *testing.T) {
 			amount: 100,
 		}
 
-		err = kapp.Validate(1000, feeHandler) // Requesting more than available
+		err = kapp.Validate([]byte("sender"), 1000, feeHandler) // Requesting more than available
 		require.Equal(t, common.ErrAssetPoolOutOfFunds, err)
 	})
 
@@ -992,7 +996,7 @@ func TestValidate(t *testing.T) {
 			amount: 50, // Less than required
 		}
 
-		err = kapp.Validate(1000, feeHandler)
+		err = kapp.Validate([]byte("sender"), 1000, feeHandler)
 		require.ErrorContains(t, err, common.ErrAssetPoolAmountError.Error())
 	})
 }
@@ -1396,4 +1400,314 @@ func TestComputeNeutralizesStoredNonPositiveRatio(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, int64(100), value)
 	})
+}
+
+// newSwapTestKApp wires a fee pool over an in-memory KApp account. kda is required rather than
+// optional on purpose: the asset controls in Swap are only as good as what GetKDA answers, so every
+// case has to state the asset it is swapping against instead of inheriting a permissive default.
+// kdaErr, when set, is what the KDA KApp answers instead of the asset.
+//
+// The third return reports the asset identifiers the KDA KApp was asked for, so a test can pin the
+// identifier the fee leg derives from the fee rather than only its outcome.
+func newSwapTestKApp(
+	t *testing.T,
+	forkStub *mock.ForkControllerStub,
+	kda *kapps.KDAData,
+	kdaErr error,
+) (kapp.KDAFeesPoolKapp, func() *kdafeespool.KDAFeesPoolData, func() [][]byte) {
+	t.Helper()
+
+	marshalizer := &marshal.JSONMarshalizer{}
+	args := createMockArgsKDAFeesPool()
+	args.Marshalizer = marshalizer
+	args.ForkController = forkStub
+
+	feesPool, err := kdafeespool.NewKDAFeesPoolKApp(args)
+	require.NoError(t, err)
+
+	stored, err := marshalizer.Marshal(&kdafeespool.KDAFeesPoolData{
+		OwnerAddress: []byte("owner"),
+		KDA:          []byte("asset-id"),
+		Active:       true,
+		KLVBalance:   swapTestInitialKLVBalance,
+		FRatioKLV:    1000,
+		FRatioKDA:    100,
+	})
+	require.NoError(t, err)
+
+	kappAcc := &mock.KAppAccountHandlerStub{
+		GetStorageCalled: func(_ []byte) []byte {
+			return stored
+		},
+		SetStorageCalled: func(_ []byte, value []byte) error {
+			stored = value
+			return nil
+		},
+	}
+
+	cacher := &mock.AccountsCacherStub{
+		LoadKAppCalled: func(_ []byte) (state.KAppAccountHandler, error) {
+			return kappAcc, nil
+		},
+	}
+	require.NoError(t, feesPool.SetAccountsCacher(cacher))
+
+	var requested [][]byte
+	controller := &mock.KappsControllerMock{
+		KDAKapp: &stub.KDAKappStub{
+			GetKDACalled: func(assetID []byte) (state.KAppAccountHandler, *kapps.KDAData, error) {
+				requested = append(requested, assetID)
+				return nil, kda, kdaErr
+			},
+			// Validate reads the asset uncached because it runs on an interceptor goroutine.
+			GetKDAUncachedCalled: func(assetID []byte) (*kapps.KDAData, error) {
+				requested = append(requested, assetID)
+				return kda, kdaErr
+			},
+		},
+	}
+	require.NoError(t, feesPool.SetKAppController(controller))
+
+	readPool := func() *kdafeespool.KDAFeesPoolData {
+		pool := &kdafeespool.KDAFeesPoolData{}
+		require.NoError(t, marshalizer.Unmarshal(pool, stored))
+
+		return pool
+	}
+
+	return feesPool, readPool, func() [][]byte { return requested }
+}
+
+const (
+	swapTestInitialKLVBalance = int64(1_000_000)
+	swapTestKLVFee            = int64(1000)
+	// FRatioKDA 100 over FRatioKLV 1000, so the quote is a tenth of the KLV fee.
+	swapTestQuote = swapTestKLVFee * 100 / 1000
+)
+
+func TestSwapAssetControlsAndDebitAmount(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		fixV5     bool
+		kda       *kapps.KDAData
+		kdaErr    error
+		feeKDA    []byte
+		amount    int64
+		wantDebit int64
+		wantErr   error
+		wantAsset []byte
+	}{
+		{
+			name:      "after fork the whole signed amount including the tip is debited",
+			fixV5:     true,
+			kda:       &kapps.KDAData{},
+			amount:    swapTestQuote * 500,
+			wantDebit: swapTestQuote * 500,
+		},
+		{
+			name:      "after fork an exact fee is accepted",
+			fixV5:     true,
+			kda:       &kapps.KDAData{},
+			amount:    swapTestQuote,
+			wantDebit: swapTestQuote,
+		},
+		{
+			name:    "after fork underpayment is rejected",
+			fixV5:   true,
+			kda:     &kapps.KDAData{},
+			amount:  swapTestQuote - 1,
+			wantErr: common.ErrAssetPoolAmountError,
+		},
+		{
+			name:      "before fork the whole supplied amount is debited",
+			fixV5:     false,
+			kda:       &kapps.KDAData{},
+			amount:    50000,
+			wantDebit: 50000,
+		},
+		{
+			name:    "after fork a paused asset cannot pay the fee",
+			fixV5:   true,
+			kda:     &kapps.KDAData{Attributes: &kapps.AttributesData{IsPaused: true}},
+			amount:  50000,
+			wantErr: process.ErrAssetIsPaused,
+		},
+		{
+			name:  "after fork a sender without the transfer role cannot pay the fee",
+			fixV5: true,
+			kda: &kapps.KDAData{
+				Properties: &kapps.PropertiesData{LimitTransfer: true},
+				Attributes: &kapps.AttributesData{},
+			},
+			amount:  50000,
+			wantErr: process.ErrKDATransferNotAllowed,
+		},
+		{
+			name:      "before fork a paused asset is still accepted",
+			fixV5:     false,
+			kda:       &kapps.KDAData{Attributes: &kapps.AttributesData{IsPaused: true}},
+			amount:    50000,
+			wantDebit: 50000,
+		},
+		// The two cases below are the happy path of the transfer-role control. Without them an
+		// implementation that refused every limit-transfer asset would ship green while making
+		// legitimate fee payments in those assets impossible.
+		{
+			name:  "after fork a sender holding the transfer role can pay the fee",
+			fixV5: true,
+			kda: &kapps.KDAData{
+				Properties: &kapps.PropertiesData{LimitTransfer: true},
+				Attributes: &kapps.AttributesData{},
+				Roles:      []*kapps.RolesData{{Address: []byte("sender"), HasRoleTransfer: true}},
+			},
+			amount:    swapTestQuote * 500,
+			wantDebit: swapTestQuote * 500,
+		},
+		{
+			name:  "after fork the asset owner can pay the fee in a limit-transfer asset",
+			fixV5: true,
+			kda: &kapps.KDAData{
+				Properties:   &kapps.PropertiesData{LimitTransfer: true},
+				Attributes:   &kapps.AttributesData{},
+				OwnerAddress: []byte("sender"),
+			},
+			amount:    swapTestQuote * 500,
+			wantDebit: swapTestQuote * 500,
+		},
+		{
+			name:      "after fork an unknown asset cannot pay the fee",
+			fixV5:     true,
+			kda:       &kapps.KDAData{},
+			kdaErr:    common.ErrAssetNotFound,
+			amount:    50000,
+			wantErr:   common.ErrAssetNotFound,
+			wantAsset: []byte("asset-id"),
+		},
+		{
+			name:      "after fork the nonce is stripped from a collection fee identifier",
+			fixV5:     true,
+			kda:       &kapps.KDAData{},
+			feeKDA:    []byte("asset-id/7"),
+			amount:    swapTestQuote * 500,
+			wantDebit: swapTestQuote * 500,
+			wantAsset: []byte("asset-id"),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			forkStub := mock.NewForkControllerStub()
+			forkStub.FixAuditChangesV5Value = test.fixV5
+
+			feesPool, readPool, requestedAssets := newSwapTestKApp(t, forkStub, test.kda, test.kdaErr)
+
+			var debitedFromSender, credited int64
+			subCalled := false
+			sender := &mock.UserAccountHandlerStub{
+				AddressBytesCalled: func() []byte { return []byte("sender") },
+				SubFromBalanceCalled: func(value int64, _ []byte, _ bool, _ ...*kapps.UserKDA) error {
+					subCalled = true
+					debitedFromSender = value
+					return nil
+				},
+				AddToBalanceCalled: func(value int64, _ []byte, _ bool, _ ...*kapps.UserKDA) error {
+					credited = value
+					return nil
+				},
+			}
+
+			feeKDA := test.feeKDA
+			if feeKDA == nil {
+				feeKDA = []byte("asset-id")
+			}
+
+			feeHandler := &KDAFeeHandlerStub{kda: feeKDA, amount: test.amount}
+			err := feesPool.Swap(sender, swapTestKLVFee, feeHandler)
+
+			if test.wantAsset != nil {
+				require.Equal(t, [][]byte{test.wantAsset}, requestedAssets())
+			}
+
+			if test.wantErr != nil {
+				require.ErrorIs(t, err, test.wantErr)
+				require.False(t, subCalled, "a rejected fee payment must not debit the sender")
+
+				pool := readPool()
+				require.Equal(t, int64(0), pool.KDABalance)
+				require.Equal(t, swapTestInitialKLVBalance, pool.KLVBalance)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, test.wantDebit, debitedFromSender)
+
+			// The pool must be credited exactly what the sender was debited. Asserting only the
+			// debit would let a credit of info.GetAmount() pass as green while inflating the pool.
+			pool := readPool()
+			require.Equal(t, test.wantDebit, pool.KDABalance)
+			require.Equal(t, swapTestInitialKLVBalance-swapTestKLVFee, pool.KLVBalance)
+			require.Equal(t, swapTestKLVFee, credited)
+		})
+	}
+}
+
+func TestValidateRejectsWhateverSwapWouldReject(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		fixV5   bool
+		kda     *kapps.KDAData
+		wantErr error
+	}{
+		{
+			name:  "after fork a paused asset is refused at interception",
+			fixV5: true,
+			kda:   &kapps.KDAData{Attributes: &kapps.AttributesData{IsPaused: true}},
+
+			wantErr: process.ErrAssetIsPaused,
+		},
+		{
+			name:  "after fork a sender without the transfer role is refused at interception",
+			fixV5: true,
+			kda: &kapps.KDAData{
+				Properties: &kapps.PropertiesData{LimitTransfer: true},
+				Attributes: &kapps.AttributesData{},
+			},
+			wantErr: process.ErrKDATransferNotAllowed,
+		},
+		{
+			name:  "before fork interception keeps accepting both",
+			fixV5: false,
+			kda:   &kapps.KDAData{Attributes: &kapps.AttributesData{IsPaused: true}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			forkStub := mock.NewForkControllerStub()
+			forkStub.FixAuditChangesV5Value = test.fixV5
+
+			feesPool, _, _ := newSwapTestKApp(t, forkStub, test.kda, nil)
+			feeHandler := &KDAFeeHandlerStub{kda: []byte("asset-id"), amount: 50000}
+
+			err := feesPool.Validate([]byte("sender"), swapTestKLVFee, feeHandler)
+
+			if test.wantErr != nil {
+				// A fee payment accepted here but refused by Swap is gossiped network-wide and then
+				// dropped without consuming a fee or a nonce, so it can be resubmitted for free.
+				require.ErrorIs(t, err, test.wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+		})
+	}
 }

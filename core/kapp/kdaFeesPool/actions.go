@@ -9,6 +9,7 @@ import (
 
 	"github.com/klever-io/klever-go/common"
 	"github.com/klever-io/klever-go/core/kapp"
+	"github.com/klever-io/klever-go/core/process"
 	"github.com/klever-io/klever-go/core/process/kda/kdautils"
 	txProcess "github.com/klever-io/klever-go/core/process/transaction"
 	"github.com/klever-io/klever-go/data"
@@ -430,7 +431,7 @@ func (v *kdaFeesPoolKApp) Withdraw(sender []byte, tc *transaction.WithdrawContra
 	return transaction.Transaction_Ok, nil
 }
 
-// Swap - exchange KLV to KDA from pool to sender
+// Swap charges the full signed KDA amount, including any excess over the required fee.
 func (v *kdaFeesPoolKApp) Swap(sender state.UserAccountHandler, klvAmount int64, info data.KDAFeeHandler) error {
 	if check.IfNil(info) {
 		return nil
@@ -445,6 +446,18 @@ func (v *kdaFeesPoolKApp) Swap(sender state.UserAccountHandler, klvAmount int64,
 	pool, err := v.validate(app, klvAmount, info)
 	if err != nil {
 		return err
+	}
+
+	if v.forkController.FixAuditChangesV5() {
+		_, kda, errKDA := v.KAppController.GetKDAKApp().GetKDA(feeAssetID(info))
+		if errKDA != nil {
+			return errKDA
+		}
+
+		err = checkFeeTransferControls(sender.AddressBytes(), kda)
+		if err != nil {
+			return err
+		}
 	}
 
 	// SUB KDA from USER
@@ -546,7 +559,11 @@ func (v *kdaFeesPoolKApp) compute(app state.KAppAccountHandler, klvFee int64, in
 }
 
 // Validate -
-func (v *kdaFeesPoolKApp) Validate(klvFee int64, info data.KDAFeeHandler) error {
+// Validate is the interception-side gate. It must reject everything Swap would reject: a fee payment
+// admitted here but refused at execution is gossiped to every node, dropped without consuming a fee
+// or a nonce, and can be resubmitted for free, so any Swap rejection reason without a counterpart
+// here is a spam amplifier.
+func (v *kdaFeesPoolKApp) Validate(senderAddress []byte, klvFee int64, info data.KDAFeeHandler) error {
 	// check if pool exists
 	app, err := v.getKApp()
 	if err != nil {
@@ -554,7 +571,61 @@ func (v *kdaFeesPoolKApp) Validate(klvFee int64, info data.KDAFeeHandler) error 
 	}
 
 	_, err = v.validate(app, klvFee, info)
-	return err
+	if err != nil {
+		return err
+	}
+
+	if !v.forkController.FixAuditChangesV5() {
+		return nil
+	}
+
+	// Read the asset uncached: Validate runs on the interceptor goroutines, concurrently with
+	// block processing, and the cached KDA KApp's TrackableDataTrie is a bare map that processing
+	// writes on every asset mutation. See AccountsCacher.LoadKAppUncached.
+	kda, err := v.KAppController.GetKDAKApp().GetKDAUncached(feeAssetID(info))
+	if err != nil {
+		return err
+	}
+
+	return checkFeeTransferControls(senderAddress, kda)
+}
+
+// feeAssetID is the asset a fee is paid in, without the nonce suffix a collection identifier
+// carries, defaulting to KLV when the fee names no asset.
+func feeAssetID(info data.KDAFeeHandler) []byte {
+	assetID := bytes.Split(info.GetKDA(), []byte(kapps.Sp))[0]
+	if assetID == nil {
+		return kdautils.KLVIdentifier
+	}
+
+	return assetID
+}
+
+// checkFeeTransferControls rejects a fee payment the asset itself would not allow, so paying a
+// fee in KDA cannot bypass the controls a plain transfer of it is subject to. The asset is
+// resolved by the caller because the two call sites must read it differently: Swap runs inside
+// block processing and reads the cached KApp, Validate runs on an interceptor goroutine and
+// cannot.
+//
+// Deliberately not kapps.KDAData.IsTransferAllowed, which is the same chain plus one chance:
+// it also admits the transfer when the *destination* holds the deposit role. Routed through
+// here that would let an issuer open its limit-transfer asset to fee payment by granting the
+// deposit role to KDAFeesPoolKAppAddress, widening who may pay fees in it. That may well be the
+// semantics we want - it is how a plain transfer behaves - but it is a consensus-visible
+// broadening and not what this audit fix was scoped to decide, so the narrower check stands.
+func checkFeeTransferControls(senderAddress []byte, kda *kapps.KDAData) error {
+	if kda.GetAttributes().GetIsPaused() {
+		return process.ErrAssetIsPaused
+	}
+
+	if kda.GetProperties().GetLimitTransfer() {
+		senderRoles, errRole := kda.GetRoleByAddress(senderAddress)
+		if errRole != nil || !senderRoles.HasRoleTransfer {
+			return process.ErrKDATransferNotAllowed
+		}
+	}
+
+	return nil
 }
 
 func (v *kdaFeesPoolKApp) validate(app state.KAppAccountHandler, klvFee int64, info data.KDAFeeHandler) (*KDAFeesPoolData, error) {

@@ -136,6 +136,34 @@ func (k *kdaKapp) GetKDA(assetID []byte) (state.KAppAccountHandler, *kapps.KDADa
 	return kdaKapp, kda, nil
 }
 
+// GetKDAUncached is GetKDA for callers outside the processing goroutine (e.g. the transaction
+// interceptors); see AccountsCacher.LoadKAppUncached. The cached KDA KApp is the hottest one on
+// the chain - every asset mutation writes its TrackableDataTrie, a bare map with no lock - so a
+// concurrent read of it from another goroutine is a fatal "concurrent map read and map write".
+// Returns last committed state, which is what an interception-side check should see anyway.
+func (k *kdaKapp) GetKDAUncached(assetID []byte) (*kapps.KDAData, error) {
+	kdaKapp, err := k.accountsCacher.LoadKAppUncached(kapps.KDAKAppAddress)
+	if err != nil {
+		return nil, err
+	}
+
+	kdaBytes, err := kdaKapp.DataTrieTracker().RetrieveValue(kdautils.ToKDAKey(assetID, nil))
+	if err != nil {
+		return nil, err
+	}
+	if len(kdaBytes) == 0 {
+		return nil, common.ErrAssetNotFound
+	}
+
+	kda := &kapps.KDAData{}
+	err = k.marshalizer.Unmarshal(kda, kdaBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return kda, nil
+}
+
 func (k *kdaKapp) SetKDA(kdaKapp state.KAppAccountHandler, assetID []byte, kda *kapps.KDAData) error {
 	data, err := k.marshalizer.Marshal(kda)
 	if err != nil {

@@ -97,6 +97,7 @@ type KappsControllerMock struct {
 	kappContext    kapp.KappContext
 	ValidatorsKapp kapp.ValidatorsKapp
 	MarketKapp     kapp.MarketKapp
+	KDAKapp        kapp.KDAKapp
 }
 
 func (k *KappsControllerMock) SetCurrentKAppContext(kappContext kapp.KappContext) {
@@ -129,7 +130,7 @@ func (k *KappsControllerMock) GetAccountsKApp() kapp.AccountsKapp {
 
 // IsInterfaceNil -
 func (k *KappsControllerMock) GetKDAKApp() kapp.KDAKapp {
-	return nil
+	return k.KDAKapp
 }
 
 // IsInterfaceNil -

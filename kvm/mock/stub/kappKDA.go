@@ -7,11 +7,14 @@ import (
 	"github.com/klever-io/klever-go/kapps"
 )
 
+var _ kapp.KDAKapp = (*KDAKappStub)(nil)
+
 type KDAKappStub struct {
 	SetKAppControllerCalled func(controller kapp.KAppController) error
 	SetAccountsCacherCalled func(cacher state.AccountsCacher) error
 	GetAccountsCacherCalled func() state.AccountsCacher
 	GetKDACalled            func(assetID []byte) (state.KAppAccountHandler, *kapps.KDAData, error)
+	GetKDAUncachedCalled    func(assetID []byte) (*kapps.KDAData, error)
 	SetKDACalled            func(kdaKapp state.KAppAccountHandler, assetID []byte, kda *kapps.KDAData) error
 	GetStakingCalled        func(assetID []byte) (state.KAppAccountHandler, *kapps.StakingData, error)
 	SetStakingCalled        func(stakingKapp state.KAppAccountHandler, assetID []byte, staking *kapps.StakingData) error
@@ -33,7 +36,7 @@ func (stub *KDAKappStub) SetKAppController(controller kapp.KAppController) error
 
 func (stub *KDAKappStub) SetAccountsCacher(cacher state.AccountsCacher) error {
 	if stub.SetAccountsCacherCalled != nil {
-		return stub.SetAccountsCacher(cacher)
+		return stub.SetAccountsCacherCalled(cacher)
 	}
 
 	return nil
@@ -41,7 +44,7 @@ func (stub *KDAKappStub) SetAccountsCacher(cacher state.AccountsCacher) error {
 
 func (stub *KDAKappStub) GetAccountsCacher() state.AccountsCacher {
 	if stub.GetAccountsCacherCalled != nil {
-		return stub.GetAccountsCacher()
+		return stub.GetAccountsCacherCalled()
 	}
 	return nil
 }
@@ -51,6 +54,19 @@ func (stub *KDAKappStub) GetKDA(assetID []byte) (state.KAppAccountHandler, *kapp
 		return stub.GetKDACalled(assetID)
 	}
 	return nil, nil, nil
+}
+
+func (stub *KDAKappStub) GetKDAUncached(assetID []byte) (*kapps.KDAData, error) {
+	if stub.GetKDAUncachedCalled != nil {
+		return stub.GetKDAUncachedCalled(assetID)
+	}
+
+	if stub.GetKDACalled != nil {
+		_, kda, err := stub.GetKDACalled(assetID)
+		return kda, err
+	}
+
+	return nil, nil
 }
 
 func (stub *KDAKappStub) SetKDA(kdaKapp state.KAppAccountHandler, assetID []byte, kda *kapps.KDAData) error {

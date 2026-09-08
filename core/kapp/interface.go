@@ -78,7 +78,7 @@ type KDAFeesPoolKapp interface {
 	Compute(klvAmount int64, info data.KDAFeeHandler) (int64, error)
 	ComputeUncached(klvAmount int64, info data.KDAFeeHandler) (int64, error)
 	Swap(sender state.UserAccountHandler, klvAmount int64, info data.KDAFeeHandler) error
-	Validate(klvFee int64, info data.KDAFeeHandler) error
+	Validate(senderAddress []byte, klvFee int64, info data.KDAFeeHandler) error
 	ChangePoolOwner(poolID []byte, sender []byte, newOwner []byte) (transaction.Transaction_TXResultCode, error)
 	GetPoolOwner(assetID []byte) ([]byte, error)
 	UpdatePool(poolID []byte, assetOwner []byte, sender []byte, info *transaction.KDAPoolInfo) (transaction.Transaction_TXResultCode, error)
@@ -148,6 +148,9 @@ type KDAKapp interface {
 	SetAccountsCacher(cacher state.AccountsCacher) error
 	GetAccountsCacher() state.AccountsCacher
 	GetKDA(assetID []byte) (state.KAppAccountHandler, *kapps.KDAData, error)
+	// GetKDAUncached reads the asset bypassing the shared cache, for goroutines outside
+	// block processing; see AccountsCacher.LoadKAppUncached.
+	GetKDAUncached(assetID []byte) (*kapps.KDAData, error)
 	SetKDA(kdaKapp state.KAppAccountHandler, assetID []byte, kda *kapps.KDAData) error
 	GetStaking(assetID []byte) (state.KAppAccountHandler, *kapps.StakingData, error)
 	SetStaking(stakingKapp state.KAppAccountHandler, assetID []byte, staking *kapps.StakingData) error
