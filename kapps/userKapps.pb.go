@@ -157,6 +157,69 @@ func (x *LastClaim) GetEpoch() uint32 {
 	return 0
 }
 
+// StakeSegment records a closed interval of past stake: the bucket held Value for every
+// reward epoch in (StakedEpoch, ThroughEpoch]. Only staked intervals are recorded, so an
+// unstaked gap is represented by no segment covering it.
+type StakeSegment struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	StakedEpoch   uint32                 `protobuf:"varint,1,opt,name=StakedEpoch,json=stakedEpoch,proto3" json:"StakedEpoch,omitempty"`
+	ThroughEpoch  uint32                 `protobuf:"varint,2,opt,name=ThroughEpoch,json=throughEpoch,proto3" json:"ThroughEpoch,omitempty"`
+	Value         int64                  `protobuf:"varint,3,opt,name=Value,json=value,proto3" json:"Value,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StakeSegment) Reset() {
+	*x = StakeSegment{}
+	mi := &file_userKapps_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StakeSegment) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StakeSegment) ProtoMessage() {}
+
+func (x *StakeSegment) ProtoReflect() protoreflect.Message {
+	mi := &file_userKapps_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StakeSegment.ProtoReflect.Descriptor instead.
+func (*StakeSegment) Descriptor() ([]byte, []int) {
+	return file_userKapps_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *StakeSegment) GetStakedEpoch() uint32 {
+	if x != nil {
+		return x.StakedEpoch
+	}
+	return 0
+}
+
+func (x *StakeSegment) GetThroughEpoch() uint32 {
+	if x != nil {
+		return x.ThroughEpoch
+	}
+	return 0
+}
+
+func (x *StakeSegment) GetValue() int64 {
+	if x != nil {
+		return x.Value
+	}
+	return 0
+}
+
 type UserBucket struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	StakedAt      int64                  `protobuf:"varint,1,opt,name=StakedAt,json=stakedAt,proto3" json:"StakedAt,omitempty"`
@@ -164,13 +227,14 @@ type UserBucket struct {
 	UnstakedEpoch uint32                 `protobuf:"varint,3,opt,name=UnstakedEpoch,json=unstakedEpoch,proto3" json:"UnstakedEpoch,omitempty"`
 	Value         int64                  `protobuf:"varint,4,opt,name=Value,json=value,proto3" json:"Value,omitempty"`
 	Delegation    []byte                 `protobuf:"bytes,5,opt,name=Delegation,json=delegation,omitempty,proto3" json:"Delegation,omitempty"`
+	History       []*StakeSegment        `protobuf:"bytes,6,rep,name=History,json=history,omitempty,proto3" json:"History,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *UserBucket) Reset() {
 	*x = UserBucket{}
-	mi := &file_userKapps_proto_msgTypes[2]
+	mi := &file_userKapps_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -182,7 +246,7 @@ func (x *UserBucket) String() string {
 func (*UserBucket) ProtoMessage() {}
 
 func (x *UserBucket) ProtoReflect() protoreflect.Message {
-	mi := &file_userKapps_proto_msgTypes[2]
+	mi := &file_userKapps_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -195,7 +259,7 @@ func (x *UserBucket) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UserBucket.ProtoReflect.Descriptor instead.
 func (*UserBucket) Descriptor() ([]byte, []int) {
-	return file_userKapps_proto_rawDescGZIP(), []int{2}
+	return file_userKapps_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *UserBucket) GetStakedAt() int64 {
@@ -233,6 +297,13 @@ func (x *UserBucket) GetDelegation() []byte {
 	return nil
 }
 
+func (x *UserBucket) GetHistory() []*StakeSegment {
+	if x != nil {
+		return x.History
+	}
+	return nil
+}
+
 var File_userKapps_proto protoreflect.FileDescriptor
 
 const file_userKapps_proto_rawDesc = "" +
@@ -250,7 +321,11 @@ const file_userKapps_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\v2\x11.proto.UserBucketR\x05value:\x028\x01\"?\n" +
 	"\tLastClaim\x12\x1c\n" +
 	"\tTimestamp\x18\x01 \x01(\x03R\ttimestamp\x12\x14\n" +
-	"\x05Epoch\x18\x02 \x01(\rR\x05epoch\"\xb0\x01\n" +
+	"\x05Epoch\x18\x02 \x01(\rR\x05epoch\"j\n" +
+	"\fStakeSegment\x12 \n" +
+	"\vStakedEpoch\x18\x01 \x01(\rR\vstakedEpoch\x12\"\n" +
+	"\fThroughEpoch\x18\x02 \x01(\rR\fthroughEpoch\x12\x14\n" +
+	"\x05Value\x18\x03 \x01(\x03R\x05value\"\xe9\x01\n" +
 	"\n" +
 	"UserBucket\x12\x1a\n" +
 	"\bStakedAt\x18\x01 \x01(\x03R\bstakedAt\x12 \n" +
@@ -258,7 +333,8 @@ const file_userKapps_proto_rawDesc = "" +
 	"\rUnstakedEpoch\x18\x03 \x01(\rR\runstakedEpoch\x12\x14\n" +
 	"\x05Value\x18\x04 \x01(\x03R\x05value\x12(\n" +
 	"\n" +
-	"Delegation\x18\x05 \x01(\fR\x14delegation,omitemptyB\n" +
+	"Delegation\x18\x05 \x01(\fR\x14delegation,omitempty\x127\n" +
+	"\aHistory\x18\x06 \x03(\v2\x13.proto.StakeSegmentR\x11history,omitemptyB\n" +
 	"Z\b./;kappsb\x06proto3"
 
 var (
@@ -273,22 +349,24 @@ func file_userKapps_proto_rawDescGZIP() []byte {
 	return file_userKapps_proto_rawDescData
 }
 
-var file_userKapps_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_userKapps_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
 var file_userKapps_proto_goTypes = []any{
-	(*UserKDA)(nil),    // 0: proto.UserKDA
-	(*LastClaim)(nil),  // 1: proto.LastClaim
-	(*UserBucket)(nil), // 2: proto.UserBucket
-	nil,                // 3: proto.UserKDA.BucketsEntry
+	(*UserKDA)(nil),      // 0: proto.UserKDA
+	(*LastClaim)(nil),    // 1: proto.LastClaim
+	(*StakeSegment)(nil), // 2: proto.StakeSegment
+	(*UserBucket)(nil),   // 3: proto.UserBucket
+	nil,                  // 4: proto.UserKDA.BucketsEntry
 }
 var file_userKapps_proto_depIdxs = []int32{
 	1, // 0: proto.UserKDA.LastClaim:type_name -> proto.LastClaim
-	3, // 1: proto.UserKDA.Buckets:type_name -> proto.UserKDA.BucketsEntry
-	2, // 2: proto.UserKDA.BucketsEntry.value:type_name -> proto.UserBucket
-	3, // [3:3] is the sub-list for method output_type
-	3, // [3:3] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	4, // 1: proto.UserKDA.Buckets:type_name -> proto.UserKDA.BucketsEntry
+	2, // 2: proto.UserBucket.History:type_name -> proto.StakeSegment
+	3, // 3: proto.UserKDA.BucketsEntry.value:type_name -> proto.UserBucket
+	4, // [4:4] is the sub-list for method output_type
+	4, // [4:4] is the sub-list for method input_type
+	4, // [4:4] is the sub-list for extension type_name
+	4, // [4:4] is the sub-list for extension extendee
+	0, // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_userKapps_proto_init() }
@@ -302,7 +380,7 @@ func file_userKapps_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_userKapps_proto_rawDesc), len(file_userKapps_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   4,
+			NumMessages:   5,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

@@ -392,11 +392,9 @@ func (a *userAccount) Freeze(
 	assetID []byte,
 	bucketID []byte,
 	value int64,
-	epoch uint32,
-	blockTime int64,
 	staking *kapps.StakingData,
 	userKDA *kapps.UserKDA,
-	newStakingFlow bool,
+	opts FreezeOptions,
 ) error {
 	if value <= 0 {
 		return ErrInvalidValue
@@ -414,27 +412,73 @@ func (a *userAccount) Freeze(
 
 	oldValue := int64(0)
 	toAdd := value
+	var history []*kapps.StakeSegment
 	if userKDA.Buckets[parsedBucketID] != nil {
-		oldValue = userKDA.Buckets[parsedBucketID].Value
-		if newStakingFlow &&
-			userKDA.Buckets[parsedBucketID].UnstakedEpoch != core.DefaultUnstakedEpoch {
+		bucket := userKDA.Buckets[parsedBucketID]
+		oldValue = bucket.Value
+		if opts.NewStakingFlow && bucket.UnstakedEpoch != core.DefaultUnstakedEpoch {
 			toAdd += oldValue
 		}
 
+		if opts.KeepStakeHistory {
+			history = stakeHistoryAfterFreeze(bucket, opts.BlockEpoch, userKDA.LastClaim.GetEpoch())
+		}
 	}
 
 	userKDA.Buckets[parsedBucketID] = &kapps.UserBucket{
-		StakedAt:      blockTime,
-		StakedEpoch:   epoch,
+		StakedAt:      opts.BlockTime,
+		StakedEpoch:   opts.BlockEpoch,
 		UnstakedEpoch: core.DefaultUnstakedEpoch,
 		Value:         oldValue + value,
 		Delegation:    nil,
+		History:       history,
 	}
 
 	userKDA.FrozenBalance += toAdd
 	staking.TotalStaked += toAdd
 
 	return nil
+}
+
+// stakeHistoryAfterFreeze records what the bucket had staked before this freeze rewrote it, so an
+// ordinary claim can still price the reward epochs that stake earned.
+//
+// Segments already covered by LastClaim are dropped, so the list is bounded by the claim cursor
+// rather than by the number of top-ups.
+func stakeHistoryAfterFreeze(bucket *kapps.UserBucket, epoch, lastClaimEpoch uint32) []*kapps.StakeSegment {
+	history := make([]*kapps.StakeSegment, 0, len(bucket.History)+1)
+
+	for _, segment := range bucket.History {
+		// Each segment carries its own end, so a claim cursor past that end retires it without
+		// consulting its neighbours.
+		if segment.ThroughEpoch > lastClaimEpoch {
+			history = append(history, segment)
+		}
+	}
+
+	// The stake being replaced was live until this freeze, or until the unfreeze that preceded
+	// it -- an unfreeze at U still earns pool U, which is where the interval closes.
+	through := epoch
+	if bucket.UnstakedEpoch != core.DefaultUnstakedEpoch {
+		through = bucket.UnstakedEpoch
+	}
+
+	// StakedEpoch == through leaves the empty interval (through, through], which no pool epoch
+	// can fall in; through <= lastClaimEpoch is already paid. Both same-epoch cases -- a top-up
+	// and an unfreeze/re-freeze inside one epoch -- fall out of the first condition.
+	if bucket.StakedEpoch < through && lastClaimEpoch < through {
+		history = append(history, &kapps.StakeSegment{
+			StakedEpoch:  bucket.StakedEpoch,
+			ThroughEpoch: through,
+			Value:        bucket.Value,
+		})
+	}
+
+	if len(history) == 0 {
+		return nil
+	}
+
+	return history
 }
 
 // Unfreeze -
@@ -677,6 +721,29 @@ func computeAPR(initTime, endTime, amount, currAPR int64, forkController core.Fo
 	return intV
 }
 
+// bucketStakeAt reports the value the bucket had staked when fprEpoch was
+// distributed. Before FixAuditChangesV5 only the current stake is visible, so a
+// top-up that moves StakedEpoch forward hides every pool at or below it; from
+// the fork on, the segments recorded at each top-up keep those pools priced at
+// the value that actually earned them.
+func bucketStakeAt(bucket *kapps.UserBucket, fprEpoch uint32, forkController core.ForkController) (int64, bool) {
+	if bucket.StakedEpoch < fprEpoch {
+		return bucket.Value, true
+	}
+
+	if !forkController.FixAuditChangesV5() {
+		return 0, false
+	}
+
+	for _, segment := range bucket.History {
+		if segment.StakedEpoch < fprEpoch && fprEpoch <= segment.ThroughEpoch {
+			return segment.Value, true
+		}
+	}
+
+	return 0, false
+}
+
 func (a *userAccount) computeClaimFPR(assetID []byte, blockEpoch uint32, blockTime int64, userKDA *kapps.UserKDA, staking *kapps.StakingData, forkController core.ForkController) (map[string]int64, error) {
 	if userKDA.Buckets == nil || userKDA.LastClaim == nil {
 		return nil, nil
@@ -695,46 +762,62 @@ func (a *userAccount) computeClaimFPR(assetID []byte, blockEpoch uint32, blockTi
 		}
 
 		for _, bucket := range userKDA.Buckets {
-			if bucket.StakedEpoch < fpr.Epoch {
-
-				if !forkController.BigBucketsCompute() {
-					// sanity test...
-					if bucket.Value > fpr.TotalStaked {
-						return nil, ErrInconsistentStakingData
-					}
-				}
-
-				if bucket.UnstakedEpoch != core.DefaultUnstakedEpoch {
-					if forkController.FixAuditChangesV3() {
-						if fpr.Epoch > bucket.UnstakedEpoch {
-							continue
-						}
-					} else if forkController.FixStakingBuckets() {
-						continue
-					}
-				}
-
-				if fpr.TotalAmount > 0 {
-					kdaID := string(kdautils.KLVIdentifier)
-					if !forkController.ClaimKFI() {
-						kdaID = string(kdautils.KFIIdentifier)
-					}
-
-					intAmount := a.calculateFPRAmount(fpr.TotalAmount, fpr.TotalStaked, bucket.Value, fpr.TotalClaimed, forkController)
-					gains[kdaID] += intAmount
-					fpr.TotalClaimed += intAmount
-				}
-
-				for key, value := range fpr.KDAS {
-					intAmount := a.calculateFPRAmount(value.TotalAmount, fpr.TotalStaked, bucket.Value, value.TotalClaimed, forkController)
-					gains[key] += intAmount
-					fpr.KDAS[key].TotalClaimed += intAmount
-				}
+			if err := a.accrueBucketFPR(gains, fpr, bucket, forkController); err != nil {
+				return nil, err
 			}
 		}
 	}
 
 	return gains, nil
+}
+
+func (a *userAccount) accrueBucketFPR(gains map[string]int64, fpr *kapps.FPRData, bucket *kapps.UserBucket, forkController core.ForkController) error {
+	stakedValue, staked := bucketStakeAt(bucket, fpr.Epoch, forkController)
+	if !staked {
+		return nil
+	}
+
+	if !forkController.BigBucketsCompute() {
+		// sanity test...
+		if stakedValue > fpr.TotalStaked {
+			return ErrInconsistentStakingData
+		}
+	}
+
+	if !bucketEligibleForFPR(bucket, fpr.Epoch, forkController) {
+		return nil
+	}
+
+	if fpr.TotalAmount > 0 {
+		kdaID := string(kdautils.KLVIdentifier)
+		if !forkController.ClaimKFI() {
+			kdaID = string(kdautils.KFIIdentifier)
+		}
+
+		intAmount := a.calculateFPRAmount(fpr.TotalAmount, fpr.TotalStaked, stakedValue, fpr.TotalClaimed, forkController)
+		gains[kdaID] += intAmount
+		fpr.TotalClaimed += intAmount
+	}
+
+	for key, value := range fpr.KDAS {
+		intAmount := a.calculateFPRAmount(value.TotalAmount, fpr.TotalStaked, stakedValue, value.TotalClaimed, forkController)
+		gains[key] += intAmount
+		fpr.KDAS[key].TotalClaimed += intAmount
+	}
+
+	return nil
+}
+
+func bucketEligibleForFPR(bucket *kapps.UserBucket, fprEpoch uint32, forkController core.ForkController) bool {
+	if bucket.UnstakedEpoch == core.DefaultUnstakedEpoch {
+		return true
+	}
+
+	if forkController.FixAuditChangesV3() {
+		return fprEpoch <= bucket.UnstakedEpoch
+	}
+
+	return !forkController.FixStakingBuckets()
 }
 
 func (a *userAccount) calculateFPRAmount(totalAmount, totalStaked, bucketValue, totalClaimed int64, forkController core.ForkController) int64 {

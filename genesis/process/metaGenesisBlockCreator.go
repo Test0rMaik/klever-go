@@ -410,7 +410,11 @@ func setStakingToTrie(
 			return nil, err
 		}
 
-		err = account.Freeze(kdautils.KLVIdentifier, bucketID, delegation.GetValue(), arg.StartEpochNum, arg.GenesisTime, klvStaking, userKDA, true)
+		err = account.Freeze(kdautils.KLVIdentifier, bucketID, delegation.GetValue(), klvStaking, userKDA, state.FreezeOptions{
+			BlockEpoch:     arg.StartEpochNum,
+			BlockTime:      arg.GenesisTime,
+			NewStakingFlow: true,
+		})
 		if err != nil {
 			return nil, err
 		}

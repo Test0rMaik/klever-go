@@ -789,7 +789,12 @@ func (a *accountsKapp) Freeze(sender []byte, tc *transaction.FreezeContract) (tr
 		bucketID = kdautils.ToBucketID(a.hasher, ctx.Block().GetRandSeed(), sender, assetID, ctx.TxNonce(), ctx.ContractID(), tc.GetAmount())
 	}
 
-	err = ownerAcc.Freeze(assetID, bucketID, value, ctx.Block().GetEpoch(), ctx.Block().GetTimestamp(), staking, userKDA, a.forkController.FixStakingBuckets())
+	err = ownerAcc.Freeze(assetID, bucketID, value, staking, userKDA, state.FreezeOptions{
+		BlockEpoch:       ctx.Block().GetEpoch(),
+		BlockTime:        ctx.Block().GetTimestamp(),
+		NewStakingFlow:   a.forkController.FixStakingBuckets(),
+		KeepStakeHistory: a.forkController.FixAuditChangesV5(),
+	})
 	if err != nil {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldFreezeError, err.Error())
 		return transaction.Transaction_FreezeError, err

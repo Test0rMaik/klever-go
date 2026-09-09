@@ -18,10 +18,20 @@ message LastClaim {
     uint32  Epoch     = 2 [json_name = "epoch"];
 }
 
+// StakeSegment records a closed interval of past stake: the bucket held Value for every
+// reward epoch in (StakedEpoch, ThroughEpoch]. Only staked intervals are recorded, so an
+// unstaked gap is represented by no segment covering it.
+message StakeSegment {
+    uint32  StakedEpoch  = 1 [json_name = "stakedEpoch"];
+    uint32  ThroughEpoch = 2 [json_name = "throughEpoch"];
+    int64   Value        = 3 [json_name = "value"];
+}
+
 message UserBucket {
-    int64   StakedAt         = 1 [json_name = "stakedAt"];
-    uint32  StakedEpoch      = 2 [json_name = "stakedEpoch"];
-    uint32  UnstakedEpoch    = 3 [json_name = "unstakedEpoch"];
-    int64   Value            = 4 [json_name = "value"];
-    bytes   Delegation       = 5 [json_name = "delegation,omitempty"];
+    int64                 StakedAt         = 1 [json_name = "stakedAt"];
+    uint32                StakedEpoch      = 2 [json_name = "stakedEpoch"];
+    uint32                UnstakedEpoch    = 3 [json_name = "unstakedEpoch"];
+    int64                 Value            = 4 [json_name = "value"];
+    bytes                 Delegation       = 5 [json_name = "delegation,omitempty"];
+    repeated StakeSegment History          = 6 [json_name = "history,omitempty"];
 }

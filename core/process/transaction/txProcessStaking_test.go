@@ -1342,6 +1342,371 @@ func TestStakingTxProcessor_KDA_FPRClaim_Unfreeze_At_Reward_Epoch_PostFix(t *tes
 	assert.Equal(t, depositKLVAmount, staking.FPR[0].TotalClaimed)
 }
 
+const (
+	topUpInitialKLV = int64(2_000_000_000)
+	topUpInitialFPR = int64(2_000_000_000)
+	topUpBaseStake  = int64(1_000_000)
+	// a one unit top-up is the cheapest possible attempt at pulling the reward
+	// forward, so it is what the claim window has to hold against
+	topUpIncrement     = int64(1)
+	topUpRewardPool    = int64(500_000)
+	topUpExpiryDeposit = int64(1)
+	topUpClaimWindow   = uint32(5)
+	topUpStakeEpoch    = uint32(1)
+	topUpRewardEpoch   = uint32(3)
+	topUpMatureEpoch   = uint32(6)
+	topUpExpiryEpoch   = uint32(104)
+)
+
+func stakeFPRAndDepositReward(t *testing.T, c *Controller) *block.Block {
+	t.Helper()
+
+	c.AddUser(OwnerAddress, topUpInitialKLV, kdautils.KLVIdentifier)
+	c.AddUser(OwnerAddress, topUpInitialFPR, FPRIdentifier)
+	c.AddUser(RefAddress, topUpInitialKLV, kdautils.KLVIdentifier)
+
+	blk := c.CreateBlockHeader(0, topUpStakeEpoch, 1)
+	updateFPRStakingConfig(t, c, blk, topUpClaimWindow, 1, 0)
+
+	runStakingContractTx(t, c, blk, &transaction.FreezeContract{
+		AssetID: FPRIdentifier,
+		Amount:  topUpBaseStake,
+	}, transaction.TXContract_FreezeContractType, OwnerAddress, nil)
+	c.CheckBalance(OwnerAddress, FPRIdentifier, topUpInitialFPR-topUpBaseStake)
+	c.CheckBalance(OwnerAddress, kdautils.KLVIdentifier, topUpInitialKLV)
+
+	blk.Header.Epoch = topUpStakeEpoch + 1
+	runStakingContractTx(t, c, blk, &transaction.DepositContract{
+		DepositType: transaction.DepositContract_FPRDeposit,
+		ID:          FPRIdentifier,
+		CurrencyID:  kdautils.KLVIdentifier,
+		Amount:      topUpRewardPool,
+	}, transaction.TXContract_DepositContractType, RefAddress, nil)
+	c.CheckBalance(RefAddress, kdautils.KLVIdentifier, topUpInitialKLV-topUpRewardPool)
+
+	staking := c.GetStakingKDA(FPRIdentifier)
+	require.Len(t, staking.FPR, 1)
+	require.Equal(t, topUpRewardEpoch, staking.FPR[0].Epoch)
+	require.Equal(t, topUpRewardPool, staking.FPR[0].TotalAmount)
+	require.Equal(t, topUpBaseStake, staking.FPR[0].TotalStaked)
+	require.Zero(t, staking.FPR[0].TotalClaimed)
+
+	return blk
+}
+
+func topUpWhileClaimWindowShut(t *testing.T, c *Controller, blk *block.Block, epoch uint32) {
+	t.Helper()
+
+	blk.Header.Epoch = epoch
+	runStakingContractTx(t, c, blk, &transaction.FreezeContract{
+		AssetID: FPRIdentifier,
+		Amount:  topUpIncrement,
+	}, transaction.TXContract_FreezeContractType, OwnerAddress, nil)
+
+	c.CheckBalance(OwnerAddress, kdautils.KLVIdentifier, topUpInitialKLV)
+	require.Zero(t, c.GetStakingKDA(FPRIdentifier).FPR[0].TotalClaimed)
+}
+
+func topUpBucket(t *testing.T, c *Controller) *kapps.UserBucket {
+	t.Helper()
+
+	ownerAcc := loadUserAccount(c.accCacher, OwnerAddress)
+	userKDA, err := ownerAcc.GetUserKDA(FPRIdentifier, nil, true)
+	require.NoError(t, err)
+
+	return userKDA.Buckets[string(FPRIdentifier)]
+}
+
+func claimTopUpReward(t *testing.T, c *Controller, blk *block.Block, expectedErr error) {
+	t.Helper()
+
+	blk.Header.Epoch = topUpMatureEpoch
+	runStakingContractTx(t, c, blk, &transaction.ClaimContract{
+		ClaimType: transaction.ClaimContract_StakingClaim,
+		ID:        FPRIdentifier,
+	}, transaction.TXContract_ClaimContractType, OwnerAddress, expectedErr)
+}
+
+func expireTopUpPool(t *testing.T, c *Controller, blk *block.Block) {
+	t.Helper()
+
+	blk.Header.Epoch = topUpExpiryEpoch
+	runStakingContractTx(t, c, blk, &transaction.DepositContract{
+		DepositType: transaction.DepositContract_FPRDeposit,
+		ID:          FPRIdentifier,
+		CurrencyID:  kdautils.KLVIdentifier,
+		Amount:      topUpExpiryDeposit,
+	}, transaction.TXContract_DepositContractType, RefAddress, nil)
+}
+
+func TestStakingTxProcessor_KDA_FPRClaim_TopUpBeforeMaturity_RawTx_PreFix(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV5: math.MaxUint32})
+
+	blk := stakeFPRAndDepositReward(t, c)
+	topUpWhileClaimWindowShut(t, c, blk, topUpRewardEpoch)
+
+	bucket := topUpBucket(t, c)
+	require.Equal(t, topUpRewardEpoch, bucket.StakedEpoch)
+	require.Equal(t, topUpBaseStake+topUpIncrement, bucket.Value)
+	require.Empty(t, bucket.History)
+
+	claimTopUpReward(t, c, blk, state.ErrClaimNotAvailable)
+	c.CheckBalance(OwnerAddress, kdautils.KLVIdentifier, topUpInitialKLV)
+	assert.Zero(t, c.GetStakingKDA(FPRIdentifier).FPR[0].TotalClaimed)
+
+	expireTopUpPool(t, c, blk)
+	c.CheckBalance(RefAddress, kdautils.KLVIdentifier, topUpInitialKLV-topUpExpiryDeposit)
+}
+
+func TestStakingTxProcessor_KDA_FPRClaim_TopUpBeforeMaturity_RawTx_PostFix(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV5: 0})
+
+	blk := stakeFPRAndDepositReward(t, c)
+	topUpWhileClaimWindowShut(t, c, blk, topUpRewardEpoch)
+
+	bucket := topUpBucket(t, c)
+	require.Equal(t, topUpRewardEpoch, bucket.StakedEpoch)
+	require.Equal(t, topUpBaseStake+topUpIncrement, bucket.Value)
+	require.Len(t, bucket.History, 1)
+	require.Equal(t, topUpStakeEpoch, bucket.History[0].StakedEpoch)
+	require.Equal(t, topUpBaseStake, bucket.History[0].Value)
+
+	claimTopUpReward(t, c, blk, nil)
+	c.CheckBalance(OwnerAddress, kdautils.KLVIdentifier, topUpInitialKLV+topUpRewardPool)
+	assert.Equal(t, topUpRewardPool, c.GetStakingKDA(FPRIdentifier).FPR[0].TotalClaimed)
+
+	expireTopUpPool(t, c, blk)
+	c.CheckBalance(RefAddress, kdautils.KLVIdentifier,
+		topUpInitialKLV-topUpRewardPool-topUpExpiryDeposit)
+}
+
+func TestStakingTxProcessor_KDA_FPRClaim_RepeatedTopUpsKeepClaimWindow_PostFix(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV5: 0})
+
+	blk := stakeFPRAndDepositReward(t, c)
+
+	for epoch := topUpRewardEpoch; epoch < topUpMatureEpoch; epoch++ {
+		topUpWhileClaimWindowShut(t, c, blk, epoch)
+	}
+
+	bucket := topUpBucket(t, c)
+	require.Len(t, bucket.History, int(topUpMatureEpoch-topUpRewardEpoch))
+	require.Equal(t, topUpStakeEpoch, bucket.History[0].StakedEpoch)
+	require.Equal(t, topUpBaseStake, bucket.History[0].Value)
+
+	claimTopUpReward(t, c, blk, nil)
+	c.CheckBalance(OwnerAddress, kdautils.KLVIdentifier, topUpInitialKLV+topUpRewardPool)
+	assert.Equal(t, topUpRewardPool, c.GetStakingKDA(FPRIdentifier).FPR[0].TotalClaimed)
+}
+
+// The fixtures above have a single staker, who takes the whole pool whichever stake the claim is
+// priced at -- so they pin that the reward is no longer forfeited, but they cannot tell correct
+// historical pricing from pricing at the current stake. This one splits the pool between two
+// stakers and then doubles one of them after the pool is fixed. Pricing at the current stake pays
+// the owner the entire 500_000 and leaves the rival nothing.
+func TestStakingTxProcessor_KDA_FPRClaim_TopUpDoesNotDiluteRival_PostFix(t *testing.T) {
+	rivalAddress := []byte("klv1d05ju9jaj6u99zph0ant9jh7gksj")
+
+	// Doubling a 1_000_000 stake in a 2_000_000 pool: the owner's share has to stay half.
+	topUpDoubleStake := int64(1_000_000)
+	topUpSplitShare := int64(250_000)
+
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV5: 0})
+
+	c.AddUser(OwnerAddress, topUpInitialKLV, kdautils.KLVIdentifier)
+	c.AddUser(OwnerAddress, topUpInitialFPR, FPRIdentifier)
+	c.AddUser(rivalAddress, topUpInitialKLV, kdautils.KLVIdentifier)
+	c.AddUser(rivalAddress, topUpInitialFPR, FPRIdentifier)
+	c.AddUser(RefAddress, topUpInitialKLV, kdautils.KLVIdentifier)
+
+	blk := c.CreateBlockHeader(0, topUpStakeEpoch, 1)
+	updateFPRStakingConfig(t, c, blk, topUpClaimWindow, 1, 0)
+
+	stakers := [][]byte{OwnerAddress, rivalAddress}
+	for _, staker := range stakers {
+		runStakingContractTx(t, c, blk, &transaction.FreezeContract{
+			AssetID: FPRIdentifier,
+			Amount:  topUpBaseStake,
+		}, transaction.TXContract_FreezeContractType, staker, nil)
+	}
+
+	blk.Header.Epoch = topUpStakeEpoch + 1
+	runStakingContractTx(t, c, blk, &transaction.DepositContract{
+		DepositType: transaction.DepositContract_FPRDeposit,
+		ID:          FPRIdentifier,
+		CurrencyID:  kdautils.KLVIdentifier,
+		Amount:      topUpRewardPool,
+	}, transaction.TXContract_DepositContractType, RefAddress, nil)
+
+	staking := c.GetStakingKDA(FPRIdentifier)
+	require.Len(t, staking.FPR, 1)
+	require.Equal(t, topUpRewardEpoch, staking.FPR[0].Epoch)
+	require.Equal(t, topUpBaseStake*2, staking.FPR[0].TotalStaked)
+
+	blk.Header.Epoch = topUpRewardEpoch
+	runStakingContractTx(t, c, blk, &transaction.FreezeContract{
+		AssetID: FPRIdentifier,
+		Amount:  topUpDoubleStake,
+	}, transaction.TXContract_FreezeContractType, OwnerAddress, nil)
+
+	bucket := topUpBucket(t, c)
+	require.Equal(t, topUpBaseStake+topUpDoubleStake, bucket.Value)
+	require.Len(t, bucket.History, 1)
+	require.Equal(t, topUpStakeEpoch, bucket.History[0].StakedEpoch)
+	require.Equal(t, topUpBaseStake, bucket.History[0].Value)
+
+	blk.Header.Epoch = topUpMatureEpoch
+
+	// Assert the owner's share before the rival claims. Pricing at the current stake pays the
+	// owner the whole pool here, and the theft then surfaces on the rival as "claim not
+	// available" -- an error that says nothing about why. Checking the payout first names it.
+	runStakingContractTx(t, c, blk, &transaction.ClaimContract{
+		ClaimType: transaction.ClaimContract_StakingClaim,
+		ID:        FPRIdentifier,
+	}, transaction.TXContract_ClaimContractType, OwnerAddress, nil)
+	c.CheckBalance(OwnerAddress, kdautils.KLVIdentifier, topUpInitialKLV+topUpSplitShare)
+
+	runStakingContractTx(t, c, blk, &transaction.ClaimContract{
+		ClaimType: transaction.ClaimContract_StakingClaim,
+		ID:        FPRIdentifier,
+	}, transaction.TXContract_ClaimContractType, rivalAddress, nil)
+	c.CheckBalance(rivalAddress, kdautils.KLVIdentifier, topUpInitialKLV+topUpSplitShare)
+
+	assert.Equal(t, topUpRewardPool, c.GetStakingKDA(FPRIdentifier).FPR[0].TotalClaimed)
+}
+
+// Two gaps the single-currency rival test cannot see:
+//
+//   - historical pricing must apply to fpr.KDAS reward currencies too, not just the KLV
+//     TotalAmount. Swapping stakedValue for bucket.Value in the KDAS loop leaves every KLV
+//     assertion green while other currencies overpay after a top-up.
+//   - retained history must not pay twice. The owner claims, waits out the cooldown and claims
+//     again BEFORE the rival does, so the pool still holds the rival's half and the remaining-
+//     pool cap cannot mask a replay.
+func TestStakingTxProcessor_KDA_FPRClaim_TopUpMultiCurrencyAndNoReplay_PostFix(t *testing.T) {
+	rivalAddress := []byte("klv1d05ju9jaj6u99zph0ant9jh7gksk")
+
+	topUpDoubleStake := int64(1_000_000)
+	topUpSplitShare := int64(250_000)
+	replayEpoch := topUpMatureEpoch + topUpClaimWindow // next opening after the first claim
+
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV5: 0})
+
+	c.AddUser(OwnerAddress, topUpInitialKLV, kdautils.KLVIdentifier)
+	c.AddUser(OwnerAddress, topUpInitialFPR, FPRIdentifier)
+	c.AddUser(rivalAddress, topUpInitialKLV, kdautils.KLVIdentifier)
+	c.AddUser(rivalAddress, topUpInitialFPR, FPRIdentifier)
+	c.AddUser(RefAddress, topUpInitialKLV, kdautils.KLVIdentifier)
+	c.AddUser(RefAddress, topUpInitialKLV, kdautils.KFIIdentifier)
+
+	blk := c.CreateBlockHeader(0, topUpStakeEpoch, 1)
+	updateFPRStakingConfig(t, c, blk, topUpClaimWindow, 1, 0)
+
+	stakers := [][]byte{OwnerAddress, rivalAddress}
+	for _, staker := range stakers {
+		runStakingContractTx(t, c, blk, &transaction.FreezeContract{
+			AssetID: FPRIdentifier, Amount: topUpBaseStake,
+		}, transaction.TXContract_FreezeContractType, staker, nil)
+	}
+
+	// one pool, two reward currencies
+	blk.Header.Epoch = topUpStakeEpoch + 1
+	for _, currency := range [][]byte{kdautils.KLVIdentifier, kdautils.KFIIdentifier} {
+		runStakingContractTx(t, c, blk, &transaction.DepositContract{
+			DepositType: transaction.DepositContract_FPRDeposit, ID: FPRIdentifier,
+			CurrencyID: currency, Amount: topUpRewardPool,
+		}, transaction.TXContract_DepositContractType, RefAddress, nil)
+	}
+
+	staking := c.GetStakingKDA(FPRIdentifier)
+	require.Len(t, staking.FPR, 1)
+	require.Equal(t, topUpRewardEpoch, staking.FPR[0].Epoch)
+	require.Equal(t, topUpBaseStake*2, staking.FPR[0].TotalStaked)
+	require.Contains(t, staking.FPR[0].KDAS, string(kdautils.KFIIdentifier))
+
+	// owner doubles their stake after the pool is fixed, with the claim window shut
+	blk.Header.Epoch = topUpRewardEpoch
+	runStakingContractTx(t, c, blk, &transaction.FreezeContract{
+		AssetID: FPRIdentifier, Amount: topUpDoubleStake,
+	}, transaction.TXContract_FreezeContractType, OwnerAddress, nil)
+	require.Len(t, topUpBucket(t, c).History, 1)
+
+	// the owner's share must be half in BOTH currencies, priced at the pre-top-up stake
+	blk.Header.Epoch = topUpMatureEpoch
+	runStakingContractTx(t, c, blk, &transaction.ClaimContract{
+		ClaimType: transaction.ClaimContract_StakingClaim, ID: FPRIdentifier,
+	}, transaction.TXContract_ClaimContractType, OwnerAddress, nil)
+	c.CheckBalance(OwnerAddress, kdautils.KLVIdentifier, topUpInitialKLV+topUpSplitShare)
+	c.CheckBalance(OwnerAddress, kdautils.KFIIdentifier, topUpSplitShare)
+
+	// claiming again must pay nothing while the rival's half is still in the pool
+	blk.Header.Epoch = replayEpoch
+	runStakingContractTx(t, c, blk, &transaction.ClaimContract{
+		ClaimType: transaction.ClaimContract_StakingClaim, ID: FPRIdentifier,
+	}, transaction.TXContract_ClaimContractType, OwnerAddress, state.ErrClaimNotAvailable)
+	c.CheckBalance(OwnerAddress, kdautils.KLVIdentifier, topUpInitialKLV+topUpSplitShare)
+	c.CheckBalance(OwnerAddress, kdautils.KFIIdentifier, topUpSplitShare)
+
+	// and the rival still receives their full half of each currency
+	runStakingContractTx(t, c, blk, &transaction.ClaimContract{
+		ClaimType: transaction.ClaimContract_StakingClaim, ID: FPRIdentifier,
+	}, transaction.TXContract_ClaimContractType, rivalAddress, nil)
+	c.CheckBalance(rivalAddress, kdautils.KLVIdentifier, topUpInitialKLV+topUpSplitShare)
+	c.CheckBalance(rivalAddress, kdautils.KFIIdentifier, topUpSplitShare)
+
+	staking = c.GetStakingKDA(FPRIdentifier)
+	require.Equal(t, topUpRewardPool, staking.FPR[0].TotalClaimed)
+	require.Equal(t, topUpRewardPool, staking.FPR[0].KDAS[string(kdautils.KFIIdentifier)].TotalClaimed)
+}
+
+// The spec-level tests drive the pre-claim themselves, so they cannot see it being removed
+// from the real freeze path. This exercises accounts.Freeze's own ClaimBalance call across the
+// full lifecycle: a top-up while the window is shut creates history, a later top-up once the
+// window opens is paid out immediately BY THE FREEZE, the cursor moves, and the history the
+// payout covered is retired rather than left behind.
+func TestStakingTxProcessor_KDA_FPRClaim_FreezePreClaimLifecycle_PostFix(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV5: 0})
+
+	blk := stakeFPRAndDepositReward(t, c)
+
+	// window shut at the reward epoch: the top-up cannot be paid, so it must be recorded
+	topUpWhileClaimWindowShut(t, c, blk, topUpRewardEpoch)
+	bucket := topUpBucket(t, c)
+	require.Len(t, bucket.History, 1)
+	require.Equal(t, topUpStakeEpoch, bucket.History[0].StakedEpoch)
+	require.Equal(t, topUpRewardEpoch, bucket.History[0].ThroughEpoch)
+	require.Equal(t, topUpBaseStake, bucket.History[0].Value)
+	c.CheckBalance(OwnerAddress, kdautils.KLVIdentifier, topUpInitialKLV)
+
+	// window open: the freeze's own pre-claim must pay the recorded interval before rewriting
+	// the bucket, and must do it at the historical stake
+	blk.Header.Epoch = topUpMatureEpoch
+	runStakingContractTx(t, c, blk, &transaction.FreezeContract{
+		AssetID: FPRIdentifier, Amount: topUpIncrement,
+	}, transaction.TXContract_FreezeContractType, OwnerAddress, nil)
+
+	c.CheckBalance(OwnerAddress, kdautils.KLVIdentifier, topUpInitialKLV+topUpRewardPool)
+	require.Equal(t, topUpRewardPool, c.GetStakingKDA(FPRIdentifier).FPR[0].TotalClaimed)
+
+	// the cursor moved, so the interval it covered is retired rather than carried forward
+	after := topUpBucket(t, c)
+	require.Empty(t, after.History, "the paid interval must not survive the freeze that paid it")
+	require.Equal(t, topUpMatureEpoch, after.StakedEpoch)
+
+	// nothing left to claim, and the cooldown restarted from the freeze
+	blk.Header.Epoch = topUpMatureEpoch + 1
+	runStakingContractTx(t, c, blk, &transaction.ClaimContract{
+		ClaimType: transaction.ClaimContract_StakingClaim, ID: FPRIdentifier,
+	}, transaction.TXContract_ClaimContractType, OwnerAddress, state.ErrClaimNotAvailable)
+	c.CheckBalance(OwnerAddress, kdautils.KLVIdentifier, topUpInitialKLV+topUpRewardPool)
+}
+
 func TestStakingTxProcessor_KDA_FPRClaim_MultipleFreezes(t *testing.T) {
 	toAddress1 := []byte("klv1d05ju9jaj6u99zph0ant9jh7gksh")
 	toAddress2 := []byte("klv1d05ju9jaj6u99zph0ant9jh7gksi")

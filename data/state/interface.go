@@ -21,6 +21,14 @@ const (
 	PeerAccountsState AccountsDbIdentifier = 2
 )
 
+// FreezeOptions carries the block context and the fork-gated switches Freeze applies
+type FreezeOptions struct {
+	BlockEpoch       uint32
+	BlockTime        int64
+	NewStakingFlow   bool
+	KeepStakeHistory bool
+}
+
 // UserAccountHandler models a user account, which can journalize account's data with some extra features
 // like balance, developer rewards, owner
 type UserAccountHandler interface {
@@ -50,7 +58,7 @@ type UserAccountHandler interface {
 	GetAllowance() int64
 	GetFrozenBalance(assetID []byte, cdd bool) int64
 	GetBuckets(assetID []byte, cdd bool) map[string]*kapps.UserBucket
-	Freeze(assetID, bucketID []byte, value int64, blockEpoch uint32, blockTime int64, staking *kapps.StakingData, userKDA *kapps.UserKDA, newStakingFlow bool) error
+	Freeze(assetID, bucketID []byte, value int64, staking *kapps.StakingData, userKDA *kapps.UserKDA, opts FreezeOptions) error
 	Unfreeze(assetID, bucketID []byte, blockEpoch uint32, staking *kapps.StakingData, userKDA *kapps.UserKDA, newStakingFlow bool) ([]byte, int64, error)
 	Delegate(bucketID, delegation []byte, userKDA *kapps.UserKDA) (int64, error)
 	Undelegate(bucketID []byte, userKDA *kapps.UserKDA) ([]byte, int64, error)

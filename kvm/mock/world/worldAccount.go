@@ -206,7 +206,7 @@ func (a *Account) GetBuckets(assetID []byte, _ bool) map[string]*kapps.UserBucke
 	panic("implement me")
 }
 
-func (a *Account) Freeze(assetID, bucketID []byte, value int64, blockEpoch uint32, blockTime int64, staking *kapps.StakingData, userKDA *kapps.UserKDA, newStakingFlow bool) error {
+func (a *Account) Freeze(assetID, bucketID []byte, value int64, staking *kapps.StakingData, userKDA *kapps.UserKDA, opts state.FreezeOptions) error {
 	panic("implement me")
 }
 

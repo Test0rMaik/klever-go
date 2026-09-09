@@ -36,7 +36,7 @@ type UserAccountHandlerStub struct {
 	GetAllowanceCalled            func() int64
 	GetFrozenBalanceCalled        func(assetID []byte, cdd bool) int64
 	GetBucketsCalled              func(assetID []byte, cdd bool) map[string]*kapps.UserBucket
-	FreezeCalled                  func(assetID, bucketID []byte, value int64, blockEpoch uint32, blockTime int64, staking *kapps.StakingData, userKDA *kapps.UserKDA, newStakingFlow bool) error
+	FreezeCalled                  func(assetID, bucketID []byte, value int64, staking *kapps.StakingData, userKDA *kapps.UserKDA, opts state.FreezeOptions) error
 	UnfreezeCalled                func(assetID, bucketID []byte, blockEpoch uint32, staking *kapps.StakingData, userKDA *kapps.UserKDA, newStakingFlow bool) ([]byte, int64, error)
 	DelegateCalled                func(bucketID, delegation []byte, userKDA *kapps.UserKDA) (int64, error)
 	UndelegateCalled              func(bucketID []byte, userKDA *kapps.UserKDA) ([]byte, int64, error)
@@ -234,9 +234,9 @@ func (u *UserAccountHandlerStub) GetBuckets(assetID []byte, cdd bool) map[string
 	return nil
 }
 
-func (u *UserAccountHandlerStub) Freeze(assetID, bucketID []byte, value int64, blockEpoch uint32, blockTime int64, staking *kapps.StakingData, userKDA *kapps.UserKDA, newStakingFlow bool) error {
+func (u *UserAccountHandlerStub) Freeze(assetID, bucketID []byte, value int64, staking *kapps.StakingData, userKDA *kapps.UserKDA, opts state.FreezeOptions) error {
 	if u.FreezeCalled != nil {
-		return u.FreezeCalled(assetID, bucketID, value, blockEpoch, blockTime, staking, userKDA, newStakingFlow)
+		return u.FreezeCalled(assetID, bucketID, value, staking, userKDA, opts)
 	}
 	return nil
 }

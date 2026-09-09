@@ -87,7 +87,7 @@ func TestUserAccount_Freeze(t *testing.T) {
 	userBuckets := account.GetBuckets(kdautils.KLVIdentifier, true)
 	assert.Len(t, userBuckets, 0)
 
-	err := account.Freeze(kdautils.KLVIdentifier, bucketID, 100, 1, 1000, staking, userKDA, true)
+	err := account.Freeze(kdautils.KLVIdentifier, bucketID, 100, staking, userKDA, state.FreezeOptions{BlockEpoch: 1, BlockTime: 1000, NewStakingFlow: true})
 	assert.NoError(t, err)
 	assert.Equal(t, int64(100), userKDA.FrozenBalance)
 	assert.Equal(t, int64(100), staking.TotalStaked)
@@ -1239,7 +1239,7 @@ func TestUserAccount_GetFrozenBalance(t *testing.T) {
 		userKDA, _ := account.GetUserKDA(kdautils.KLVIdentifier, nil, true)
 		staking := &kapps.StakingData{}
 
-		err := account.Freeze(kdautils.KLVIdentifier, []byte("b1"), 500, 1, 1000, staking, userKDA, true)
+		err := account.Freeze(kdautils.KLVIdentifier, []byte("b1"), 500, staking, userKDA, state.FreezeOptions{BlockEpoch: 1, BlockTime: 1000, NewStakingFlow: true})
 		assert.NoError(t, err)
 		err = account.SetUserKDA(kdautils.KLVIdentifier, nil, userKDA)
 		assert.NoError(t, err)
@@ -1335,10 +1335,10 @@ func TestUserAccount_Freeze_InvalidValue(t *testing.T) {
 	userKDA := &kapps.UserKDA{Buckets: make(map[string]*kapps.UserBucket)}
 	staking := &kapps.StakingData{}
 
-	err := account.Freeze(kdautils.KLVIdentifier, []byte("b1"), 0, 1, 1000, staking, userKDA, true)
+	err := account.Freeze(kdautils.KLVIdentifier, []byte("b1"), 0, staking, userKDA, state.FreezeOptions{BlockEpoch: 1, BlockTime: 1000, NewStakingFlow: true})
 	assert.Equal(t, state.ErrInvalidValue, err)
 
-	err = account.Freeze(kdautils.KLVIdentifier, []byte("b1"), -1, 1, 1000, staking, userKDA, true)
+	err = account.Freeze(kdautils.KLVIdentifier, []byte("b1"), -1, staking, userKDA, state.FreezeOptions{BlockEpoch: 1, BlockTime: 1000, NewStakingFlow: true})
 	assert.Equal(t, state.ErrInvalidValue, err)
 }
 
@@ -1348,7 +1348,7 @@ func TestUserAccount_Freeze_NilBucketsCreatesMap(t *testing.T) {
 	staking := &kapps.StakingData{}
 	assert.Nil(t, userKDA.Buckets)
 
-	err := account.Freeze(kdautils.KLVIdentifier, []byte("b1"), 100, 1, 1000, staking, userKDA, true)
+	err := account.Freeze(kdautils.KLVIdentifier, []byte("b1"), 100, staking, userKDA, state.FreezeOptions{BlockEpoch: 1, BlockTime: 1000, NewStakingFlow: true})
 	assert.NoError(t, err)
 	assert.NotNil(t, userKDA.Buckets)
 	assert.Equal(t, int64(100), userKDA.FrozenBalance)
@@ -1360,7 +1360,7 @@ func TestUserAccount_Freeze_NonKLVAssetUseStringBucketID(t *testing.T) {
 	userKDA := &kapps.UserKDA{Buckets: make(map[string]*kapps.UserBucket)}
 	staking := &kapps.StakingData{}
 
-	err := account.Freeze(assetID, []byte("b1"), 100, 1, 1000, staking, userKDA, true)
+	err := account.Freeze(assetID, []byte("b1"), 100, staking, userKDA, state.FreezeOptions{BlockEpoch: 1, BlockTime: 1000, NewStakingFlow: true})
 	assert.NoError(t, err)
 	// Non-KLV/KFI assets use string(assetID) as bucket key instead of hex-encoded bucketID
 	assert.NotNil(t, userKDA.Buckets[string(assetID)])
@@ -1384,7 +1384,7 @@ func TestUserAccount_Freeze_ExistingBucketAccumulatesValue(t *testing.T) {
 		}
 		staking := &kapps.StakingData{}
 
-		err := account.Freeze(kdautils.KLVIdentifier, bucketID, 100, 2, 2000, staking, userKDA, true)
+		err := account.Freeze(kdautils.KLVIdentifier, bucketID, 100, staking, userKDA, state.FreezeOptions{BlockEpoch: 2, BlockTime: 2000, NewStakingFlow: true})
 		assert.NoError(t, err)
 		assert.Equal(t, int64(150), userKDA.Buckets[encodedBucketID].Value)
 		// toAdd = value(100) + oldValue(50) = 150
@@ -1405,12 +1405,239 @@ func TestUserAccount_Freeze_ExistingBucketAccumulatesValue(t *testing.T) {
 		}
 		staking := &kapps.StakingData{}
 
-		err := account.Freeze(kdautils.KLVIdentifier, bucketID, 100, 2, 2000, staking, userKDA, false)
+		err := account.Freeze(kdautils.KLVIdentifier, bucketID, 100, staking, userKDA, state.FreezeOptions{BlockEpoch: 2, BlockTime: 2000})
 		assert.NoError(t, err)
 		assert.Equal(t, int64(150), userKDA.Buckets[encodedBucketID].Value)
 		// toAdd = value(100) only (no accumulation since newStakingFlow is false)
 		assert.Equal(t, int64(100), userKDA.FrozenBalance)
 		assert.Equal(t, int64(100), staking.TotalStaked)
+	})
+}
+
+func TestUserAccount_Freeze_StakeHistory(t *testing.T) {
+	assetID := []byte("FPR")
+	encodedBucketID := string(assetID)
+
+	activeBucket := func(value int64, stakedEpoch uint32, history []*kapps.StakeSegment) *kapps.UserKDA {
+		return &kapps.UserKDA{
+			LastClaim: &kapps.LastClaim{Epoch: 1},
+			Buckets: map[string]*kapps.UserBucket{
+				encodedBucketID: {
+					Value:         value,
+					StakedEpoch:   stakedEpoch,
+					UnstakedEpoch: core.DefaultUnstakedEpoch,
+					History:       history,
+				},
+			},
+		}
+	}
+
+	t.Run("top up records the stake it replaced", func(t *testing.T) {
+		account, _ := state.NewUserAccount([]byte("address"))
+		userKDA := activeBucket(100, 1, nil)
+
+		err := account.Freeze(assetID, nil, 50, &kapps.StakingData{}, userKDA, state.FreezeOptions{BlockEpoch: 3, BlockTime: 3000, NewStakingFlow: true, KeepStakeHistory: true})
+		assert.NoError(t, err)
+
+		bucket := userKDA.Buckets[encodedBucketID]
+		assert.Equal(t, int64(150), bucket.Value)
+		assert.Equal(t, uint32(3), bucket.StakedEpoch)
+		if !assert.Len(t, bucket.History, 1) {
+			return
+		}
+		assert.Equal(t, uint32(1), bucket.History[0].StakedEpoch)
+		assert.Equal(t, int64(100), bucket.History[0].Value)
+	})
+
+	t.Run("top up records nothing while the fork is disabled", func(t *testing.T) {
+		account, _ := state.NewUserAccount([]byte("address"))
+		userKDA := activeBucket(100, 1, nil)
+
+		err := account.Freeze(assetID, nil, 50, &kapps.StakingData{}, userKDA, state.FreezeOptions{BlockEpoch: 3, BlockTime: 3000, NewStakingFlow: true})
+		assert.NoError(t, err)
+		assert.Empty(t, userKDA.Buckets[encodedBucketID].History)
+	})
+
+	t.Run("re-freezing an unstaked bucket keeps what it earned and closes at the unfreeze", func(t *testing.T) {
+		account, _ := state.NewUserAccount([]byte("address"))
+		userKDA := activeBucket(100, 1, nil)
+		userKDA.Buckets[encodedBucketID].UnstakedEpoch = 5
+
+		err := account.Freeze(assetID, nil, 50, &kapps.StakingData{}, userKDA, state.FreezeOptions{BlockEpoch: 8, BlockTime: 8000, NewStakingFlow: true, KeepStakeHistory: true})
+		assert.NoError(t, err)
+
+		bucket := userKDA.Buckets[encodedBucketID]
+		if !assert.Len(t, bucket.History, 1) {
+			return
+		}
+
+		// The 100 staked from epoch 1 still prices the epochs it earned, and the interval closes
+		// at the unfreeze -- epoch 5 earns its pool, epochs 6 to 8 match no segment at all.
+		// Dropping this would forfeit exactly the rewards this change preserves.
+		assert.Equal(t, uint32(1), bucket.History[0].StakedEpoch)
+		assert.Equal(t, uint32(5), bucket.History[0].ThroughEpoch)
+		assert.Equal(t, int64(100), bucket.History[0].Value)
+	})
+
+	t.Run("a same-epoch unfreeze and re-freeze records no dead segment", func(t *testing.T) {
+		account, _ := state.NewUserAccount([]byte("address"))
+		userKDA := activeBucket(100, 1, nil)
+		userKDA.Buckets[encodedBucketID].UnstakedEpoch = 3
+
+		// Unfreezing and re-freezing inside epoch 3 would leave a zero segment covering (3, 3],
+		// the same empty interval the same-epoch top-up guard below exists to avoid. The 100
+		// staked from epoch 1 still has to survive: without the zero segment its coverage runs to
+		// the new StakedEpoch, which is the unfreeze epoch -- and the unfreeze epoch still earns
+		// its pool, so that is the correct upper bound.
+		err := account.Freeze(assetID, nil, 50, &kapps.StakingData{}, userKDA, state.FreezeOptions{BlockEpoch: 3, BlockTime: 3000, NewStakingFlow: true, KeepStakeHistory: true})
+		assert.NoError(t, err)
+
+		history := userKDA.Buckets[encodedBucketID].History
+		if !assert.Len(t, history, 1) {
+			return
+		}
+		assert.Equal(t, uint32(1), history[0].StakedEpoch)
+		assert.Equal(t, int64(100), history[0].Value)
+	})
+
+	t.Run("repeated same-epoch unfreeze and re-freeze cycles do not grow the history", func(t *testing.T) {
+		account, _ := state.NewUserAccount([]byte("address"))
+		userKDA := activeBucket(100, 1, nil)
+
+		// MinEpochsToUnstake is issuer-controlled and may be zero, so a bucket can be unfrozen and
+		// re-frozen repeatedly inside one epoch. Every pass after the first rewrites a bucket
+		// already staked at that epoch, so neither branch has anything left to record.
+		for i := 0; i < 50; i++ {
+			userKDA.Buckets[encodedBucketID].UnstakedEpoch = 3
+
+			err := account.Freeze(assetID, nil, 1, &kapps.StakingData{}, userKDA, state.FreezeOptions{BlockEpoch: 3, BlockTime: 3000, NewStakingFlow: true, KeepStakeHistory: true})
+			assert.NoError(t, err)
+		}
+
+		assert.Len(t, userKDA.Buckets[encodedBucketID].History, 1)
+	})
+
+	t.Run("a same-epoch top up records no dead segment", func(t *testing.T) {
+		account, _ := state.NewUserAccount([]byte("address"))
+		userKDA := activeBucket(100, 3, nil)
+
+		// bucket.StakedEpoch equals the block epoch, so a segment here would cover (3, 3] -- an
+		// interval bucketStakeAt can never satisfy. It would be dead weight in a persisted trie
+		// leaf, re-marshalled on every later touch of the account.
+		err := account.Freeze(assetID, nil, 50, &kapps.StakingData{}, userKDA, state.FreezeOptions{BlockEpoch: 3, BlockTime: 3000, NewStakingFlow: true, KeepStakeHistory: true})
+		assert.NoError(t, err)
+		assert.Empty(t, userKDA.Buckets[encodedBucketID].History)
+	})
+
+	t.Run("repeated top ups in one epoch do not grow the history", func(t *testing.T) {
+		account, _ := state.NewUserAccount([]byte("address"))
+		userKDA := activeBucket(100, 3, nil)
+
+		for i := 0; i < 50; i++ {
+			err := account.Freeze(assetID, nil, 1, &kapps.StakingData{}, userKDA, state.FreezeOptions{BlockEpoch: 5, BlockTime: 5000, NewStakingFlow: true, KeepStakeHistory: true})
+			assert.NoError(t, err)
+		}
+
+		// Only the first freeze replaces a bucket staked in an earlier epoch. The other 49 rewrite
+		// a bucket already staked at epoch 5, so the list is bounded by distinct epochs rather
+		// than by the number of top-ups -- which an issuer controls through MinEpochsToClaim.
+		assert.Len(t, userKDA.Buckets[encodedBucketID].History, 1)
+	})
+
+	t.Run("segments already covered by a claim are dropped", func(t *testing.T) {
+		account, _ := state.NewUserAccount([]byte("address"))
+		userKDA := activeBucket(100, 6, []*kapps.StakeSegment{
+			{StakedEpoch: 1, ThroughEpoch: 4, Value: 40},
+			{StakedEpoch: 4, ThroughEpoch: 6, Value: 70},
+		})
+		userKDA.LastClaim.Epoch = 5
+
+		err := account.Freeze(assetID, nil, 50, &kapps.StakingData{}, userKDA, state.FreezeOptions{BlockEpoch: 7, BlockTime: 7000, NewStakingFlow: true, KeepStakeHistory: true})
+		assert.NoError(t, err)
+
+		// The (1,4] segment ends at or before the claim cursor, so it is retired; (4,6] straddles
+		// it and survives. Each decision reads that segment's own ThroughEpoch.
+		history := userKDA.Buckets[encodedBucketID].History
+		if !assert.Len(t, history, 2) {
+			return
+		}
+		assert.Equal(t, uint32(4), history[0].StakedEpoch)
+		assert.Equal(t, uint32(6), history[0].ThroughEpoch)
+		assert.Equal(t, uint32(6), history[1].StakedEpoch)
+		assert.Equal(t, uint32(7), history[1].ThroughEpoch)
+	})
+
+	t.Run("a segment ending exactly at the claim cursor is dropped", func(t *testing.T) {
+		account, _ := state.NewUserAccount([]byte("address"))
+		userKDA := activeBucket(100, 6, []*kapps.StakeSegment{
+			{StakedEpoch: 1, ThroughEpoch: 5, Value: 40},
+		})
+		userKDA.LastClaim.Epoch = 5
+
+		// (1,5] is fully paid once the cursor reaches 5, so retention is > and not >=.
+		err := account.Freeze(assetID, nil, 50, &kapps.StakingData{}, userKDA, state.FreezeOptions{BlockEpoch: 7, BlockTime: 7000, NewStakingFlow: true, KeepStakeHistory: true})
+		assert.NoError(t, err)
+
+		history := userKDA.Buckets[encodedBucketID].History
+		if !assert.Len(t, history, 1) {
+			return
+		}
+		assert.Equal(t, uint32(6), history[0].StakedEpoch)
+		assert.Equal(t, uint32(7), history[0].ThroughEpoch)
+	})
+
+	t.Run("top up records nothing when the claim already covers it", func(t *testing.T) {
+		account, _ := state.NewUserAccount([]byte("address"))
+		userKDA := activeBucket(100, 1, nil)
+		userKDA.LastClaim.Epoch = 9
+
+		err := account.Freeze(assetID, nil, 50, &kapps.StakingData{}, userKDA, state.FreezeOptions{BlockEpoch: 9, BlockTime: 9000, NewStakingFlow: true, KeepStakeHistory: true})
+		assert.NoError(t, err)
+		assert.Empty(t, userKDA.Buckets[encodedBucketID].History)
+	})
+
+	t.Run("top up without a recorded last claim keeps the segment", func(t *testing.T) {
+		account, _ := state.NewUserAccount([]byte("address"))
+		userKDA := activeBucket(100, 1, nil)
+		userKDA.LastClaim = nil
+
+		err := account.Freeze(assetID, nil, 50, &kapps.StakingData{}, userKDA, state.FreezeOptions{BlockEpoch: 3, BlockTime: 3000, NewStakingFlow: true, KeepStakeHistory: true})
+		assert.NoError(t, err)
+		if !assert.Len(t, userKDA.Buckets[encodedBucketID].History, 1) {
+			return
+		}
+		assert.Equal(t, uint32(1), userKDA.Buckets[encodedBucketID].History[0].StakedEpoch)
+	})
+
+	t.Run("reward epochs older than the whole history pay nothing", func(t *testing.T) {
+		account, _ := state.NewUserAccount([]byte("address"))
+		forkController := mock.NewForkControllerStub()
+
+		userKDA := activeBucket(150, 6, []*kapps.StakeSegment{
+			{StakedEpoch: 4, ThroughEpoch: 6, Value: 100},
+		})
+		userKDA.LastClaim.Epoch = 1
+
+		// Epoch 3 sits below the segment's start, so it must pay nothing. Epoch 5 sits inside
+		// (4,6] and must pay, which is what makes the first assertion mean something: without
+		// the positive control, dropping the lower-bound check entirely would still pass.
+		below := &kapps.StakingData{
+			InterestType:     kapps.StakingData_FPRI,
+			MinEpochsToClaim: 0,
+			FPR:              []*kapps.FPRData{{Epoch: 3, TotalAmount: 500, TotalStaked: 5000}},
+		}
+		gains, err := account.ComputeAvailableClaim(assetID, 8, 8000, userKDA, below, forkController)
+		assert.NoError(t, err)
+		assert.Zero(t, gains[string(kdautils.KLVIdentifier)])
+
+		inside := &kapps.StakingData{
+			InterestType:     kapps.StakingData_FPRI,
+			MinEpochsToClaim: 0,
+			FPR:              []*kapps.FPRData{{Epoch: 5, TotalAmount: 500, TotalStaked: 5000}},
+		}
+		gains, err = account.ComputeAvailableClaim(assetID, 8, 8000, userKDA, inside, forkController)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(10), gains[string(kdautils.KLVIdentifier)]) // 500/5000 * 100
 	})
 }
 
@@ -2434,7 +2661,7 @@ func TestUserAccount_Freeze_NewStakingFlowAccumulation(t *testing.T) {
 	staking := &kapps.StakingData{}
 
 	// Freeze with newStakingFlow=true and value=100
-	err := account.Freeze(kdautils.KLVIdentifier, bucketID, 100, 10, 5000, staking, userKDA, true)
+	err := account.Freeze(kdautils.KLVIdentifier, bucketID, 100, staking, userKDA, state.FreezeOptions{BlockEpoch: 10, BlockTime: 5000, NewStakingFlow: true})
 	assert.NoError(t, err)
 
 	// Verify: toAdd includes oldValue (50+100=150), bucket.Value = old+new (150), FrozenBalance += 150

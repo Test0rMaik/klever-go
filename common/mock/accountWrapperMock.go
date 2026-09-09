@@ -110,7 +110,7 @@ func (awm *AccountWrapMock) GetBuckets(assetID []byte, _ bool) map[string]*kapps
 }
 
 // Freeze -
-func (awm *AccountWrapMock) Freeze(assetID []byte, bucketID []byte, value int64, epoch uint32, lockTime int64, staking *kapps.StakingData, userKDA *kapps.UserKDA, _ bool) error {
+func (awm *AccountWrapMock) Freeze(assetID []byte, bucketID []byte, value int64, staking *kapps.StakingData, userKDA *kapps.UserKDA, _ state.FreezeOptions) error {
 	return nil
 }
 
