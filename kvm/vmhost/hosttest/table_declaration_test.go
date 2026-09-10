@@ -250,7 +250,7 @@ func TestGasUsed_TableGrow_FlatCostRegardlessOfSize(t *testing.T) {
 		defer host.Reset()
 
 		const gasProvided = uint64(2_000_000)
-		out := runTableGrowCall(t, host, function, gasProvided)
+		out := runContractCall(t, host, function, gasProvided)
 		require.Equal(t, vmcommon.Ok, out.ReturnCode, "%s should succeed", function)
 		return gasProvided - out.GasRemaining
 	}
@@ -290,7 +290,7 @@ func TestExecute_PreexistingOversizedTable_RejectedPostFork(t *testing.T) {
 		Build()
 	defer host.Reset()
 
-	growOutput := runTableGrowCall(t, host, "grow_five_million", 2_000_000)
+	growOutput := runContractCall(t, host, "grow_five_million", 2_000_000)
 	require.NotEqual(t, vmcommon.Ok, growOutput.ReturnCode)
 }
 
@@ -320,7 +320,7 @@ func TestExecute_PreexistingOversizedTable_PreFork(t *testing.T) {
 		Build()
 	defer host.Reset()
 
-	growOutput := runTableGrowCall(t, host, "grow_five_million", 2_000_000)
+	growOutput := runContractCall(t, host, "grow_five_million", 2_000_000)
 	require.Equal(t, vmcommon.Ok, growOutput.ReturnCode)
 }
 
@@ -425,12 +425,12 @@ func TestExecute_WarmInstanceIsRevalidatedPostFork(t *testing.T) {
 
 	// Epoch 0: pre-fork. Succeeds, and leaves the instance in the warm cache.
 	epochConfirmer.EpochConfirmed(0)
-	preForkOutput := runTableGrowCall(t, host, "main", 2_000_000)
+	preForkOutput := runContractCall(t, host, "main", 2_000_000)
 	require.Equal(t, vmcommon.Ok, preForkOutput.ReturnCode)
 
 	// Epoch 1: fork active. The same warm instance must now be rejected.
 	epochConfirmer.EpochConfirmed(1)
-	postForkOutput := runTableGrowCall(t, host, "main", 2_000_000)
+	postForkOutput := runContractCall(t, host, "main", 2_000_000)
 	require.NotEqual(t, vmcommon.Ok, postForkOutput.ReturnCode,
 		"warm instance bypassed the declared-table-size check after the fork activated")
 
@@ -441,7 +441,9 @@ func TestExecute_WarmInstanceIsRevalidatedPostFork(t *testing.T) {
 	// TestRuntimeContext_WarmAndColdRejectionsAreIdentical.
 }
 
-func runTableGrowCall(t *testing.T, host vmcommon.VMExecutionHandler, function string, gasProvided uint64) *vmcommon.VMOutput {
+// runContractCall invokes an exported endpoint on an already-built host and returns the
+// raw output, so callers can assert on failures as well as successes.
+func runContractCall(t *testing.T, host vmcommon.VMExecutionHandler, function string, gasProvided uint64) *vmcommon.VMOutput {
 	t.Helper()
 	input := test.CreateTestContractCallInputBuilder().
 		WithRecipientAddr(test.ParentAddress).

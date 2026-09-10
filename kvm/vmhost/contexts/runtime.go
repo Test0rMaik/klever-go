@@ -208,6 +208,26 @@ func (context *runtimeContext) startWasmerInstance(contract []byte, gasLimit uin
 	return context.makeInstanceFromContractByteCode(contract, gasLimit, newCode)
 }
 
+// compilationOptions builds the options both instantiation paths hand the executor.
+// They must stay identical: the same contract has to compile the same way whether it
+// comes from bytecode or from the compiled-code cache, or the two paths could meter
+// the same call differently.
+func (context *runtimeContext) compilationOptions(gasLimit uint64) executor.CompilationOptions {
+	gasSchedule := context.host.Metering().GasSchedule()
+
+	return executor.CompilationOptions{
+		GasLimit:                gasLimit,
+		UnmeteredLocals:         uint64(gasSchedule.WASMOpcodeCost.LocalsUnmetered),
+		MaxMemoryGrow:           uint64(gasSchedule.WASMOpcodeCost.MaxMemoryGrow),
+		MaxMemoryGrowDelta:      uint64(gasSchedule.WASMOpcodeCost.MaxMemoryGrowDelta),
+		MaxDeclaredTableSize:    context.effectiveMaxDeclaredTableSize(gasSchedule),
+		TableInitPerElementCost: context.effectiveTableInitPerElementCost(gasSchedule),
+		OpcodeTrace:             false,
+		Metering:                true,
+		RuntimeBreakpoints:      true,
+	}
+}
+
 func (context *runtimeContext) makeInstanceFromCompiledCode(gasLimit uint64, newCode bool) (bool, error) {
 	codeHash := context.iTracker.CodeHash()
 	if newCode || len(codeHash) == 0 {
@@ -221,17 +241,7 @@ func (context *runtimeContext) makeInstanceFromCompiledCode(gasLimit uint64, new
 		return false, nil
 	}
 
-	gasSchedule := context.host.Metering().GasSchedule()
-	options := executor.CompilationOptions{
-		GasLimit:             gasLimit,
-		UnmeteredLocals:      uint64(gasSchedule.WASMOpcodeCost.LocalsUnmetered),
-		MaxMemoryGrow:        uint64(gasSchedule.WASMOpcodeCost.MaxMemoryGrow),
-		MaxMemoryGrowDelta:   uint64(gasSchedule.WASMOpcodeCost.MaxMemoryGrowDelta),
-		MaxDeclaredTableSize: context.effectiveMaxDeclaredTableSize(gasSchedule),
-		OpcodeTrace:          false,
-		Metering:             true,
-		RuntimeBreakpoints:   true,
-	}
+	options := context.compilationOptions(gasLimit)
 	newInstance, err := context.vmExecutor.NewInstanceFromCompiledCodeWithOptions(compiledCode, options)
 	if err != nil {
 		logRuntime.Error("instance creation", "from", "cached compilation", "error", err)
@@ -277,6 +287,27 @@ func (context *runtimeContext) effectiveMaxDeclaredTableSize(gasSchedule *config
 	return uint64(gasSchedule.WASMOpcodeCost.MaxDeclaredTableSize)
 }
 
+// isTableInitPerElementChargeActive reports whether table.init is priced by the
+// number of elements it copies. This activates one fork later than the declared
+// table cap above: that cap already shipped with FixAuditChangesV4, while
+// repricing an opcode changes the gas of transactions that already executed, so
+// it cannot share an epoch that is already in the past.
+func (context *runtimeContext) isTableInitPerElementChargeActive() bool {
+	forkController := context.host.ForkController()
+	return !check.IfNil(forkController) && forkController.FixAuditChangesV5()
+}
+
+// effectiveTableInitPerElementCost returns the per-element table.init price to
+// hand the executor for this instantiation. 0 means "charge the flat opcode cost
+// only", which is exactly the pre-fork behaviour, so the executor stays
+// unconditional and fork-unaware just as it does for the table cap.
+func (context *runtimeContext) effectiveTableInitPerElementCost(gasSchedule *config.GasCost) uint64 {
+	if !context.isTableInitPerElementChargeActive() {
+		return 0
+	}
+	return uint64(gasSchedule.WASMOpcodeCost.TableInitPerElement)
+}
+
 // verifyTableDeclarationIfActive runs the declared-table-size check against the
 // currently active instance, when the fork gate is active. Callable on any
 // instance the runtime is about to execute, however it was obtained.
@@ -291,17 +322,7 @@ func (context *runtimeContext) verifyTableDeclarationIfActive() error {
 }
 
 func (context *runtimeContext) makeInstanceFromContractByteCode(contract []byte, gasLimit uint64, newCode bool) error {
-	gasSchedule := context.host.Metering().GasSchedule()
-	options := executor.CompilationOptions{
-		GasLimit:             gasLimit,
-		UnmeteredLocals:      uint64(gasSchedule.WASMOpcodeCost.LocalsUnmetered),
-		MaxMemoryGrow:        uint64(gasSchedule.WASMOpcodeCost.MaxMemoryGrow),
-		MaxMemoryGrowDelta:   uint64(gasSchedule.WASMOpcodeCost.MaxMemoryGrowDelta),
-		MaxDeclaredTableSize: context.effectiveMaxDeclaredTableSize(gasSchedule),
-		OpcodeTrace:          false,
-		Metering:             true,
-		RuntimeBreakpoints:   true,
-	}
+	options := context.compilationOptions(gasLimit)
 	newInstance, err := context.vmExecutor.NewInstanceWithOptions(contract, options)
 	if err != nil {
 		context.iTracker.UnsetInstance()

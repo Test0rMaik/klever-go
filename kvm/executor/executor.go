@@ -27,6 +27,14 @@ type CompilationOptions struct {
 	OpcodeTrace          bool
 	Metering             bool
 	RuntimeBreakpoints   bool
+	// TableInitPerElementCost is charged for every element a table.init copies,
+	// on top of the flat TableInit opcode cost. 0 disables the proportional
+	// charge and reproduces the pre-fork metering exactly.
+	//
+	// Declared last to match the Rust CompilationOptions: the C API casts the
+	// pointer instead of marshalling field by field, so the two field orders
+	// must stay in lockstep and new fields must only ever be appended.
+	TableInitPerElementCost uint64
 }
 
 // Executor defines the functionality needed to create any executor instance.
