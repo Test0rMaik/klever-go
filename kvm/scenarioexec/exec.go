@@ -34,11 +34,14 @@ type VMTestExecutor struct {
 	World              *worldhook.MockWorld
 	vm                 vmi.VMExecutionHandler
 	OverrideVMExecutor executor.ExecutorAbstractFactory
-	vmHost             vmhost.VMHost
-	checkGas           bool
-	scenarioTraceGas   []bool
-	fileResolver       scenfileresolver.FileResolver
-	exprReconstructor  scenexpressionreconstructor.ExprReconstructor
+	// EnableEpochs, when set, replaces the default schedule (every fork active from epoch 0)
+	// so a scenario can be run on the pre-fork path of a given activation
+	EnableEpochs      *config.EnableEpochs
+	vmHost            vmhost.VMHost
+	checkGas          bool
+	scenarioTraceGas  []bool
+	fileResolver      scenfileresolver.FileResolver
+	exprReconstructor scenexpressionreconstructor.ExprReconstructor
 }
 
 var _ scencontroller.TestExecutor = (*VMTestExecutor)(nil)
@@ -73,19 +76,11 @@ func (ae *VMTestExecutor) InitVM(scenGasSchedule scenjsonmodel.GasSchedule) erro
 
 	epochNotifier := &commonMock.EpochNotifierStub{}
 
-	forkController, _ := fork.NewForkController(config.EnableEpochs{
-		ClaimKFI:                0,
-		ProcessorFlowITOPrice:   0,
-		FixStakingBuckets:       0,
-		KdaFpr:                  0,
-		BigBucketsCompute:       0,
-		FPRComputeAndKdaFeeFlow: 0,
-		FixDelegationSameEpoch:  0,
-		SmartContracts:          0,
-		FixAuditChanges:         0,
-		EpochRewardsV2:          0,
-		FixAuditChangesV2:       0,
-	}, epochNotifier)
+	enableEpochs := config.EnableEpochs{}
+	if ae.EnableEpochs != nil {
+		enableEpochs = *ae.EnableEpochs
+	}
+	forkController, _ := fork.NewForkController(enableEpochs, epochNotifier)
 
 	err = ae.World.InitBuiltinFunctions(gasSchedule, forkController)
 	if err != nil {

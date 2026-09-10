@@ -139,3 +139,22 @@ func IfNil(checker nilInterfaceChecker) bool {
 type nilInterfaceChecker interface {
 	IsInterfaceNil() bool
 }
+
+// SliceIsOutOfBounds reports whether the slice [startingPosition, startingPosition+sliceLength)
+// falls outside a buffer of bufferLength bytes. Post-fork the end of the slice is computed
+// without int32 wrapping, so an overflowing request is rejected instead of reaching the slice
+// expression; pre-fork the legacy wrapping arithmetic is preserved byte for byte. It is the one
+// bounds check shared by the managed-buffer hooks and by managedTypesContext.SetByteSlice.
+func SliceIsOutOfBounds(fixAuditChangesV5 bool, startingPosition int32, sliceLength int32, bufferLength int) bool {
+	if startingPosition < 0 || sliceLength < 0 {
+		return true
+	}
+
+	if !fixAuditChangesV5 {
+		return int(startingPosition+sliceLength) > bufferLength
+	}
+
+	endPosition, err := math.AddInt32WithErr(startingPosition, sliceLength)
+
+	return err != nil || int(endPosition) > bufferLength
+}

@@ -189,6 +189,8 @@ type ManagedTypesContext interface {
 	ConsumeGasForThisBigIntNumberOfBytes(byteLen *big.Int) error
 	ConsumeGasForThisIntNumberOfBytes(byteLen int)
 	ConsumeGasForBytes(bytes []byte)
+	ConsumeGasForByteLenBounded(byteLen uint64) error
+	ConsumeGasForAppend(mBufferHandle int32, dataLength int32) error
 	ConsumeGasForBigIntCopy(values ...*big.Int)
 	ConsumeGasForBigFloatCopy(values ...*big.Float)
 	NewBigInt(value *big.Int) int32

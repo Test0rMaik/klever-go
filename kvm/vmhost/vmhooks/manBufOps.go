@@ -34,6 +34,92 @@ const (
 	mBufferFromBigFloatName       = "mBufferFromBigFloat"
 )
 
+// maxManagedBufferLength bounds the bytes a single managed-buffer hook will accept. It is the
+// same ceiling as maxTotalArgumentsBytes, the established limit in this package for a single
+// VM-hook-processed blob, so the two cannot drift apart.
+const maxManagedBufferLength = maxTotalArgumentsBytes
+
+// consumeGasForBuffersBounded charges bounded per-byte gas for the current length of each
+// handle, before the buffers are cloned. Pre-fork it charges nothing, so the legacy call sites
+// keep their own unbounded charging untouched.
+func consumeGasForBuffersBounded(host vmhost.VMHost, mBufferHandles ...int32) error {
+	if !host.ForkController().FixAuditChangesV5() {
+		return nil
+	}
+
+	managedType := host.ManagedTypes()
+	for _, mBufferHandle := range mBufferHandles {
+		length := managedType.GetLength(mBufferHandle)
+		if length <= 0 {
+			continue
+		}
+
+		// #nosec G115
+		err := managedType.ConsumeGasForByteLenBounded(uint64(length))
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validateCappedLength rejects a caller-supplied length that is negative or above the
+// managed-buffer cap, before it is used to size any host work
+func validateCappedLength(dataLength executor.MemLength) error {
+	if dataLength < 0 || dataLength > maxManagedBufferLength {
+		return vmhost.ErrManagedBufferLengthExceedsMaximum
+	}
+
+	return nil
+}
+
+// consumeGasForCappedLength validates a caller-supplied length and charges bounded per-byte gas
+// for it, before the bytes are loaded
+func consumeGasForCappedLength(managedType vmhost.ManagedTypesContext, dataLength executor.MemLength) error {
+	err := validateCappedLength(dataLength)
+	if err != nil {
+		return err
+	}
+
+	// #nosec G115
+	return managedType.ConsumeGasForByteLenBounded(uint64(dataLength))
+}
+
+// post-fork the flat and the per-byte gas are bounded and paid before the buffer is read
+func consumeBufferReadGas(host vmhost.VMHost, gasToUse uint64, mBufferHandle int32) error {
+	metering := host.Metering()
+	if !host.ForkController().FixAuditChangesV5() {
+		metering.UseAndTraceGas(gasToUse)
+		return nil
+	}
+
+	err := metering.UseGasBounded(gasToUse)
+	if err != nil {
+		return err
+	}
+
+	return consumeGasForBuffersBounded(host, mBufferHandle)
+}
+
+// useBoundedGas charges gasToUse under functionName's own gas trace. Post-fork the charge is
+// bounded so it cannot be overdrawn before the host work. The amount is whatever the caller
+// computed and may already include a per-byte component (MBufferSetRandom's does), so this is
+// not necessarily a flat charge.
+func useBoundedGas(host vmhost.VMHost, functionName string, gasToUse uint64) error {
+	metering := host.Metering()
+	if !host.ForkController().FixAuditChangesV5() {
+		metering.UseGasAndAddTracedGas(functionName, gasToUse)
+		return nil
+	}
+
+	// UseGasBoundedAndAddTracedGas would record the amount twice, once into whichever trace is
+	// current and once as a new traced entry, so open this hook's own trace and let UseGasBounded
+	// record it there exactly once, the same shape the pre-fork helper produces
+	metering.StartGasTracing(functionName)
+	return metering.UseGasBounded(gasToUse)
+}
+
 // MBufferNew VMHooks implementation.
 // @autogenerate(VMHooks)
 func (context *VMHooksImpl) MBufferNew() int32 {
@@ -54,7 +140,18 @@ func (context *VMHooksImpl) MBufferNewFromBytes(dataOffset executor.MemPtr, data
 	metering := context.GetMeteringContext()
 
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferNewFromBytes
-	metering.UseGasAndAddTracedGas(mBufferNewFromBytesName, gasToUse)
+	// post-fork the flat and the per-byte gas are bounded and paid before the memory load
+	err := useBoundedGas(context.host, mBufferNewFromBytesName, gasToUse)
+	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+		return -1
+	}
+
+	if context.host.ForkController().FixAuditChangesV5() {
+		err = consumeGasForCappedLength(managedType, dataLength)
+		if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return -1
+		}
+	}
 
 	data, err := context.MemLoad(dataOffset, dataLength)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
@@ -91,14 +188,21 @@ func (context *VMHooksImpl) MBufferGetBytes(mBufferHandle int32, resultOffset ex
 	metering := context.GetMeteringContext()
 	metering.StartGasTracing(mBufferGetBytesName)
 
+	fixAuditV5 := context.host.ForkController().FixAuditChangesV5()
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferGetBytes
-	metering.UseAndTraceGas(gasToUse)
+	// post-fork the flat and the per-byte gas are bounded and paid before the buffer clone
+	err := consumeBufferReadGas(context.host, gasToUse, mBufferHandle)
+	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+		return 1
+	}
 
 	mBufferBytes, err := managedType.GetBytes(mBufferHandle)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
 		return 1
 	}
-	managedType.ConsumeGasForBytes(mBufferBytes)
+	if !fixAuditV5 {
+		managedType.ConsumeGasForBytes(mBufferBytes)
+	}
 
 	err = context.MemStore(resultOffset, mBufferBytes)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
@@ -121,16 +225,23 @@ func (context *VMHooksImpl) MBufferGetByteSlice(
 	metering := context.GetMeteringContext()
 	metering.StartGasTracing(mBufferGetByteSliceName)
 
+	fixAuditV5 := context.host.ForkController().FixAuditChangesV5()
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferGetByteSlice
-	metering.UseAndTraceGas(gasToUse)
+	// post-fork the flat and the per-byte gas are bounded and paid before the buffer clone
+	err := consumeBufferReadGas(context.host, gasToUse, sourceHandle)
+	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+		return 1
+	}
 
 	sourceBytes, err := managedType.GetBytes(sourceHandle)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
 		return 1
 	}
-	managedType.ConsumeGasForBytes(sourceBytes)
+	if !fixAuditV5 {
+		managedType.ConsumeGasForBytes(sourceBytes)
+	}
 
-	if startingPosition < 0 || sliceLength < 0 || int(startingPosition+sliceLength) > len(sourceBytes) {
+	if vmhost.SliceIsOutOfBounds(fixAuditV5, startingPosition, sliceLength, len(sourceBytes)) {
 		// does not fail execution if slice exceeds bounds
 		return 1
 	}
@@ -158,24 +269,48 @@ func ManagedBufferCopyByteSliceWithHost(host vmhost.VMHost, sourceHandle int32, 
 	metering := host.Metering()
 	metering.StartGasTracing(mBufferCopyByteSliceName)
 
+	fixAuditV5 := host.ForkController().FixAuditChangesV5()
+	// post-fork the destination write is capped before any gas is charged, so the ceiling holds
+	// whatever the gas schedule prices a byte at
+	if fixAuditV5 && sliceLength > maxManagedBufferLength {
+		_ = WithFaultAndHost(host, vmhost.ErrManagedBufferLengthExceedsMaximum, runtime.ManagedBufferAPIErrorShouldFailExecution())
+		return 1
+	}
+
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferCopyByteSlice
-	metering.UseAndTraceGas(gasToUse)
+	// post-fork the flat and the per-byte gas are bounded and paid before the buffer clone
+	err := consumeBufferReadGas(host, gasToUse, sourceHandle)
+	if WithFaultAndHost(host, err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+		return 1
+	}
 
 	sourceBytes, err := managedType.GetBytes(sourceHandle)
 	if WithFaultAndHost(host, err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
 		return 1
 	}
-	managedType.ConsumeGasForBytes(sourceBytes)
+	if !fixAuditV5 {
+		managedType.ConsumeGasForBytes(sourceBytes)
+	}
 
-	if startingPosition < 0 || sliceLength < 0 || int(startingPosition+sliceLength) > len(sourceBytes) {
+	if vmhost.SliceIsOutOfBounds(fixAuditV5, startingPosition, sliceLength, len(sourceBytes)) {
 		// does not fail execution if slice exceeds bounds
 		return 1
 	}
 
 	slice := sourceBytes[startingPosition : startingPosition+sliceLength]
-	managedType.SetBytes(destinationHandle, slice)
-
 	gasToUse = math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, uint64(len(slice)))
+	// post-fork the destination write is paid before it happens
+	if fixAuditV5 {
+		err = metering.UseGasBounded(gasToUse)
+		if WithFaultAndHost(host, err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return 1
+		}
+
+		managedType.SetBytes(destinationHandle, slice)
+		return 0
+	}
+
+	managedType.SetBytes(destinationHandle, slice)
 	metering.UseAndTraceGas(gasToUse)
 
 	return 0
@@ -189,20 +324,34 @@ func (context *VMHooksImpl) MBufferEq(mBufferHandle1 int32, mBufferHandle2 int32
 	metering := context.GetMeteringContext()
 	metering.StartGasTracing(mBufferEqName)
 
+	fixAuditV5 := context.host.ForkController().FixAuditChangesV5()
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferCopyByteSlice
-	metering.UseAndTraceGas(gasToUse)
+	// post-fork the flat gas is bounded and each buffer is paid for before it is cloned
+	err := consumeBufferReadGas(context.host, gasToUse, mBufferHandle1)
+	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+		return -1
+	}
 
 	bytes1, err := managedType.GetBytes(mBufferHandle1)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
 		return -1
 	}
-	managedType.ConsumeGasForBytes(bytes1)
+	if fixAuditV5 {
+		err = consumeGasForBuffersBounded(context.host, mBufferHandle2)
+		if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return -1
+		}
+	} else {
+		managedType.ConsumeGasForBytes(bytes1)
+	}
 
 	bytes2, err := managedType.GetBytes(mBufferHandle2)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
 		return -1
 	}
-	managedType.ConsumeGasForBytes(bytes2)
+	if !fixAuditV5 {
+		managedType.ConsumeGasForBytes(bytes2)
+	}
 
 	if bytes.Equal(bytes1, bytes2) {
 		return 1
@@ -219,14 +368,30 @@ func (context *VMHooksImpl) MBufferSetBytes(mBufferHandle int32, dataOffset exec
 	metering := context.GetMeteringContext()
 	metering.StartGasTracing(mBufferSetBytesName)
 
+	fixAuditV5 := context.host.ForkController().FixAuditChangesV5()
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferSetBytes
-	metering.UseAndTraceGas(gasToUse)
+	// post-fork the write is capped and the flat and per-byte gas are bounded and paid before the memory load
+	if fixAuditV5 {
+		err := metering.UseGasBounded(gasToUse)
+		if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return 1
+		}
+
+		err = consumeGasForCappedLength(managedType, dataLength)
+		if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return 1
+		}
+	} else {
+		metering.UseAndTraceGas(gasToUse)
+	}
 
 	data, err := context.MemLoad(dataOffset, dataLength)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
 		return 1
 	}
-	managedType.ConsumeGasForBytes(data)
+	if !fixAuditV5 {
+		managedType.ConsumeGasForBytes(data)
+	}
 	managedType.SetBytes(mBufferHandle, data)
 
 	return 0
@@ -252,12 +417,28 @@ func (context *VMHooksImpl) ManagedBufferSetByteSliceWithHost(
 	dataLength executor.MemLength,
 	dataOffset executor.MemPtr) int32 {
 
+	managedType := host.ManagedTypes()
 	runtime := host.Runtime()
 	metering := host.Metering()
 	metering.StartGasTracing(mBufferGetByteSliceName)
 
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferSetBytes
-	metering.UseAndTraceGas(gasToUse)
+	// post-fork the write is capped and the flat and per-byte gas for the loaded bytes are
+	// bounded and paid before the memory load; the destination clone is paid for where it
+	// happens, in ManagedBufferSetByteSliceWithTypedArgs
+	if host.ForkController().FixAuditChangesV5() {
+		err := metering.UseGasBounded(gasToUse)
+		if WithFaultAndHost(host, err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return 1
+		}
+
+		err = consumeGasForCappedLength(managedType, dataLength)
+		if WithFaultAndHost(host, err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return 1
+		}
+	} else {
+		metering.UseAndTraceGas(gasToUse)
+	}
 
 	data, err := context.MemLoad(dataOffset, dataLength)
 	if WithFaultAndHost(host, err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
@@ -268,13 +449,22 @@ func (context *VMHooksImpl) ManagedBufferSetByteSliceWithHost(
 }
 
 // ManagedBufferSetByteSliceWithTypedArgs VMHooks implementation.
+// It pays for its own work: post-fork the destination buffer that SetByteSlice clones is charged
+// with bounded gas before the clone, so a caller only has to pay for producing data itself.
 func ManagedBufferSetByteSliceWithTypedArgs(host vmhost.VMHost, mBufferHandle int32, startingPosition int32, dataLength int32, data []byte) int32 {
 	managedType := host.ManagedTypes()
 	runtime := host.Runtime()
 	metering := host.Metering()
 	metering.StartGasTracing(mBufferGetByteSliceName)
 
-	managedType.ConsumeGasForBytes(data)
+	if host.ForkController().FixAuditChangesV5() {
+		err := consumeGasForBuffersBounded(host, mBufferHandle)
+		if WithFaultAndHost(host, err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return 1
+		}
+	} else {
+		managedType.ConsumeGasForBytes(data)
+	}
 
 	ok, err := managedType.SetByteSlice(mBufferHandle, startingPosition, dataLength, data)
 	if WithFaultAndHost(host, err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
@@ -296,14 +486,41 @@ func (context *VMHooksImpl) MBufferAppend(accumulatorHandle int32, dataHandle in
 	metering := context.GetMeteringContext()
 	metering.StartGasTracing(mBufferAppendName)
 
+	fixAuditV5 := context.host.ForkController().FixAuditChangesV5()
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferAppend
-	metering.UseAndTraceGas(gasToUse)
+	// post-fork the resulting length is capped and the flat and per-byte gas are bounded and paid before the clone
+	if fixAuditV5 {
+		// the resulting length is capped before any gas is charged, so the ceiling holds
+		// whatever the gas schedule prices a byte at
+		if int64(managedType.GetLength(accumulatorHandle))+int64(managedType.GetLength(dataHandle)) > maxManagedBufferLength {
+			_ = context.WithFault(vmhost.ErrManagedBufferLengthExceedsMaximum, runtime.ManagedBufferAPIErrorShouldFailExecution())
+			return 1
+		}
+
+		err := metering.UseGasBounded(gasToUse)
+		if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return 1
+		}
+
+		// the append always copies the incoming bytes and copies the accumulator only when it
+		// has to reallocate, which is exactly what ConsumeGasForAppend charges. Charging the
+		// accumulator unconditionally would bill the sum of every intermediate length, making a
+		// buffer built in a loop cost gas quadratic in the number of appends.
+		err = managedType.ConsumeGasForAppend(accumulatorHandle, managedType.GetLength(dataHandle))
+		if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return 1
+		}
+	} else {
+		metering.UseAndTraceGas(gasToUse)
+	}
 
 	dataBufferBytes, err := managedType.GetBytes(dataHandle)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
 		return 1
 	}
-	managedType.ConsumeGasForBytes(dataBufferBytes)
+	if !fixAuditV5 {
+		managedType.ConsumeGasForBytes(dataBufferBytes)
+	}
 
 	isSuccess := managedType.AppendBytes(accumulatorHandle, dataBufferBytes)
 	if !isSuccess {
@@ -322,8 +539,36 @@ func (context *VMHooksImpl) MBufferAppendBytes(accumulatorHandle int32, dataOffs
 	metering := context.GetMeteringContext()
 	metering.StartGasTracing(mBufferAppendBytesName)
 
+	fixAuditV5 := context.host.ForkController().FixAuditChangesV5()
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferAppendBytes
-	metering.UseAndTraceGas(gasToUse)
+	// post-fork the resulting length is capped and the flat and per-byte gas are bounded and paid before the memory load
+	if fixAuditV5 {
+		err := metering.UseGasBounded(gasToUse)
+		if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return 1
+		}
+
+		if int64(managedType.GetLength(accumulatorHandle))+int64(dataLength) > maxManagedBufferLength {
+			_ = context.WithFault(vmhost.ErrManagedBufferLengthExceedsMaximum, runtime.ManagedBufferAPIErrorShouldFailExecution())
+			return 1
+		}
+
+		err = validateCappedLength(dataLength)
+		if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return 1
+		}
+
+		// the append always copies the incoming bytes and copies the accumulator only when it
+		// has to reallocate, which is exactly what ConsumeGasForAppend charges. Charging the
+		// accumulator unconditionally would bill the sum of every intermediate length, making a
+		// buffer built in a loop cost gas quadratic in the number of appends.
+		err = managedType.ConsumeGasForAppend(accumulatorHandle, dataLength)
+		if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return 1
+		}
+	} else {
+		metering.UseAndTraceGas(gasToUse)
+	}
 
 	data, err := context.MemLoad(dataOffset, dataLength)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
@@ -336,8 +581,10 @@ func (context *VMHooksImpl) MBufferAppendBytes(accumulatorHandle int32, dataOffs
 		return 1
 	}
 
-	gasToUse = math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, uint64(len(data)))
-	metering.UseAndTraceGas(gasToUse)
+	if !fixAuditV5 {
+		gasToUse = math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, uint64(len(data)))
+		metering.UseAndTraceGas(gasToUse)
+	}
 
 	return 0
 }
@@ -350,7 +597,16 @@ func (context *VMHooksImpl) MBufferToBigIntUnsigned(mBufferHandle int32, bigIntH
 	metering := context.GetMeteringContext()
 
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferToBigIntUnsigned
-	metering.UseGasAndAddTracedGas(mBufferToBigIntUnsignedName, gasToUse)
+	// post-fork the flat gas is bounded and the buffer is paid for before it is cloned and parsed
+	err := useBoundedGas(context.host, mBufferToBigIntUnsignedName, gasToUse)
+	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+		return 1
+	}
+
+	err = consumeGasForBuffersBounded(context.host, mBufferHandle)
+	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+		return 1
+	}
 
 	managedBuffer, err := managedType.GetBytes(mBufferHandle)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
@@ -371,7 +627,16 @@ func (context *VMHooksImpl) MBufferToBigIntSigned(mBufferHandle int32, bigIntHan
 	metering := context.GetMeteringContext()
 
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferToBigIntSigned
-	metering.UseGasAndAddTracedGas(mBufferToBigIntSignedName, gasToUse)
+	// post-fork the flat gas is bounded and the buffer is paid for before it is cloned and parsed
+	err := useBoundedGas(context.host, mBufferToBigIntSignedName, gasToUse)
+	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+		return 1
+	}
+
+	err = consumeGasForBuffersBounded(context.host, mBufferHandle)
+	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+		return 1
+	}
 
 	managedBuffer, err := managedType.GetBytes(mBufferHandle)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
@@ -391,12 +656,25 @@ func (context *VMHooksImpl) MBufferFromBigIntUnsigned(mBufferHandle int32, bigIn
 	runtime := context.GetRuntimeContext()
 	metering := context.GetMeteringContext()
 
+	fixAuditV5 := context.host.ForkController().FixAuditChangesV5()
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferFromBigIntUnsigned
-	metering.UseGasAndAddTracedGas(mBufferFromBigIntUnsignedName, gasToUse)
+	// post-fork the flat gas is bounded and the value is paid for before it is serialized and copied
+	err := useBoundedGas(context.host, mBufferFromBigIntUnsignedName, gasToUse)
+	if context.WithFault(err, runtime.BigIntAPIErrorShouldFailExecution()) {
+		return 1
+	}
 
 	value, err := managedType.GetBigInt(bigIntHandle)
 	if context.WithFault(err, runtime.BigIntAPIErrorShouldFailExecution()) {
 		return 1
+	}
+
+	if fixAuditV5 {
+		// #nosec G115
+		err = managedType.ConsumeGasForByteLenBounded(uint64(value.BitLen())/8 + 1)
+		if context.WithFault(err, runtime.BigIntAPIErrorShouldFailExecution()) {
+			return 1
+		}
 	}
 
 	managedType.SetBytes(mBufferHandle, value.Bytes())
@@ -411,12 +689,25 @@ func (context *VMHooksImpl) MBufferFromBigIntSigned(mBufferHandle int32, bigIntH
 	runtime := context.GetRuntimeContext()
 	metering := context.GetMeteringContext()
 
+	fixAuditV5 := context.host.ForkController().FixAuditChangesV5()
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferFromBigIntSigned
-	metering.UseGasAndAddTracedGas(mBufferFromBigIntSignedName, gasToUse)
+	// post-fork the flat gas is bounded and the value is paid for before it is serialized and copied
+	err := useBoundedGas(context.host, mBufferFromBigIntSignedName, gasToUse)
+	if context.WithFault(err, runtime.BigIntAPIErrorShouldFailExecution()) {
+		return 1
+	}
 
 	value, err := managedType.GetBigInt(bigIntHandle)
 	if context.WithFault(err, runtime.BigIntAPIErrorShouldFailExecution()) {
 		return 1
+	}
+
+	if fixAuditV5 {
+		// #nosec G115
+		err = managedType.ConsumeGasForByteLenBounded(uint64(value.BitLen())/8 + 1)
+		if context.WithFault(err, runtime.BigIntAPIErrorShouldFailExecution()) {
+			return 1
+		}
 	}
 
 	managedType.SetBytes(mBufferHandle, twos.ToBytes(value))
@@ -431,15 +722,21 @@ func (context *VMHooksImpl) MBufferToBigFloat(mBufferHandle, bigFloatHandle int3
 	metering := context.GetMeteringContext()
 	metering.StartGasTracing(mBufferToBigFloatName)
 
+	fixAuditV5 := context.host.ForkController().FixAuditChangesV5()
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferToBigFloat
-	metering.UseAndTraceGas(gasToUse)
+	err := consumeBufferReadGas(context.host, gasToUse, mBufferHandle)
+	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+		return 1
+	}
 
 	managedBuffer, err := managedType.GetBytes(mBufferHandle)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
 		return 1
 	}
 
-	managedType.ConsumeGasForBytes(managedBuffer)
+	if !fixAuditV5 {
+		managedType.ConsumeGasForBytes(managedBuffer)
+	}
 	if managedType.EncodedBigFloatIsNotValid(managedBuffer) {
 		_ = context.WithFault(vmhost.ErrBigFloatWrongPrecision, runtime.BigFloatAPIErrorShouldFailExecution())
 		return 1
@@ -480,8 +777,17 @@ func (context *VMHooksImpl) MBufferFromBigFloat(mBufferHandle, bigFloatHandle in
 	metering := context.GetMeteringContext()
 	metering.StartGasTracing(mBufferFromBigFloatName)
 
+	fixAuditV5 := context.host.ForkController().FixAuditChangesV5()
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferFromBigFloat
-	metering.UseAndTraceGas(gasToUse)
+	// post-fork the flat and the per-byte gas are bounded and the encoding is paid for before it is copied
+	if fixAuditV5 {
+		err := metering.UseGasBounded(gasToUse)
+		if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return 1
+		}
+	} else {
+		metering.UseAndTraceGas(gasToUse)
+	}
 
 	value, err := managedType.GetBigFloat(bigFloatHandle)
 	if context.WithFault(err, runtime.BigFloatAPIErrorShouldFailExecution()) {
@@ -492,7 +798,15 @@ func (context *VMHooksImpl) MBufferFromBigFloat(mBufferHandle, bigFloatHandle in
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
 		return 1
 	}
-	managedType.ConsumeGasForBytes(encodedFloat)
+
+	if fixAuditV5 {
+		err = managedType.ConsumeGasForByteLenBounded(uint64(len(encodedFloat)))
+		if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return 1
+		}
+	} else {
+		managedType.ConsumeGasForBytes(encodedFloat)
+	}
 
 	managedType.SetBytes(mBufferHandle, encodedFloat)
 
@@ -508,7 +822,16 @@ func (context *VMHooksImpl) MBufferStorageStore(keyHandle int32, sourceHandle in
 	metering := context.GetMeteringContext()
 
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferStorageStore
-	metering.UseGasAndAddTracedGas(mBufferStorageStoreName, gasToUse)
+	// post-fork the flat gas is bounded and both buffers are paid for before they are cloned
+	err := useBoundedGas(context.host, mBufferStorageStoreName, gasToUse)
+	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+		return 1
+	}
+
+	err = consumeGasForBuffersBounded(context.host, keyHandle, sourceHandle)
+	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+		return 1
+	}
 
 	key, err := managedType.GetBytes(keyHandle)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
@@ -536,6 +859,13 @@ func (context *VMHooksImpl) MBufferStorageLoad(keyHandle int32, destinationHandl
 	storage := context.GetStorageContext()
 	metering := context.GetMeteringContext()
 
+	fixAuditV5 := context.host.ForkController().FixAuditChangesV5()
+	// post-fork the key is paid for with bounded gas before it is cloned
+	err := consumeGasForBuffersBounded(context.host, keyHandle)
+	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+		return 1
+	}
+
 	key, err := managedType.GetBytes(keyHandle)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
 		return 1
@@ -554,6 +884,14 @@ func (context *VMHooksImpl) MBufferStorageLoad(keyHandle int32, destinationHandl
 		return -1
 	}
 
+	// post-fork the loaded value is paid for with bounded gas before it is copied into the destination
+	if fixAuditV5 {
+		err = managedType.ConsumeGasForByteLenBounded(uint64(len(storageBytes)))
+		if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return 1
+		}
+	}
+
 	managedType.SetBytes(destinationHandle, storageBytes)
 
 	return 0
@@ -565,6 +903,13 @@ func (context *VMHooksImpl) MBufferStorageLoadFromAddress(addressHandle, keyHand
 	host := context.GetVMHost()
 	managedType := context.GetManagedTypesContext()
 	runtime := context.GetRuntimeContext()
+
+	fixAuditV5 := host.ForkController().FixAuditChangesV5()
+	// post-fork the key and the address are paid for with bounded gas before they are cloned
+	err := consumeGasForBuffersBounded(host, keyHandle, addressHandle)
+	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+		return
+	}
 
 	key, err := managedType.GetBytes(keyHandle)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
@@ -582,6 +927,14 @@ func (context *VMHooksImpl) MBufferStorageLoadFromAddress(addressHandle, keyHand
 		return
 	}
 
+	// post-fork the loaded value is paid for with bounded gas before it is copied into the destination
+	if fixAuditV5 {
+		err = managedType.ConsumeGasForByteLenBounded(uint64(len(storageBytes)))
+		if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return
+		}
+	}
+
 	managedType.SetBytes(destinationHandle, storageBytes)
 }
 
@@ -592,8 +945,13 @@ func (context *VMHooksImpl) MBufferGetArgument(id int32, destinationHandle int32
 	runtime := context.GetRuntimeContext()
 	metering := context.GetMeteringContext()
 
+	fixAuditV5 := context.host.ForkController().FixAuditChangesV5()
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferGetArgument
-	metering.UseGasAndAddTracedGas(mBufferGetArgumentName, gasToUse)
+	// post-fork the flat gas is bounded and the argument is paid for before it is copied
+	err := useBoundedGas(context.host, mBufferGetArgumentName, gasToUse)
+	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+		return 1
+	}
 
 	args := runtime.Arguments()
 	// #nosec G115
@@ -601,6 +959,14 @@ func (context *VMHooksImpl) MBufferGetArgument(id int32, destinationHandle int32
 		context.WithFault(vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
 		return 1
 	}
+
+	if fixAuditV5 {
+		err = managedType.ConsumeGasForByteLenBounded(uint64(len(args[id])))
+		if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return 1
+		}
+	}
+
 	managedType.SetBytes(destinationHandle, args[id])
 	return 0
 }
@@ -615,7 +981,11 @@ func (context *VMHooksImpl) MBufferFinish(sourceHandle int32) int32 {
 	metering.StartGasTracing(mBufferFinishName)
 
 	gasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferFinish
-	metering.UseAndTraceGas(gasToUse)
+	// post-fork the flat and the per-byte gas are bounded and paid before the buffer clone
+	err := consumeBufferReadGas(context.host, gasToUse, sourceHandle)
+	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+		return 1
+	}
 
 	sourceBytes, err := managedType.GetBytes(sourceHandle)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
@@ -648,11 +1018,20 @@ func (context *VMHooksImpl) MBufferSetRandom(destinationHandle int32, length int
 	baseGasToUse := metering.GasSchedule().ManagedBufferAPICost.MBufferSetRandom
 	lengthDependentGasToUse := math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, uint64(length))
 	gasToUse := math.AddUint64(baseGasToUse, lengthDependentGasToUse)
-	metering.UseGasAndAddTracedGas(mBufferSetRandomName, gasToUse)
+	// post-fork the length is capped and the length-dependent gas is bounded and paid before the allocation
+	if context.host.ForkController().FixAuditChangesV5() && length > maxManagedBufferLength {
+		_ = context.WithFault(vmhost.ErrManagedBufferLengthExceedsMaximum, runtime.ManagedBufferAPIErrorShouldFailExecution())
+		return -1
+	}
+
+	err := useBoundedGas(context.host, mBufferSetRandomName, gasToUse)
+	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+		return -1
+	}
 
 	randomizer := managedType.GetRandReader()
 	buffer := make([]byte, length)
-	_, err := randomizer.Read(buffer)
+	_, err = randomizer.Read(buffer)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
 		return -1
 	}

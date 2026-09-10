@@ -267,6 +267,9 @@ var ErrEmptyProtectedKeyPrefix = errors.New("protectedKeyPrefix is empty or nil"
 // ErrInvalidGasProvided signals that an unacceptable GasProvided value was specified
 var ErrInvalidGasProvided = errors.New("invalid gas provided")
 
+// ErrManagedBufferLengthExceedsMaximum signals that a managed buffer operation was given more bytes than allowed
+var ErrManagedBufferLengthExceedsMaximum = errors.New("managed buffer length exceeds maximum")
+
 // ErrRAndSExceedsMax32BytesSecp256k1 signals that r and s are greater than 32 bytes max allowed on Secp256k1
 var ErrRAndSExceedsMax32BytesSecp256k1 = errors.New("invalid length of secp256k1 r and s")
 

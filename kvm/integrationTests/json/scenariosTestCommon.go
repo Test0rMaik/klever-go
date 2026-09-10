@@ -9,6 +9,7 @@ import (
 	"time"
 
 	logger "github.com/klever-io/klever-go-logger"
+	"github.com/klever-io/klever-go/config"
 	"github.com/klever-io/klever-go/kvm/executor"
 	executorwrapper "github.com/klever-io/klever-go/kvm/executor/wrapper"
 	am "github.com/klever-io/klever-go/kvm/scenarioexec"
@@ -39,6 +40,7 @@ type ScenariosTestBuilder struct {
 	exclusions      []string
 	executorLogger  executorwrapper.ExecutorLogger
 	executorFactory executor.ExecutorAbstractFactory
+	enableEpochs    *config.EnableEpochs
 	currentError    error
 }
 
@@ -51,6 +53,13 @@ func ScenariosTest(t *testing.T) *ScenariosTestBuilder {
 		executorLogger:  nil,
 		executorFactory: nil,
 	}
+}
+
+// WithEnableEpochs runs the scenarios under the given activation schedule instead of the
+// default one, in which every fork is active from epoch 0
+func (mtb *ScenariosTestBuilder) WithEnableEpochs(enableEpochs config.EnableEpochs) *ScenariosTestBuilder {
+	mtb.enableEpochs = &enableEpochs
+	return mtb
 }
 
 // Folder sets the folder
@@ -100,6 +109,7 @@ func (mtb *ScenariosTestBuilder) Run() *ScenariosTestBuilder {
 	}
 
 	executor.OverrideVMExecutor = mtb.executorFactory
+	executor.EnableEpochs = mtb.enableEpochs
 	if mtb.executorLogger != nil {
 		executor.OverrideVMExecutor = executorwrapper.NewWrappedExecutorFactory(
 			mtb.executorLogger,

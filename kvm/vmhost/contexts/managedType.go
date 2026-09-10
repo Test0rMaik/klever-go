@@ -251,6 +251,36 @@ func (context *managedTypesContext) ConsumeGasForBytes(bytes []byte) {
 	metering.UseAndTraceGas(gasToUse)
 }
 
+// ConsumeGasForByteLenBounded uses gas for the given number of bytes, returning ErrNotEnoughGas
+// instead of overdrawing, for callers that know the length before the bytes exist
+func (context *managedTypesContext) ConsumeGasForByteLenBounded(byteLen uint64) error {
+	metering := context.host.Metering()
+	gasToUse := math.MulUint64(byteLen, metering.GasSchedule().BaseOperationCost.DataCopyPerByte)
+	return metering.UseGasBounded(gasToUse)
+}
+
+// ConsumeGasForAppend charges, before the work happens, the copying that appending dataLength
+// bytes onto the buffer at mBufferHandle will actually perform. The incoming bytes are always
+// copied, so they are always charged; the accumulator is copied only when the append has to
+// reallocate, so it is charged only then. Because growManagedBuffer grows capacity geometrically,
+// building a buffer through repeated appends costs gas linear in its final length instead of
+// quadratic in the number of calls. Returns ErrNotEnoughGas rather than overdrawing.
+func (context *managedTypesContext) ConsumeGasForAppend(mBufferHandle int32, dataLength int32) error {
+	bytesToCopy := uint64(0)
+	if dataLength > 0 {
+		// #nosec G115
+		bytesToCopy = uint64(dataLength)
+	}
+
+	buffer, ok := context.managedTypesValues.mBufferValues[mBufferHandle]
+	if ok && appendWillReallocate(buffer, int(bytesToCopy)) {
+		// the reallocation copies the whole accumulator into the new backing array
+		bytesToCopy += uint64(len(buffer))
+	}
+
+	return context.ConsumeGasForByteLenBounded(bytesToCopy)
+}
+
 // ConsumeGasForThisBigIntNumberOfBytes uses gas for the number of bytes given that are being copied
 func (context *managedTypesContext) ConsumeGasForThisBigIntNumberOfBytes(byteLen *big.Int) error {
 	metering := context.host.Metering()
@@ -607,24 +637,71 @@ func (context *managedTypesContext) SetByteSlice(mBufferHandle int32, startingPo
 		return false, vmhost.ErrNoManagedBufferUnderThisHandle
 	}
 
-	if startingPosition < 0 || dataLength < 0 || int(startingPosition+dataLength) > len(mBuffer) {
+	fixAuditV5 := context.host.ForkController().FixAuditChangesV5()
+	if vmhost.SliceIsOutOfBounds(fixAuditV5, startingPosition, dataLength, len(mBuffer)) {
 		return false, nil
 	}
 
-	mBufferCopy := bytes.Clone(mBuffer)
+	// an explicit allocation rather than bytes.Clone, which is append-based and would leave a
+	// capacity chosen by the runtime's size classes behind in the map; see growManagedBuffer
+	mBufferCopy := make([]byte, len(mBuffer))
+	copy(mBufferCopy, mBuffer)
 	copy(mBufferCopy[startingPosition:startingPosition+dataLength], data)
 	context.managedTypesValues.mBufferValues[mBufferHandle] = mBufferCopy
 
 	return true, nil
 }
 
+// managedBufferGrowthFactor is the multiplier applied to a managed buffer's capacity when it has
+// to grow. The growth policy lives here instead of being left to Go's append because the gas
+// ConsumeGasForAppend charges depends on cap(), and the runtime's growslice/roundupsize are
+// unspecified and have changed between Go releases. Two nodes built with different toolchains
+// must charge the same gas for the same call, so the capacity has to be ours to decide.
+const managedBufferGrowthFactor = 2
+
+// appendWillReallocate reports whether appending dataLength bytes to buffer has to move it to a
+// new backing array, which is the only case in which the existing bytes are copied. It is the one
+// predicate shared by growManagedBuffer and by the gas charged for the copy, so the two cannot
+// disagree about whether a copy happens.
+func appendWillReallocate(buffer []byte, dataLength int) bool {
+	return len(buffer)+dataLength > cap(buffer)
+}
+
+// growManagedBuffer returns a buffer holding the same bytes with room for at least neededLen. When
+// the current capacity already suffices the buffer is returned untouched and nothing is copied.
+// Growth is geometric, so the bytes copied while building a buffer through repeated appends stay
+// linear in its final length. The resulting capacity is below twice neededLen, since a capacity is
+// only ever doubled from one that was already too small.
+func growManagedBuffer(buffer []byte, neededLen int) []byte {
+	if neededLen <= cap(buffer) {
+		return buffer
+	}
+
+	newCapacity := managedBufferGrowthFactor * cap(buffer)
+	if newCapacity < neededLen {
+		newCapacity = neededLen
+	}
+
+	// make with an explicit capacity records exactly that capacity, unlike append, whose growth
+	// is rounded up by the allocator's size classes
+	grown := make([]byte, len(buffer), newCapacity)
+	copy(grown, buffer)
+
+	return grown
+}
+
 // AppendBytes appends the given bytes to the buffer at the end
-func (context *managedTypesContext) AppendBytes(mBufferHandle int32, bytes []byte) bool {
-	_, ok := context.managedTypesValues.mBufferValues[mBufferHandle]
+func (context *managedTypesContext) AppendBytes(mBufferHandle int32, data []byte) bool {
+	buffer, ok := context.managedTypesValues.mBufferValues[mBufferHandle]
 	if !ok {
 		return false
 	}
-	context.managedTypesValues.mBufferValues[mBufferHandle] = append(context.managedTypesValues.mBufferValues[mBufferHandle], bytes...)
+
+	// grow explicitly first, so the append below never has to and the capacity stays the one
+	// growManagedBuffer decided
+	buffer = growManagedBuffer(buffer, len(buffer)+len(data))
+	context.managedTypesValues.mBufferValues[mBufferHandle] = append(buffer, data...)
+
 	return true
 }
 
@@ -677,9 +754,19 @@ func (context *managedTypesContext) InsertSlice(mBufferHandle int32, startPositi
 	if startPosition < 0 || startPosition > int32(len(mBuffer))-1 {
 		return nil, vmhost.ErrBadBounds
 	}
-	mBuffer = append(mBuffer[:startPosition], append(slice, mBuffer[startPosition:]...)...)
-	context.managedTypesValues.mBufferValues[mBufferHandle] = mBuffer
-	return context.managedTypesValues.mBufferValues[mBufferHandle], nil
+	// grown explicitly rather than through append, so the capacity left in the map is the one
+	// growManagedBuffer decided and not one the runtime's size classes picked; the gas an append
+	// later charges reads cap(), so a runtime-chosen capacity would be a repricing
+	insertedLen := len(mBuffer) + len(slice)
+	grown := growManagedBuffer(mBuffer, insertedLen)[:insertedLen]
+
+	// shift the tail right before writing the inserted bytes into the gap it leaves; copy has
+	// memmove semantics, so this is correct even when grown still aliases mBuffer
+	copy(grown[int(startPosition)+len(slice):], mBuffer[startPosition:])
+	copy(grown[startPosition:], slice)
+
+	context.managedTypesValues.mBufferValues[mBufferHandle] = grown
+	return grown, nil
 }
 
 // ReadManagedVecOfManagedBuffers converts a managed buffer of managed buffers to a slice of byte slices.

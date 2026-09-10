@@ -3,6 +3,7 @@ package hostCoretest
 import (
 	"testing"
 
+	blockchainConfig "github.com/klever-io/klever-go/config"
 	mock "github.com/klever-io/klever-go/kvm/mock/context"
 	worldmock "github.com/klever-io/klever-go/kvm/mock/world"
 	test "github.com/klever-io/klever-go/kvm/testcommon"
@@ -196,4 +197,259 @@ func TestManaged_StorageStoreKeyIsolatedFromBufferMutation(t *testing.T) {
 		})
 
 	require.NoError(t, err)
+}
+
+const preForkFixAuditChangesV5 = 1_000_000
+
+func runManagedBufferHookWithGas(
+	t *testing.T,
+	fixAuditChangesV5 uint32,
+	gasLeftBeforeHook uint64,
+	hook func(host vmhost.VMHost),
+	assertResults test.AssertResultsFunc,
+) {
+	_, err := test.BuildMockInstanceCallTest(t).
+		WithEnableEpochs(blockchainConfig.EnableEpochs{FixAuditChangesV5: fixAuditChangesV5}).
+		WithContracts(
+			test.CreateMockContract(test.ParentAddress).
+				WithBalance(1000).
+				WithMethods(func(parentInstance *mock.InstanceMock, config interface{}) {
+					parentInstance.AddMockMethod("testFunction", func() *mock.InstanceMock {
+						host := parentInstance.Host
+						metering := host.Metering()
+						metering.UseGas(metering.GasLeft() - gasLeftBeforeHook)
+
+						hook(host)
+
+						return parentInstance
+					})
+				}),
+		).
+		WithInput(test.CreateTestContractCallInputBuilder().
+			WithRecipientAddr(test.ParentAddress).
+			WithGasProvided(1_000_000).
+			WithFunction("testFunction").
+			Build()).
+		AndAssertResults(assertResults)
+
+	require.NoError(t, err)
+}
+
+func TestManaged_SetRandom_RejectsInsufficientGas(t *testing.T) {
+	const length = int32(64)
+
+	setRandom := func(hookReturn *int32, produced *[]byte) func(host vmhost.VMHost) {
+		return func(host vmhost.VMHost) {
+			managedType := host.ManagedTypes()
+			destinationHandle := managedType.NewManagedBuffer()
+			*hookReturn = vmhooks.NewVMHooksImpl(host).MBufferSetRandom(destinationHandle, length)
+			result, err := managedType.GetBytes(destinationHandle)
+			require.NoError(t, err)
+			*produced = result
+		}
+	}
+
+	t.Run("post-fork: gas covering only the flat charge allocates nothing", func(t *testing.T) {
+		var hookReturn int32
+		var produced []byte
+
+		runManagedBufferHookWithGas(t, 0, 1, setRandom(&hookReturn, &produced),
+			func(world *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+				verify.OutOfGas().ReturnMessage(vmhost.ErrNotEnoughGas.Error())
+			})
+
+		require.Equal(t, int32(-1), hookReturn)
+		require.Empty(t, produced)
+	})
+
+	t.Run("pre-fork: gas covering only the flat charge still allocates", func(t *testing.T) {
+		var hookReturn int32
+		var produced []byte
+
+		runManagedBufferHookWithGas(t, preForkFixAuditChangesV5, 1, setRandom(&hookReturn, &produced),
+			func(world *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+				verify.OutOfGas()
+			})
+
+		require.Equal(t, int32(0), hookReturn)
+		require.Len(t, produced, int(length))
+	})
+
+	t.Run("post-fork: gas covering the length-dependent charge allocates", func(t *testing.T) {
+		var hookReturn int32
+		var produced []byte
+
+		runManagedBufferHookWithGas(t, 0, uint64(1+length), setRandom(&hookReturn, &produced),
+			func(world *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+				verify.Ok()
+			})
+
+		require.Equal(t, int32(0), hookReturn)
+		require.Len(t, produced, int(length))
+	})
+}
+
+func TestManaged_SetRandom_RejectsOversizeLength(t *testing.T) {
+	const oversizeLength = int32(16_000_001)
+
+	setRandom := func(hookReturn *int32, produced *[]byte) func(host vmhost.VMHost) {
+		return func(host vmhost.VMHost) {
+			managedType := host.ManagedTypes()
+			destinationHandle := managedType.NewManagedBuffer()
+			*hookReturn = vmhooks.NewVMHooksImpl(host).MBufferSetRandom(destinationHandle, oversizeLength)
+			result, err := managedType.GetBytes(destinationHandle)
+			require.NoError(t, err)
+			*produced = result
+		}
+	}
+
+	t.Run("post-fork: an oversize length allocates nothing", func(t *testing.T) {
+		var hookReturn int32
+		var produced []byte
+
+		runManagedBufferHookWithGas(t, 0, 900_000, setRandom(&hookReturn, &produced),
+			func(world *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+				verify.ExecutionFailed().ReturnMessage(vmhost.ErrManagedBufferLengthExceedsMaximum.Error())
+			})
+
+		require.Equal(t, int32(-1), hookReturn)
+		require.Empty(t, produced)
+	})
+
+	t.Run("pre-fork: an oversize length is still allocated", func(t *testing.T) {
+		var hookReturn int32
+		var produced []byte
+
+		runManagedBufferHookWithGas(t, preForkFixAuditChangesV5, 900_000, setRandom(&hookReturn, &produced),
+			func(world *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+				verify.OutOfGas()
+			})
+
+		require.Equal(t, int32(0), hookReturn)
+		require.Len(t, produced, int(oversizeLength))
+	})
+}
+
+func TestManaged_Append_ChargesPerByteBeforeAppend(t *testing.T) {
+	accumulator := []byte("abcd")
+	data := []byte("efgh")
+
+	appendBuffer := func(hookReturn *int32, produced *[]byte) func(host vmhost.VMHost) {
+		return func(host vmhost.VMHost) {
+			managedType := host.ManagedTypes()
+			accumulatorHandle := managedType.NewManagedBufferFromBytes(accumulator)
+			dataHandle := managedType.NewManagedBufferFromBytes(data)
+			*hookReturn = vmhooks.NewVMHooksImpl(host).MBufferAppend(accumulatorHandle, dataHandle)
+			result, err := managedType.GetBytes(accumulatorHandle)
+			require.NoError(t, err)
+			*produced = result
+		}
+	}
+
+	t.Run("post-fork: gas covering only the flat charge leaves the accumulator untouched", func(t *testing.T) {
+		var hookReturn int32
+		var produced []byte
+
+		runManagedBufferHookWithGas(t, 0, 1, appendBuffer(&hookReturn, &produced),
+			func(world *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+				verify.OutOfGas().ReturnMessage(vmhost.ErrNotEnoughGas.Error())
+			})
+
+		require.Equal(t, int32(1), hookReturn)
+		require.Equal(t, accumulator, produced)
+	})
+
+	t.Run("pre-fork: gas covering only the flat charge still appends", func(t *testing.T) {
+		var hookReturn int32
+		var produced []byte
+
+		runManagedBufferHookWithGas(t, preForkFixAuditChangesV5, 1, appendBuffer(&hookReturn, &produced),
+			func(world *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+				verify.OutOfGas()
+			})
+
+		require.Equal(t, int32(0), hookReturn)
+		require.Equal(t, []byte("abcdefgh"), produced)
+	})
+
+	t.Run("post-fork: gas covering only the data leaves the accumulator untouched", func(t *testing.T) {
+		var hookReturn int32
+		var produced []byte
+
+		runManagedBufferHookWithGas(t, 0, uint64(1+len(data)), appendBuffer(&hookReturn, &produced),
+			func(world *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+				verify.OutOfGas().ReturnMessage(vmhost.ErrNotEnoughGas.Error())
+			})
+
+		require.Equal(t, int32(1), hookReturn)
+		require.Equal(t, accumulator, produced)
+	})
+
+	t.Run("post-fork: gas covering the data and the accumulator copy appends", func(t *testing.T) {
+		var hookReturn int32
+		var produced []byte
+
+		runManagedBufferHookWithGas(t, 0, uint64(1+len(data)+len(accumulator)), appendBuffer(&hookReturn, &produced),
+			func(world *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+				verify.Ok()
+			})
+
+		require.Equal(t, int32(0), hookReturn)
+		require.Equal(t, []byte("abcdefgh"), produced)
+	})
+}
+
+func TestManaged_ToBigIntUnsigned_ChargesPerByteBeforeParse(t *testing.T) {
+	source := []byte{0x01, 0x02, 0x03, 0x04}
+
+	toBigInt := func(hookReturn *int32, produced *[]byte) func(host vmhost.VMHost) {
+		return func(host vmhost.VMHost) {
+			managedType := host.ManagedTypes()
+			mBufferHandle := managedType.NewManagedBufferFromBytes(source)
+			bigIntHandle := managedType.NewBigIntFromInt64(0)
+			*hookReturn = vmhooks.NewVMHooksImpl(host).MBufferToBigIntUnsigned(mBufferHandle, bigIntHandle)
+			value, err := managedType.GetBigInt(bigIntHandle)
+			require.NoError(t, err)
+			*produced = value.Bytes()
+		}
+	}
+
+	t.Run("post-fork: gas covering only the flat charge leaves the destination untouched", func(t *testing.T) {
+		var hookReturn int32
+		var produced []byte
+
+		runManagedBufferHookWithGas(t, 0, 1, toBigInt(&hookReturn, &produced),
+			func(world *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+				verify.OutOfGas().ReturnMessage(vmhost.ErrNotEnoughGas.Error())
+			})
+
+		require.Equal(t, int32(1), hookReturn)
+		require.Empty(t, produced)
+	})
+
+	t.Run("pre-fork: gas covering only the flat charge still parses", func(t *testing.T) {
+		var hookReturn int32
+		var produced []byte
+
+		runManagedBufferHookWithGas(t, preForkFixAuditChangesV5, 1, toBigInt(&hookReturn, &produced),
+			func(world *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+				verify.Ok()
+			})
+
+		require.Equal(t, int32(0), hookReturn)
+		require.Equal(t, source, produced)
+	})
+
+	t.Run("post-fork: gas covering the per-byte charge parses", func(t *testing.T) {
+		var hookReturn int32
+		var produced []byte
+
+		runManagedBufferHookWithGas(t, 0, uint64(1+len(source)), toBigInt(&hookReturn, &produced),
+			func(world *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+				verify.Ok()
+			})
+
+		require.Equal(t, int32(0), hookReturn)
+		require.Equal(t, source, produced)
+	})
 }

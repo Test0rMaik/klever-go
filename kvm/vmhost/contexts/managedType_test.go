@@ -6,6 +6,8 @@ import (
 	"math/big"
 	"testing"
 
+	commonMock "github.com/klever-io/klever-go/common/mock"
+	"github.com/klever-io/klever-go/core"
 	contextmock "github.com/klever-io/klever-go/kvm/mock/context"
 	"github.com/klever-io/klever-go/kvm/vmhost"
 	"github.com/klever-io/klever-go/tools/check"
@@ -742,8 +744,7 @@ func TestManagedTypesContext_SetByteSlice(t *testing.T) {
 	t.Parallel()
 
 	t.Run("handle not found", func(t *testing.T) {
-		host := &contextmock.VMHostStub{}
-		managedTypesCtx, _ := NewManagedTypesContext(host)
+		managedTypesCtx, _ := NewManagedTypesContext(newForkedHostStub())
 
 		ok, err := managedTypesCtx.SetByteSlice(999, 0, 1, []byte{0xAA})
 		require.False(t, ok)
@@ -751,8 +752,7 @@ func TestManagedTypesContext_SetByteSlice(t *testing.T) {
 	})
 
 	t.Run("out of bounds", func(t *testing.T) {
-		host := &contextmock.VMHostStub{}
-		managedTypesCtx, _ := NewManagedTypesContext(host)
+		managedTypesCtx, _ := NewManagedTypesContext(newForkedHostStub())
 		mBufferHandle := managedTypesCtx.NewManagedBufferFromBytes([]byte{1, 2, 3, 4})
 
 		ok, err := managedTypesCtx.SetByteSlice(mBufferHandle, 2, 10, []byte{0xAA})
@@ -766,10 +766,14 @@ func TestManagedTypesContext_SetByteSlice(t *testing.T) {
 		ok, err = managedTypesCtx.SetByteSlice(mBufferHandle, 0, -1, []byte{0xAA})
 		require.False(t, ok)
 		require.Nil(t, err)
+
+		ok, err = managedTypesCtx.SetByteSlice(mBufferHandle, 2147483647, 1, []byte{0xAA})
+		require.False(t, ok)
+		require.Nil(t, err)
 	})
 
 	t.Run("single-copy write", func(t *testing.T) {
-		host := &contextmock.VMHostStub{}
+		host := newForkedHostStub()
 		managedTypesCtx, _ := NewManagedTypesContext(host)
 		mBufferHandle := managedTypesCtx.NewManagedBufferFromBytes([]byte{1, 2, 3, 4})
 
@@ -846,4 +850,205 @@ func TestManagedTypesContext_CleanBackTransfersMustEmptyItsFields(t *testing.T) 
 	// Verifies the fields are empty
 	assert.Equal(t, big.NewInt(0), managedTypesCtx.managedTypesValues.backTransfers.CallValue)
 	assert.Len(t, managedTypesCtx.managedTypesValues.backTransfers.KDATransfers, 0)
+}
+
+func newForkedHostStub() *contextmock.VMHostStub {
+	return &contextmock.VMHostStub{
+		ForkControllerCalled: func() core.ForkController {
+			return commonMock.NewForkControllerStub()
+		},
+	}
+}
+
+func TestGrowManagedBuffer(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a buffer with spare capacity is returned untouched", func(t *testing.T) {
+		t.Parallel()
+
+		buffer := make([]byte, 4, 16)
+		grown := growManagedBuffer(buffer, 10)
+
+		require.Equal(t, 16, cap(grown))
+		require.Equal(t, 4, len(grown))
+		// same backing array, so nothing was copied
+		require.Equal(t, &buffer[0], &grown[0])
+	})
+
+	t.Run("a full buffer doubles", func(t *testing.T) {
+		t.Parallel()
+
+		buffer := make([]byte, 8, 8)
+		grown := growManagedBuffer(buffer, 9)
+
+		require.Equal(t, 16, cap(grown))
+		require.Equal(t, 8, len(grown))
+	})
+
+	t.Run("doubling that still does not fit grows to exactly what is needed", func(t *testing.T) {
+		t.Parallel()
+
+		buffer := make([]byte, 8, 8)
+		grown := growManagedBuffer(buffer, 100)
+
+		require.Equal(t, 100, cap(grown))
+	})
+
+	t.Run("growing from empty allocates exactly what is needed", func(t *testing.T) {
+		t.Parallel()
+
+		grown := growManagedBuffer(make([]byte, 0), 7)
+
+		require.Equal(t, 7, cap(grown))
+		require.Equal(t, 0, len(grown))
+	})
+
+	t.Run("the existing bytes survive the move", func(t *testing.T) {
+		t.Parallel()
+
+		buffer := []byte("abcd")
+		grown := growManagedBuffer(buffer[:len(buffer):len(buffer)], 5)
+
+		require.Equal(t, []byte("abcd"), grown)
+	})
+}
+
+// TestAppendBytesCapacityIsDeterministic pins the capacity a managed buffer has after a fixed
+// sequence of appends. The gas charged for an append depends on whether the buffer has to
+// reallocate, so the capacity is consensus-critical: if it were left to Go's append, the
+// allocator's size classes and growth formula (both unspecified, both changed between releases)
+// would decide it, and two nodes built with different toolchains could charge different gas for
+// the same transaction. A failure here means a repricing, not just a refactor.
+func TestAppendBytesCapacityIsDeterministic(t *testing.T) {
+	t.Parallel()
+
+	host := &contextmock.VMHostStub{}
+	managedTypesCtx, err := NewManagedTypesContext(host)
+	require.Nil(t, err)
+
+	handle := managedTypesCtx.NewManagedBuffer()
+
+	// each step appends 10 bytes; capacity doubles only when the append does not fit
+	expectedCapacities := []int{10, 20, 40, 40, 80, 80, 80, 80, 160, 160}
+	for step, expectedCapacity := range expectedCapacities {
+		require.True(t, managedTypesCtx.AppendBytes(handle, make([]byte, 10)))
+
+		buffer := managedTypesCtx.managedTypesValues.mBufferValues[handle]
+		require.Equalf(t, (step+1)*10, len(buffer), "length after step %d", step)
+		require.Equalf(t, expectedCapacity, cap(buffer), "capacity after step %d", step)
+	}
+}
+
+// TestSetBytesLeavesNoSpareCapacity pins the property the audit finding rests on: a buffer seeded
+// through SetBytes has len == cap, so the very next append does copy the whole accumulator and
+// must be charged for it.
+func TestSetBytesLeavesNoSpareCapacity(t *testing.T) {
+	t.Parallel()
+
+	host := &contextmock.VMHostStub{}
+	managedTypesCtx, err := NewManagedTypesContext(host)
+	require.Nil(t, err)
+
+	handle := managedTypesCtx.NewManagedBuffer()
+	managedTypesCtx.SetBytes(handle, bytes.Repeat([]byte{'a'}, 1000))
+
+	buffer := managedTypesCtx.managedTypesValues.mBufferValues[handle]
+	require.Equal(t, 1000, len(buffer))
+	require.Equal(t, 1000, cap(buffer))
+	require.True(t, appendWillReallocate(buffer, 1))
+}
+
+// TestSetByteSliceLeavesNoSpareCapacity does the same for the other path that replaces a buffer's
+// backing array, so no hook can leave a runtime-chosen capacity behind in the map
+func TestSetByteSliceLeavesNoSpareCapacity(t *testing.T) {
+	t.Parallel()
+
+	managedTypesCtx, err := NewManagedTypesContext(newForkedHostStub())
+	require.Nil(t, err)
+
+	handle := managedTypesCtx.NewManagedBuffer()
+	managedTypesCtx.SetBytes(handle, bytes.Repeat([]byte{'a'}, 100))
+	// grow the capacity past the length so the check below is meaningful
+	require.True(t, managedTypesCtx.AppendBytes(handle, []byte{'b'}))
+	require.Greater(t, cap(managedTypesCtx.managedTypesValues.mBufferValues[handle]), 101)
+
+	ok, err := managedTypesCtx.SetByteSlice(handle, 0, 4, []byte("zzzz"))
+	require.Nil(t, err)
+	require.True(t, ok)
+
+	buffer := managedTypesCtx.managedTypesValues.mBufferValues[handle]
+	require.Equal(t, 101, len(buffer))
+	require.Equal(t, 101, cap(buffer))
+}
+
+// TestInsertSliceLeavesAPolicyChosenCapacity closes the last path that could leave a runtime-chosen
+// capacity in the map. InsertSlice used to build its result with append, so the allocator's size
+// classes decided the capacity, and the gas a later append charges reads cap(). Two nodes built
+// with different toolchains would then have charged different gas for the same call. The hook is
+// not wired to the VM today, which is exactly why it needs a test: wiring it later must not
+// silently reintroduce the divergence.
+func TestInsertSliceLeavesAPolicyChosenCapacity(t *testing.T) {
+	t.Parallel()
+
+	managedTypesCtx, err := NewManagedTypesContext(newForkedHostStub())
+	require.Nil(t, err)
+
+	handle := managedTypesCtx.NewManagedBuffer()
+	managedTypesCtx.SetBytes(handle, bytes.Repeat([]byte{'a'}, 1000))
+
+	_, err = managedTypesCtx.InsertSlice(handle, 0, make([]byte, 100))
+	require.Nil(t, err)
+
+	buffer := managedTypesCtx.managedTypesValues.mBufferValues[handle]
+	require.Equal(t, 1100, len(buffer))
+	// what the growth policy dictates for 1000 bytes that must hold 1100, not a size class
+	require.Equal(t, cap(growManagedBuffer(make([]byte, 1000, 1000), 1100)), cap(buffer))
+}
+
+// TestInsertSliceDoesNotMutateTheCallerSlice pins the other half of the same rewrite. The old
+// implementation appended the buffer's tail onto the caller's slice, so a slice handed in with
+// spare capacity had that spare capacity overwritten.
+func TestInsertSliceDoesNotMutateTheCallerSlice(t *testing.T) {
+	t.Parallel()
+
+	managedTypesCtx, err := NewManagedTypesContext(newForkedHostStub())
+	require.Nil(t, err)
+
+	handle := managedTypesCtx.NewManagedBuffer()
+	managedTypesCtx.SetBytes(handle, []byte("HELLO-WORLD"))
+
+	inserted := make([]byte, 3, 16)
+	copy(inserted, "xyz")
+	spare := inserted[:16][3:]
+	for i := range spare {
+		spare[i] = '.'
+	}
+
+	buffer, err := managedTypesCtx.InsertSlice(handle, 5, inserted)
+	require.Nil(t, err)
+	require.Equal(t, []byte("HELLOxyz-WORLD"), buffer)
+	require.Equal(t, bytes.Repeat([]byte{'.'}, 13), spare)
+}
+
+// TestDeleteSliceKeepsThePolicyCapacity is the last write path into mBufferValues. DeleteSlice
+// only ever shrinks, so it reuses the backing array and cannot introduce a runtime-chosen
+// capacity - but it is asserted rather than assumed, so that the four paths together state the
+// invariant the append gas depends on: every capacity in the map is one growManagedBuffer chose.
+func TestDeleteSliceKeepsThePolicyCapacity(t *testing.T) {
+	t.Parallel()
+
+	managedTypesCtx, err := NewManagedTypesContext(newForkedHostStub())
+	require.Nil(t, err)
+
+	handle := managedTypesCtx.NewManagedBuffer()
+	managedTypesCtx.SetBytes(handle, bytes.Repeat([]byte{'a'}, 1000))
+	require.True(t, managedTypesCtx.AppendBytes(handle, make([]byte, 100)))
+	capacityBefore := cap(managedTypesCtx.managedTypesValues.mBufferValues[handle])
+
+	_, err = managedTypesCtx.DeleteSlice(handle, 10, 50)
+	require.Nil(t, err)
+
+	buffer := managedTypesCtx.managedTypesValues.mBufferValues[handle]
+	require.Equal(t, 1050, len(buffer))
+	require.Equal(t, capacityBefore, cap(buffer))
 }

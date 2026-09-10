@@ -41,3 +41,28 @@ func TestInverseBytes(t *testing.T) {
 	result = InverseBytes([]byte("a"))
 	require.Equal(t, []byte("a"), result)
 }
+
+func TestSliceIsOutOfBounds(t *testing.T) {
+	t.Parallel()
+
+	const bufferLength = 8
+
+	inBounds := []struct{ start, length int32 }{{0, 0}, {0, 8}, {2, 6}, {8, 0}}
+	outOfBounds := []struct{ start, length int32 }{{-1, 1}, {0, -1}, {0, 9}, {8, 1}}
+
+	for _, fixAuditChangesV5 := range []bool{false, true} {
+		for _, c := range inBounds {
+			require.False(t, SliceIsOutOfBounds(fixAuditChangesV5, c.start, c.length, bufferLength), "fork=%v %+v", fixAuditChangesV5, c)
+		}
+		for _, c := range outOfBounds {
+			require.True(t, SliceIsOutOfBounds(fixAuditChangesV5, c.start, c.length, bufferLength), "fork=%v %+v", fixAuditChangesV5, c)
+		}
+	}
+
+	// start+length wraps to a negative int32: pre-fork the legacy arithmetic lets it through
+	// (the caller's slice expression then panics), post-fork it is rejected up front
+	require.False(t, SliceIsOutOfBounds(false, 2147483647, 1, bufferLength))
+	require.True(t, SliceIsOutOfBounds(true, 2147483647, 1, bufferLength))
+	require.False(t, SliceIsOutOfBounds(false, 0x40000000, 0x40000000, bufferLength))
+	require.True(t, SliceIsOutOfBounds(true, 0x40000000, 0x40000000, bufferLength))
+}

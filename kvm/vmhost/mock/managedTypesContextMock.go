@@ -22,6 +22,8 @@ type ManagedTypesContextMock struct {
 	ConsumeGasForThisBigIntNumberOfBytesCalled     func(byteLen *big.Int) error
 	ConsumeGasForThisIntNumberOfBytesCalled        func(byteLen int)
 	ConsumeGasForBytesCalled                       func(bytes []byte)
+	ConsumeGasForByteLenBoundedCalled              func(byteLen uint64) error
+	ConsumeGasForAppendCalled                      func(mBufferHandle int32, dataLength int32) error
 	ConsumeGasForBigIntCopyCalled                  func(values ...*big.Int)
 	ConsumeGasForBigFloatCopyCalled                func(values ...*big.Float)
 	NewBigIntCalled                                func(value *big.Int) int32
@@ -123,6 +125,20 @@ func (m *ManagedTypesContextMock) ConsumeGasForBytes(bytes []byte) {
 	if m.ConsumeGasForBytesCalled != nil {
 		m.ConsumeGasForBytesCalled(bytes)
 	}
+}
+
+func (m *ManagedTypesContextMock) ConsumeGasForByteLenBounded(byteLen uint64) error {
+	if m.ConsumeGasForByteLenBoundedCalled != nil {
+		return m.ConsumeGasForByteLenBoundedCalled(byteLen)
+	}
+	return nil
+}
+
+func (m *ManagedTypesContextMock) ConsumeGasForAppend(mBufferHandle int32, dataLength int32) error {
+	if m.ConsumeGasForAppendCalled != nil {
+		return m.ConsumeGasForAppendCalled(mBufferHandle, dataLength)
+	}
+	return nil
 }
 
 func (m *ManagedTypesContextMock) ConsumeGasForBigIntCopy(values ...*big.Int) {
