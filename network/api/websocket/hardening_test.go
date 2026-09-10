@@ -3,6 +3,7 @@ package websocket_test
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"net"
 	"net/http"
 	"strings"
@@ -158,6 +159,86 @@ func TestSubscribe_ConnectionCap_ReleasedOnClose(t *testing.T) {
 		_ = c.Close()
 		return true
 	}, 3*time.Second, 50*time.Millisecond, "slot must be released after the connection closes")
+}
+
+// requireClosed asserts the server closed conn. A read deadline expiring is an error
+// too, so "the read failed" alone would also hold for a connection that was wrongly kept
+// open. Only a non-timeout failure proves the peer actually went away.
+func requireClosed(t *testing.T, conn *websocket.Conn, msg string) {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, _, err := conn.ReadMessage()
+	require.Error(t, err, msg)
+
+	var netErr net.Error
+	require.False(t, errors.As(err, &netErr) && netErr.Timeout(), msg)
+}
+
+// TestSubscribe_HubShutdownClosesTheConnection covers processSubscription's insertion
+// failure path: once StartServer has torn the hub down, a fresh subscribe must be closed
+// rather than registered into a hub that has already shut down (the closed flag deleteAll
+// sets).
+func TestSubscribe_HubShutdownClosesTheConnection(t *testing.T) {
+	hub := socket.NewHub("", "", nil)
+	hubCtx, stopHub := context.WithCancel(context.Background())
+	go hub.StartServer(hubCtx)
+
+	addr, cleanup := startTestServerOpts(t, hub, wsocket.SubscribeOptions{})
+	defer cleanup()
+
+	subscribe := func(t *testing.T) *websocket.Conn {
+		t.Helper()
+		conn, _, err := websocket.DefaultDialer.Dial("ws://"+addr+"/subscribe", nil)
+		require.NoError(t, err)
+		require.NoError(t, conn.WriteJSON(map[string]interface{}{
+			"subscribed_types": []string{"blocks"},
+			"addresses":        []string{"klv1a"},
+		}))
+		return conn
+	}
+
+	// deleteAll sets the closed flag under the same lock, before it closes any
+	// connection, so this socket dying is a happens-after edge on the flag: whether the
+	// client was inserted first (deleteAll closes it) or not (the insertion is refused
+	// and processSubscription closes it), the next subscribe is guaranteed to see it.
+	live := subscribe(t)
+	defer live.Close()
+
+	stopHub()
+	requireClosed(t, live, "hub teardown must close the live connection")
+
+	next := subscribe(t)
+	defer next.Close()
+
+	requireClosed(t, next, "a subscribe against a shut-down hub must be closed, not registered")
+}
+
+// TestSubscribe_OversizedAddressReportsTheReasonThenCloses covers the cap rejection. It is
+// reachable on any fresh connection — the route's own pre-check bounds the address count,
+// not each address's byte length — so the peer must be told why rather than having the
+// socket dropped on it. The route rejects before NewClient, while it still owns the raw
+// connection and a write is safe.
+func TestSubscribe_OversizedAddressReportsTheReasonThenCloses(t *testing.T) {
+	hub := socket.NewHub("", "", nil)
+	addr, cleanup := startTestServerOpts(t, hub, wsocket.SubscribeOptions{})
+	defer cleanup()
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws://"+addr+"/subscribe", nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	require.NoError(t, conn.WriteJSON(map[string]interface{}{
+		"subscribed_types": []string{"accounts"},
+		"addresses":        []string{strings.Repeat("a", 63)}, // one past the 62-byte address cap
+	}))
+
+	var rejection map[string]string
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	require.NoError(t, conn.ReadJSON(&rejection), "the peer must be told why it was rejected")
+	require.Contains(t, rejection["error"], "maximum length",
+		"the reason must name the limit that was exceeded")
+
+	requireClosed(t, conn, "a subscribe with an oversized address must be closed, not registered")
 }
 
 // TestSubscribe_Secured confirms the AuthHandlers wiring runs before the WebSocket

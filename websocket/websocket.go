@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/klever-io/klever-go/cmd/operator/utils"
 
@@ -33,6 +35,17 @@ const (
 	errBlockNotFound    = "block not found"
 
 	postQueueDropLogIntervalSeconds = 10
+
+	// peerFailLogOp labels the shutdown summaries for the peer-driven failure budgets.
+	peerFailLogOp = "ws.peerFailures"
+)
+
+var (
+	// ErrClientClosed is returned by HandleClientInsertion when the client's connection is
+	// already being torn down. Classify it with errors.Is, not by string equality.
+	ErrClientClosed = errors.New("client connection is closed")
+	// ErrHubClosed is returned by HandleClientInsertion once the hub has shut down.
+	ErrHubClosed = errors.New("websocket hub is shutting down")
 )
 
 // dropWarner rate-limits a recurring warning behind a fixed window: every occurrence
@@ -87,7 +100,17 @@ type SocketHub struct {
 	addressSubscription     map[string]map[*client]userOptions
 	clientAddresses         map[*client]int
 	limits                  resolvedLimits
-	unregister              chan *client
+	// clients is every client the hub has accepted, so deleteAll can close all of them.
+	// The subscription maps alone are not enough: an address-scoped subscribe with an
+	// empty address list (or an unsubscribe that empties the last one) leaves a live
+	// client in none of them, and shutdown would then never close its socket.
+	clients map[*client]struct{}
+	// closed is set by deleteAll (under mu) once StartServer's shutdown has torn the hub
+	// down. A client created but not yet inserted is in no map and in no clients entry, so
+	// deleteAll cannot reach it; without this flag its insertion would register into a dead
+	// hub, and its map entries, goroutines and connection-limiter slot would outlive
+	// shutdown for as long as the peer holds the socket.
+	closed bool
 	// postQueue feeds the bounded postWSConnection worker pool; nil when the mirror is
 	// disabled (no URL configured — see NewHub), so asyncPost is a no-op and never
 	// allocates a goroutine or channel slot for a feature nobody turned on.
@@ -101,6 +124,15 @@ type SocketHub struct {
 	// window.
 	queueDropWarn dropWarner
 	postFailWarn  dropWarner
+	rejectWarn    dropWarner
+	// One budget per peer-driven failure source; see logPeerDrivenFailure for why they
+	// are not shared.
+	upgradeFailWarn   dropWarner
+	handshakeFailWarn dropWarner
+	readFailWarn      dropWarner
+	sendDropWarn      dropWarner
+	writeFailWarn     dropWarner
+	queryFailWarn     dropWarner
 	// appStatusHandler exports the mirror's cumulative drop/failure counts (see
 	// MetricWSMirrorQueueDroppedTotal/MetricWSMirrorPostFailuresTotal) alongside the
 	// rate-limited WARN logs above — the log is a periodic sample, this is the exact
@@ -138,7 +170,7 @@ func NewHub(postConnectionURL, postConnectionAPIKey string, facade WSFacade, lim
 	}
 
 	return &SocketHub{
-		unregister:              make(chan *client),
+		clients:                 make(map[*client]struct{}),
 		addressSubscription:     make(map[string]map[*client]userOptions),
 		clientAddresses:         make(map[*client]int),
 		blockSubscription:       make(map[*client]struct{}),
@@ -150,6 +182,13 @@ func NewHub(postConnectionURL, postConnectionAPIKey string, facade WSFacade, lim
 		postQueue:               postQueue,
 		queueDropWarn:           dropWarner{windowSecs: postQueueDropLogIntervalSeconds},
 		postFailWarn:            dropWarner{windowSecs: postQueueDropLogIntervalSeconds},
+		rejectWarn:              dropWarner{windowSecs: postQueueDropLogIntervalSeconds},
+		upgradeFailWarn:         dropWarner{windowSecs: postQueueDropLogIntervalSeconds},
+		handshakeFailWarn:       dropWarner{windowSecs: postQueueDropLogIntervalSeconds},
+		readFailWarn:            dropWarner{windowSecs: postQueueDropLogIntervalSeconds},
+		sendDropWarn:            dropWarner{windowSecs: postQueueDropLogIntervalSeconds},
+		writeFailWarn:           dropWarner{windowSecs: postQueueDropLogIntervalSeconds},
+		queryFailWarn:           dropWarner{windowSecs: postQueueDropLogIntervalSeconds},
 		appStatusHandler:        statusHandler.NewNilStatusHandler(),
 	}
 }
@@ -265,6 +304,20 @@ func (h *SocketHub) marshalAndPost(evType indexer.EventType, address, hash strin
 }
 
 func (h *SocketHub) StartServer(ctx context.Context) {
+	// deleteAll sets closed on shutdown and nothing else clears it, so a hub whose context
+	// was cancelled would reject every insertion forever. Clear it here rather than leaving
+	// the type single-use — the drop-warner flush below already reasons about hub reuse.
+	//
+	// This makes a hub restartable after a previous StartServer has RETURNED, not while one
+	// is still running. Overlapping calls are still wrong and always were: cancel A, start B
+	// before A reaches its teardown, and A's deleteAll then closes B's clients and leaves
+	// closed set under a running B — and A's postWorkersWG.Wait() can block on B's workers.
+	// Serialising starts is the caller's contract; no production caller overlaps them
+	// (network/api/api.go builds a fresh hub per registration).
+	h.mu.Lock()
+	h.closed = false
+	h.mu.Unlock()
+
 	h.startPostWorkers(ctx)
 	for {
 		select {
@@ -283,9 +336,31 @@ func (h *SocketHub) StartServer(ctx context.Context) {
 			if count, ok := h.postFailWarn.flush(); ok {
 				log.Warn("ws.EventReceive.postWSConnection", "msg", "failed to post to mirror (final)", "failedCount", count)
 			}
+			// Same reasoning for the peer-driven budgets: without this, the tail of a burst
+			// that stops before the next window opens is never reported at all.
+			//
+			// Best effort, not exhaustive: deleteAll closes clients but does not join their
+			// reader, writer and request goroutines, so an occurrence that lands after this
+			// point — a query still inside the facade, say — is counted into a window that
+			// nothing will report. Joining them would need a lifecycle these types do not
+			// have today.
+			for _, final := range []struct {
+				warner *dropWarner
+				msg    string
+			}{
+				{&h.upgradeFailWarn, "websocket upgrades failed (final)"},
+				{&h.handshakeFailWarn, "subscribe handshakes failed (final)"},
+				{&h.readFailWarn, "connection reads failed without a close frame (final)"},
+				{&h.sendDropWarn, "responses dropped on full client buffers (final)"},
+				{&h.writeFailWarn, "connection writes failed (final)"},
+				{&h.queryFailWarn, "client queries failed (final)"},
+				{&h.rejectWarn, "subscription inserts rejected at a cap (final)"},
+			} {
+				if count, ok := final.warner.flush(); ok {
+					log.Warn(peerFailLogOp, "msg", final.msg, "count", count)
+				}
+			}
 			return
-		case client := <-h.unregister:
-			h.handleClientDelete(client)
 		case event := <-indexer.EventQueue:
 			h.mu.RLock()
 			blockCount, txCount := len(h.blockSubscription), len(h.transactionSubscription)
@@ -419,19 +494,160 @@ func marshalMessage(evType indexer.EventType, address string, hash string, messa
 	}, nil
 }
 
-// RemoveClient remove client from hub
-func (h *SocketHub) RemoveClient(c *client) {
-	h.unregister <- c
+// logPeerDrivenFailure folds a failure a peer can provoke at will into at most one line per
+// window: one line per occurrence would hand a peer control of the node's log volume.
+//
+// Each source owns its budget rather than sharing one, because only the caller that opens a
+// window has its op and err logged — every other occurrence survives as a bare count under
+// that caller's message. Sharing would let a flood of the cheapest failure (a bare GET to
+// /subscribe) hide the identity of a rarer one (an established connection's read fault) for
+// as long as the flood lasts, not merely for one window.
+//
+// Warn rather than Error because these are usually the peer's doing, though not always: an
+// upgrade can fail on this side, and a transport error does not say which end broke.
+func (h *SocketHub) logPeerDrivenFailure(warner *dropWarner, op string, err error) {
+	if count, ok := warner.fire(); ok {
+		log.Warn(op, "err", loggableError(err), "similarSinceLastLog", count)
+	}
 }
 
-func (h *SocketHub) HandleClientInsertion(eventType []indexer.EventType, addresses []string, c *client) error {
+// LogUpgradeFailure reports a websocket upgrade that never completed — a request with no
+// upgrade headers reaches it, so anyone who can open a TCP connection can drive it.
+func (h *SocketHub) LogUpgradeFailure(op string, err error) {
+	h.logPeerDrivenFailure(&h.upgradeFailWarn, op, err)
+}
+
+// LogHandshakeFailure reports a subscribe handshake that never produced a usable request:
+// malformed JSON, a wrong-typed field, or a close before it arrived.
+func (h *SocketHub) LogHandshakeFailure(op string, err error) {
+	h.logPeerDrivenFailure(&h.handshakeFailWarn, op, err)
+}
+
+// logReadFailure reports a read on an established connection that failed with no close
+// frame at all. Gorilla's IsUnexpectedCloseError answers false for every one of these, so
+// before they were routed here they were dropped silently rather than logged.
+func (h *SocketHub) logReadFailure(op string, err error) {
+	h.logPeerDrivenFailure(&h.readFailWarn, op, err)
+}
+
+// logSendDrop reports a response dropped because the client's output buffer was full. A
+// peer that keeps sending requests while never draining its socket fills the buffer and
+// then earns a line per dropped response, so this needs the same bound as the rest.
+func (h *SocketHub) logSendDrop(op string, msg string) {
+	if count, ok := h.sendDropWarn.fire(); ok {
+		log.Warn(op, "msg", msg, "similarSinceLastLog", count)
+	}
+}
+
+// logWriteFailure reports a failed write or ping on an established connection. Each one
+// tears the connection down, so it is bounded per connection — but a peer reconnecting in
+// a loop repeats it, and that is what the shared window bounds.
+func (h *SocketHub) logWriteFailure(op string, err error) {
+	h.logPeerDrivenFailure(&h.writeFailWarn, op, err)
+}
+
+// logQueryFailure reports a failed get_transaction/get_block lookup. Asking for something
+// that is not there is ordinary client behaviour and a peer can repeat it indefinitely on
+// one connection, so the volume is bounded and the peer-supplied hash is not logged raw:
+// it is capped only by the inbound message limit and could otherwise carry newlines into
+// the log. See loggableHash.
+func (h *SocketHub) logQueryFailure(op string, key string, value interface{}, err error) {
+	if count, ok := h.queryFailWarn.fire(); ok {
+		log.Warn(op, key, value, "err", loggableError(err), "similarSinceLastLog", count)
+	}
+}
+
+// loggableError renders an error the peer had a hand in producing. Sanitising only the
+// fields we choose is not enough, because the error text carries peer input back out on its
+// own: a storage miss quotes the whole key it was handed, so bounding the hash field alone
+// still let a 100KB hash reach the log through err. A websocket close reason arrives the
+// same way — gorilla puts it verbatim in CloseError.Error(), and the logger's formatter
+// passes CR/LF through, so a reason of "\nWARN ..." forges a log line of its own.
+func loggableError(err error) string {
+	const maxLoggableErrorLength = 256
+
+	if err == nil {
+		return ""
+	}
+
+	text := err.Error()
+	if len(text) > maxLoggableErrorLength {
+		text = text[:maxLoggableErrorLength] + fmt.Sprintf("… (%d bytes)", len(text))
+	}
+
+	// Anything that could end a log line becomes a space: CR/LF, the other control runes,
+	// and the Unicode line/paragraph separators, which IsControl does not cover and some
+	// aggregators treat as newlines. This guards line structure only. The logger renders
+	// "name = value", so an "=" inside a value can still read as an extra field to a human;
+	// mapping it would mangle ordinary errors ("key=value not found") to defend against a
+	// far weaker forgery than a line break, so it is left alone.
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			return ' '
+		}
+
+		return r
+	}, text)
+}
+
+// loggableHash renders a peer-supplied hash safely: a well-formed one is returned as-is,
+// and anything else is reduced to its length. A hash is hex, so a value that is not is
+// already not a hash — logging its bytes would only put peer-controlled content, newlines
+// included, into the log.
+func loggableHash(hash string) string {
+	const maxLoggableHashLength = 64
+
+	if len(hash) > maxLoggableHashLength {
+		return fmt.Sprintf("<%d bytes>", len(hash))
+	}
+
+	for _, r := range hash {
+		isHex := (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+		if !isHex {
+			return fmt.Sprintf("<%d bytes, not hex>", len(hash))
+		}
+	}
+
+	return hash
+}
+
+// LogRejectedInsertion reports a rejected insertion at the level its cause deserves.
+// Losing a race with teardown is routine and peer-triggerable, so it stays at Debug. The
+// cap rejections are the abuse signal (GHSA-4fwh-wrm6-97xm) and stay at Warn, where a
+// default *:INFO node still sees them — but a peer can provoke them too, so they are
+// folded into one summary line per window instead of one line per occurrence.
+func (h *SocketHub) LogRejectedInsertion(op string, err error) {
+	if errors.Is(err, ErrClientClosed) || errors.Is(err, ErrHubClosed) {
+		log.Debug(op, "err", err.Error())
+		return
+	}
+
+	if count, ok := h.rejectWarn.fire(); ok {
+		log.Warn(op, "err", loggableError(err), "rejectedSinceLastLog", count)
+	}
+}
+
+// RemoveClient closes c and removes it from the hub. It runs the teardown inline rather
+// than handing it to StartServer, so it stays safe to call once the hub has shut down.
+func (h *SocketHub) RemoveClient(c *client) {
+	h.handleClientDelete(c)
+}
+
+// ValidateSubscription applies the input caps HandleClientInsertion enforces before it
+// touches any state. It is exported so a route can reject a bad subscribe with a reason
+// frame while it still owns the raw connection — once NewClient has started loopIn/loopOut
+// there is no longer a safe way to write one. HandleClientInsertion repeats the checks
+// rather than trusting callers: it is also reached from handleDynamicSubscribe.
+func (h *SocketHub) ValidateSubscription(eventType []indexer.EventType, addresses []string) error {
 	// Addresses are only meaningful for the address-scoped types (ACCOUNTS,
 	// USER_TRANSACTIONS). A blocks/transactions-only subscribe must not count or
 	// store them, or it would burn the per-connection address budget on entries
 	// that never match anything (GHSA-4fwh-wrm6-97xm, Impact C).
-	wantsAddresses := containsAddressScoped(eventType)
+	if !containsAddressScoped(eventType) {
+		return nil
+	}
 
-	if wantsAddresses && len(addresses) > h.limits.maxAddressesPerSubscribe {
+	if len(addresses) > h.limits.maxAddressesPerSubscribe {
 		return fmt.Errorf("too many addresses in a single subscribe: %d (max %d)", len(addresses), h.limits.maxAddressesPerSubscribe)
 	}
 
@@ -439,22 +655,42 @@ func (h *SocketHub) HandleClientInsertion(eventType []indexer.EventType, address
 	// caps alone leave a memory-amplification path: a long-lived connection could otherwise
 	// keep sending unique oversized strings that can never match a real address yet are
 	// retained per connection (GHSA-4fwh-wrm6-97xm).
-	if wantsAddresses {
-		for _, address := range addresses {
-			if len(address) > maxEncodedAddressLength {
-				return fmt.Errorf("subscription address exceeds the maximum length of %d bytes", maxEncodedAddressLength)
-			}
+	for _, address := range addresses {
+		if len(address) > maxEncodedAddressLength {
+			return fmt.Errorf("subscription address exceeds the maximum length of %d bytes", maxEncodedAddressLength)
 		}
+	}
+
+	return nil
+}
+
+func (h *SocketHub) HandleClientInsertion(eventType []indexer.EventType, addresses []string, c *client) error {
+	wantsAddresses := containsAddressScoped(eventType)
+
+	if err := h.ValidateSubscription(eventType, addresses); err != nil {
+		return err
 	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	if h.closed {
+		return ErrHubClosed
+	}
+
+	if !c.IsAlive() {
+		return ErrClientClosed
+	}
 
 	// Reject before mutating if the per-connection cap would be exceeded; only addresses
 	// new to this client count.
 	if wantsAddresses && h.clientAddresses[c]+h.countNewAddresses(addresses, c) > h.limits.maxAddressesPerClient {
 		return fmt.Errorf("address subscription limit reached for this connection (max %d)", h.limits.maxAddressesPerClient)
 	}
+
+	// Track the client itself, not just its subscriptions: an address-scoped subscribe with
+	// an empty address list writes to no map, and deleteAll must still close it.
+	h.clients[c] = struct{}{}
 
 	acceptAccounts, acceptTransactions := h.applyEventTypes(eventType, c)
 	if wantsAddresses {
@@ -537,37 +773,31 @@ func (h *SocketHub) addAddressSubscriptions(addresses []string, c *client, accep
 	}
 }
 
-func closeAndClear(subscription map[*client]struct{}) {
-	for c := range subscription {
-		c.close()
-		delete(subscription, c)
-	}
-}
-
 func (h *SocketHub) deleteAll() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	for addr, clients := range h.addressSubscription {
-		for cl := range clients {
-			cl.close()
-			delete(clients, cl)
-		}
-		delete(h.addressSubscription, addr)
-	}
-	h.clientAddresses = make(map[*client]int)
+	h.closed = true
 
-	closeAndClear(h.blockSubscription)
-	closeAndClear(h.transactionSubscription)
+	for c := range h.clients {
+		c.Close()
+	}
+	clear(h.clients)
+
+	clear(h.addressSubscription)
+	clear(h.clientAddresses)
+	clear(h.blockSubscription)
+	clear(h.transactionSubscription)
 }
 
 func (h *SocketHub) handleClientDelete(c *client) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	delete(h.clients, c)
 	delete(h.blockSubscription, c)
 	delete(h.transactionSubscription, c)
-	c.close()
+	c.Close()
 	// Remove the client from every watched address and reclaim the outer key when its
 	// inner map empties. Without this, a disconnect leaks one map entry per address
 	// permanently (GHSA-4fwh-wrm6-97xm, Impact C).
@@ -614,7 +844,7 @@ func (h *SocketHub) handleGetTransaction(c *client, req WSRequest) {
 
 	tx, err := h.facade.GetTransaction(params.Hash, params.WithResults)
 	if err != nil {
-		log.Warn("ws.handleGetTransaction", "hash", params.Hash, "err", err.Error())
+		h.logQueryFailure("ws.handleGetTransaction", "hash", loggableHash(params.Hash), err)
 		c.send(WSResponse{ID: req.ID, Error: errTxNotFound})
 		return
 	}
@@ -642,7 +872,7 @@ func (h *SocketHub) handleGetBlock(c *client, req WSRequest) {
 	if params.Nonce != nil {
 		blk, err := h.facade.GetBlockByNonce(*params.Nonce, params.WithTxs)
 		if err != nil {
-			log.Warn("ws.handleGetBlock", "nonce", *params.Nonce, "err", err.Error())
+			h.logQueryFailure("ws.handleGetBlock", "nonce", *params.Nonce, err)
 			c.send(WSResponse{ID: req.ID, Error: errBlockNotFound})
 			return
 		}
@@ -652,7 +882,7 @@ func (h *SocketHub) handleGetBlock(c *client, req WSRequest) {
 
 	blk, err := h.facade.GetBlockByHash(params.Hash, params.WithTxs)
 	if err != nil {
-		log.Warn("ws.handleGetBlock", "hash", params.Hash, "err", err.Error())
+		h.logQueryFailure("ws.handleGetBlock", "hash", loggableHash(params.Hash), err)
 		c.send(WSResponse{ID: req.ID, Error: errBlockNotFound})
 		return
 	}
@@ -685,6 +915,13 @@ func (h *SocketHub) handleDynamicSubscribe(c *client, req WSRequest) {
 	}
 
 	if err := h.HandleClientInsertion(eventTypes, params.Addresses, c); err != nil {
+		// Answer with the state of the client's own connection rather than the node's
+		// shutdown state. Defensive only: reaching here means the client completed its
+		// initial insertion, so it is in h.clients and deleteAll always closes it before
+		// closed can be observed — c.send is then a no-op and no peer sees either error.
+		if errors.Is(err, ErrHubClosed) {
+			err = ErrClientClosed
+		}
 		c.send(WSResponse{ID: req.ID, Error: err.Error()})
 		return
 	}

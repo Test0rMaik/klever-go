@@ -3,6 +3,8 @@ package websocket
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"sync"
 	"time"
 
@@ -52,17 +54,22 @@ func (c *client) send(msg interface{}) {
 	select {
 	case c.out <- msg:
 	default:
-		log.Warn("ws.send", "msg", "client output buffer full, dropping message")
+		c.hub.logSendDrop("ws.send", "client output buffer full, dropping message")
 	}
 }
 
-// close call this function to close client connection and remove from hub
-func (c *client) close() {
+// Close tears the connection down through the client, so its loopIn/loopOut goroutines
+// see alive=false and stop. Always prefer it over closing the raw *ws.Conn: the extra
+// close and the read-deadline call it strands both log an error nobody needs to see.
+// Idempotent.
+func (c *client) Close() {
 	c.aliveLock.Lock()
 	defer c.aliveLock.Unlock()
 	if c.alive {
 		if err := c.conn.Close(); err != nil {
-			log.Warn("ws.close", "err", err.Error())
+			// Usually local, but it is still one line per connection in the worst case and
+			// it is the same teardown class as loopOut's write failures.
+			c.hub.logWriteFailure("ws.close", err)
 		}
 		c.alive = false
 		c.cancel()
@@ -73,19 +80,42 @@ func (c *client) close() {
 	}
 }
 
+// unexpectedClose reports whether a read error ended the connection in a way that says
+// anything about this node. The peer chooses the code it closes with, so no close frame is
+// evidence of a problem here — listing "ordinary" codes and warning on the rest only moves
+// the lever, because the peer just picks a code that is not on the list. 1006 is included:
+// gorilla synthesises it when the connection drops without a close frame, which is what an
+// abandoned socket looks like. What remains is a read that failed without any close frame
+// at all, and even that is rate-limited at the call site.
+func unexpectedClose(err error) bool {
+	var closeErr *ws.CloseError
+	if errors.As(err, &closeErr) {
+		return false
+	}
+
+	// Only our own Close() produces this — a peer cannot make the server's socket report
+	// itself closed — so it is teardown, not a read failure. Counting it would bill the
+	// read budget for every shutdown, every write failure and every rejected insert, which
+	// is exactly the cross-contamination the per-source budgets exist to prevent.
+	return !errors.Is(err, net.ErrClosed)
+}
+
 // watch this function read client messages to check if client cancel the conn or send a ping
 func (c *client) loopIn() {
 	defer func() {
-		c.close()
+		c.Close()
 		c.hub.handleClientDelete(c)
 	}()
-
+	label := "ws.loopIn"
 	// Bound every inbound frame and keep a lifetime read deadline, refreshed by the pong
 	// handler and each read. loopOut's pings keep a live client warm while a dead/idle one
 	// is reclaimed at pongWait (GHSA-4fwh-wrm6-97xm).
 	c.conn.SetReadLimit(c.hub.limits.maxMessageSize)
 	if err := c.conn.SetReadDeadline(time.Now().Add(c.hub.limits.pongWait)); err != nil {
-		log.Warn("ws.loopIn", "err", err.Error())
+		// Debug, not Warn: a conn this new only fails here when the owner tore it down
+		// before this goroutine got scheduled (a rejected insertion) — and a peer can drive
+		// that at will, so it must not be a log-amplification lever.
+		log.Debug(label, "err", err.Error())
 		return
 	}
 	c.conn.SetPongHandler(func(string) error {
@@ -95,15 +125,15 @@ func (c *client) loopIn() {
 	for {
 		messageType, message, err := c.conn.ReadMessage()
 		if err != nil {
-			if ws.IsUnexpectedCloseError(err, ws.CloseGoingAway, ws.CloseAbnormalClosure) {
-				log.Warn("ws.loopIn", "err", err.Error())
+			if unexpectedClose(err) {
+				c.hub.logReadFailure(label, err)
 			}
 			break
 		}
 		if err := c.conn.SetReadDeadline(time.Now().Add(c.hub.limits.pongWait)); err != nil {
-			// Debug, not Warn: this only fires when a concurrent c.close() lands between a
+			// Debug, not Warn: this only fires when a concurrent c.Close() lands between a
 			// successful read and this call — normal teardown, not an anomaly.
-			log.Debug("ws.loopIn", "err", err.Error())
+			log.Debug(label, "err", err.Error())
 			break
 		}
 
@@ -157,19 +187,19 @@ func (c *client) loopOut() {
 			// Bound the write: a client that re-arms its read deadline but never drains its
 			// socket would otherwise park this goroutine here indefinitely (GHSA-4fwh-wrm6-97xm).
 			if err := c.conn.SetWriteDeadline(time.Now().Add(c.hub.limits.pingPeriod)); err != nil {
-				log.Warn("ws.loopOut", "err", err.Error())
-				c.close()
+				c.hub.logWriteFailure("ws.loopOut", err)
+				c.Close()
 				return
 			}
 			if err := c.conn.WriteJSON(m); err != nil {
-				log.Warn("ws.loopOut", "err", err.Error())
-				c.close()
+				c.hub.logWriteFailure("ws.loopOut", err)
+				c.Close()
 				return
 			}
 		case <-ticker.C:
 			if err := c.conn.WriteControl(ws.PingMessage, nil, time.Now().Add(c.hub.limits.pingPeriod)); err != nil {
-				log.Warn("ws.loopOut.ping", "err", err.Error())
-				c.close()
+				c.hub.logWriteFailure("ws.loopOut.ping", err)
+				c.Close()
 				return
 			}
 		}

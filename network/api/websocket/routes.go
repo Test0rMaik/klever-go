@@ -69,11 +69,26 @@ func handleSubscribe(c *gin.Context, hub *websocket.SocketHub, limiter *connLimi
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		release()
-		log.Error(subscribeOp, "err", err.Error())
+		// A plain GET with no upgrade headers lands here, so this is one line per request
+		// for anyone who asks. Rate-limited, on its own budget so a flood of these cannot
+		// hide a rarer failure elsewhere.
+		hub.LogUpgradeFailure(subscribeOp, err)
 		return
 	}
 
 	go processSubscription(conn, hub, release)
+}
+
+// rejectHandshake answers a bad subscribe with a reason and closes. The write is bounded
+// like loopOut's: without a deadline a peer that provokes a rejection and then stops
+// reading could park this goroutine — and the limiter slot it holds — for as long as the
+// TCP stack keeps trying. One small frame on a fresh connection lands in the kernel buffer
+// and returns in practice, so this is the guard rail rather than a live hole, but every
+// write to a peer-controlled socket should carry one.
+func rejectHandshake(conn *gorilla.Conn, reason string) {
+	_ = conn.SetWriteDeadline(time.Now().Add(subscribeReadTimeout))
+	_ = conn.WriteJSON(map[string]string{"error": reason})
+	_ = conn.Close()
 }
 
 // remoteIP returns the connecting peer's IP from the raw remote address. It does not
@@ -96,45 +111,56 @@ func processSubscription(conn *gorilla.Conn, hub *websocket.SocketHub, release f
 	conn.SetReadLimit(hub.MaxMessageSize())
 
 	if err := conn.SetReadDeadline(time.Now().Add(subscribeReadTimeout)); err != nil {
-		log.Error(subscribeOp, "err", err.Error())
+		hub.LogHandshakeFailure(subscribeOp, err)
 		_ = conn.Close()
 		return
 	}
 
 	var req subscribeRequest
 	if err := conn.ReadJSON(&req); err != nil {
-		log.Error(subscribeOp, "err", err.Error())
+		// Malformed JSON, a wrong-typed field or an early close all arrive here, before any
+		// of the caps below can apply — so this is the cheapest log lever on the route.
+		hub.LogHandshakeFailure(subscribeOp, err)
 		_ = conn.Close()
 		return
 	}
 	// Deadline intentionally left armed; loopIn re-arms a lifetime deadline immediately.
 
 	if len(req.Types) == 0 {
-		_ = conn.WriteJSON(map[string]string{"error": "subscribed_types must not be empty"})
-		_ = conn.Close()
+		rejectHandshake(conn, "subscribed_types must not be empty")
 		return
 	}
 
 	parsedTypes, err := parseEventTypes(req.Types)
 	if err != nil {
-		_ = conn.WriteJSON(map[string]string{"error": err.Error()})
-		_ = conn.Close()
+		rejectHandshake(conn, err.Error())
 		return
 	}
 
 	if len(req.Addresses) > hub.MaxAddressesPerSubscribe() {
-		_ = conn.WriteJSON(map[string]string{"error": "too many addresses in a single subscribe"})
-		_ = conn.Close()
+		rejectHandshake(conn, "too many addresses in a single subscribe")
+		return
+	}
+
+	// Apply the hub's own input caps here, while this goroutine still owns the raw
+	// connection and can answer with a reason. Past NewClient the writer goroutine owns the
+	// socket, so a rejection can only be an abrupt close the peer cannot diagnose — and the
+	// per-address byte cap is reachable on any fresh connection, not a theoretical branch.
+	if err := hub.ValidateSubscription(parsedTypes, req.Addresses); err != nil {
+		rejectHandshake(conn, err.Error())
 		return
 	}
 
 	log.Debug(subscribeOp, "types", fmt.Sprintf("%v", parsedTypes), "addressCount", len(req.Addresses))
 	client := websocket.NewClient(conn, hub)
 	if err := hub.HandleClientInsertion(parsedTypes, req.Addresses, client); err != nil {
-		// Unreachable for a fresh client (resolve keeps per-client >= per-subscribe, and
-		// req.Addresses was pre-checked); guard defensively.
-		log.Warn(subscribeOp, "err", err.Error())
-		_ = conn.Close()
+		// Pre-validated above, so what reaches here is a teardown race or the per-connection
+		// cap. The hub picks the level and rate-limits the Warn, so this cannot become a
+		// log-amplification lever.
+		hub.LogRejectedInsertion(subscribeOp, err)
+		// Close through the client: NewClient already started loopIn/loopOut, and closing
+		// the raw conn under them logs two warnings per rejected connection.
+		client.Close()
 		return
 	}
 

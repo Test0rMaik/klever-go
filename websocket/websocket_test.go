@@ -642,13 +642,24 @@ func TestHandleClientDelete(t *testing.T) {
 func TestRemoveClient(t *testing.T) {
 	hub := newTestHub(nil)
 	c := newTestClient(hub)
+	// newTestClient has a nil conn; flip alive=false so the Close() inside the removal is
+	// a no-op.
+	killClient(c)
 
-	go func() {
-		removed := <-hub.unregister
-		assert.Equal(t, c, removed)
-	}()
+	hub.mu.Lock()
+	hub.blockSubscription[c] = struct{}{}
+	hub.mu.Unlock()
 
-	hub.RemoveClient(c)
+	// Removal runs inline: it must not depend on StartServer draining a hand-off channel,
+	// or a caller would block forever once the hub has shut down.
+	assertReturnsQuickly(t, 2*time.Second, "RemoveClient blocked with no StartServer running", func() {
+		hub.RemoveClient(c)
+	})
+
+	hub.mu.Lock()
+	_, has := hub.blockSubscription[c]
+	hub.mu.Unlock()
+	assert.False(t, has, "RemoveClient must drop the client's subscriptions")
 }
 
 func TestIsAlive(t *testing.T) {
@@ -1079,26 +1090,6 @@ func TestStartServer_UserTransaction_NoReceiptTo(t *testing.T) {
 	assert.Equal(t, indexer.USER_TRANSACTIONS, s.Type)
 
 	env.teardown(c)
-}
-
-func TestStartServer_UnregisterClient(t *testing.T) {
-	env := startServerEnv(t, nil)
-	c := newTestClient(env.hub)
-	killClient(c)
-
-	env.hub.mu.Lock()
-	env.hub.blockSubscription[c] = struct{}{}
-	env.hub.mu.Unlock()
-
-	env.hub.unregister <- c
-	time.Sleep(100 * time.Millisecond)
-
-	env.hub.mu.Lock()
-	_, has := env.hub.blockSubscription[c]
-	env.hub.mu.Unlock()
-	assert.False(t, has)
-
-	env.teardown()
 }
 
 func setupTestWSServer(t *testing.T, hub *SocketHub) (*ws.Conn, func()) {

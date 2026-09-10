@@ -1,10 +1,15 @@
 package websocket
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,10 +25,6 @@ import (
 func TestHandleClientDelete_ReclaimsAddressKeys(t *testing.T) {
 	hub := newTestHub(nil)
 	c := newTestClient(hub)
-	// Mark the client dead before inserting: newTestClient has a nil conn, so the
-	// c.close() inside handleClientDelete must be a no-op. killClient flips alive=false
-	// so close() skips the (nil) conn, letting us drive handleClientDelete directly.
-	killClient(c)
 
 	const n = 5000
 	addresses := make([]string, n)
@@ -38,6 +39,10 @@ func TestHandleClientDelete_ReclaimsAddressKeys(t *testing.T) {
 	require.Equal(t, n, hub.clientAddresses[c])
 	hub.mu.RUnlock()
 
+	// newTestClient has a nil conn and nil cancel; flip alive=false first so the
+	// c.Close() inside handleClientDelete is a no-op.
+	killClient(c)
+
 	hub.handleClientDelete(c)
 
 	hub.mu.RLock()
@@ -45,6 +50,180 @@ func TestHandleClientDelete_ReclaimsAddressKeys(t *testing.T) {
 	assert.Equal(t, 0, len(hub.addressSubscription), "outer address keys must be reclaimed on disconnect")
 	_, hasCount := hub.clientAddresses[c]
 	assert.False(t, hasCount, "per-client address count must be cleared on disconnect")
+}
+
+func TestHandleClientInsertion_ClosedClientIsNotRetained(t *testing.T) {
+	hub := newTestHub(nil)
+	c := newTestClient(hub)
+
+	require.NoError(t, hub.HandleClientInsertion([]indexer.EventType{indexer.ACCOUNTS}, []string{"klv1a"}, c))
+
+	killClient(c)
+	hub.handleClientDelete(c)
+
+	err := hub.HandleClientInsertion([]indexer.EventType{indexer.ACCOUNTS, indexer.BLOCKS}, []string{"klv1b"}, c)
+	require.ErrorIs(t, err, ErrClientClosed)
+
+	hub.mu.RLock()
+	defer hub.mu.RUnlock()
+	assert.Equal(t, 0, len(hub.addressSubscription), "a torn-down client must not be re-added to the address map")
+	_, hasCount := hub.clientAddresses[c]
+	assert.False(t, hasCount, "a torn-down client must not regain a per-client address count")
+	_, hasBlocks := hub.blockSubscription[c]
+	assert.False(t, hasBlocks, "a torn-down client must not be re-added to the blocks subscription")
+	_, hasTxs := hub.transactionSubscription[c]
+	assert.False(t, hasTxs, "a torn-down client must not be re-added to the transactions subscription")
+}
+
+// TestHandleClientInsertion_RejectsAfterHubShutdown covers the teardown path the
+// per-client liveness gate cannot see: a client created but not yet inserted is unknown
+// to the hub, so deleteAll never closes it and IsAlive() still reports true. Registering
+// it into a hub whose StartServer loop has returned leaks the map entries (and the
+// connection-limiter slot) for as long as the peer holds the socket.
+func TestHandleClientInsertion_RejectsAfterHubShutdown(t *testing.T) {
+	hub := newTestHub(nil)
+	c := newTestClient(hub)
+
+	hub.deleteAll()
+	require.True(t, c.IsAlive(), "a client not yet in any subscription map survives deleteAll")
+
+	err := hub.HandleClientInsertion([]indexer.EventType{indexer.ACCOUNTS, indexer.BLOCKS}, []string{"klv1a"}, c)
+	require.ErrorIs(t, err, ErrHubClosed)
+
+	hub.mu.RLock()
+	defer hub.mu.RUnlock()
+	assert.Equal(t, 0, len(hub.addressSubscription), "a shut-down hub must not retain address subscriptions")
+	_, hasCount := hub.clientAddresses[c]
+	assert.False(t, hasCount, "a shut-down hub must not retain a per-client address count")
+	_, hasBlocks := hub.blockSubscription[c]
+	assert.False(t, hasBlocks, "a shut-down hub must not retain a blocks subscription")
+}
+
+// TestHandleDynamicSubscribe_HubShutdownReportsClientClosed pins the downgrade on the
+// client-facing path: a subscribe that loses the race with hub teardown is answered with
+// the state of the client's own connection, not with the node's shutdown state.
+func TestHandleDynamicSubscribe_HubShutdownReportsClientClosed(t *testing.T) {
+	hub := newTestHub(nil)
+	c := newTestClient(hub)
+
+	hub.deleteAll()
+
+	params, _ := json.Marshal(SubscribeParams{Types: []string{"blocks"}, Addresses: []string{"klv1a"}})
+	resp := sendRequest(hub, c, WSRequest{ID: "sub-closed", Method: MethodSubscribe, Params: params})
+
+	assert.Equal(t, "sub-closed", resp.ID)
+	assert.Equal(t, ErrClientClosed.Error(), resp.Error)
+}
+
+// TestDeleteAll_ClosesClientHeldInNoSubscriptionMap pins the client the subscription maps
+// cannot see: an address-scoped subscribe with an empty address list (and, equally, an
+// unsubscribe that empties the last one) writes to no map, so a shutdown that discovers
+// clients by walking those maps leaves the socket, both client goroutines and the
+// connection-limiter slot alive for as long as the peer holds the connection.
+func TestDeleteAll_ClosesClientHeldInNoSubscriptionMap(t *testing.T) {
+	hub := newTestHub(nil)
+	c := NewClient(upgradedConn(t), hub)
+
+	require.NoError(t, hub.HandleClientInsertion([]indexer.EventType{indexer.ACCOUNTS}, nil, c))
+
+	hub.mu.RLock()
+	require.Empty(t, hub.addressSubscription, "an empty address list must not create map entries")
+	require.Empty(t, hub.blockSubscription)
+	hub.mu.RUnlock()
+
+	hub.deleteAll()
+
+	assert.False(t, c.IsAlive(), "hub shutdown must close a client that holds no subscription entry")
+}
+
+func TestClosedClientIsNotRetainedInSubscriptions(t *testing.T) {
+	const iterations = 300
+	inserted := 0
+
+	for i := 0; i < iterations; i++ {
+		hub := newTestHub(nil)
+		c := newTestClient(hub)
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			<-start
+			killClient(c)
+			hub.handleClientDelete(c)
+		}()
+
+		var insertErr error
+		go func() {
+			defer wg.Done()
+			<-start
+			insertErr = hub.HandleClientInsertion(
+				[]indexer.EventType{indexer.ACCOUNTS, indexer.USER_TRANSACTIONS, indexer.BLOCKS, indexer.TRANSACTIONS},
+				[]string{"klv1a", "klv1b", "klv1c"},
+				c,
+			)
+		}()
+
+		close(start)
+		wg.Wait()
+
+		if insertErr == nil {
+			inserted++
+		}
+
+		hub.mu.RLock()
+		addressCount := len(hub.addressSubscription)
+		_, hasCount := hub.clientAddresses[c]
+		_, hasBlocks := hub.blockSubscription[c]
+		_, hasTxs := hub.transactionSubscription[c]
+		hub.mu.RUnlock()
+
+		require.Equal(t, 0, addressCount, "iteration %d: address subscriptions must not outlive the client", i)
+		require.False(t, hasCount, "iteration %d: per-client address count must not outlive the client", i)
+		require.False(t, hasBlocks, "iteration %d: blocks subscription must not outlive the client", i)
+		require.False(t, hasTxs, "iteration %d: transactions subscription must not outlive the client", i)
+	}
+
+	// The post-state above is empty under both interleavings, so it would also hold for a
+	// hub that rejected every insertion. Requiring a winner keeps the insert-then-delete
+	// ordering — the one that actually exercises handleClientDelete's cleanup — covered.
+	//
+	// The race itself decides whether that ordering ever happens, and the inserter does more
+	// pre-lock work than the killer, so the bias runs against it. Rather than let coverage
+	// depend on the scheduler, run that ordering once deterministically and count it.
+	inserted += insertThenDeleteOnce(t)
+
+	require.NotZero(t, inserted, "no insertion ever won the race, so only the rejection path was exercised")
+}
+
+// insertThenDeleteOnce runs the insert-then-delete ordering with no concurrency, so the
+// racing test above has that path covered whatever the scheduler does. Returns 1 when the
+// insertion succeeded, so it can be folded into the caller's count.
+func insertThenDeleteOnce(t *testing.T) int {
+	t.Helper()
+
+	hub := newTestHub(nil)
+	c := newTestClient(hub)
+
+	require.NoError(t, hub.HandleClientInsertion(
+		[]indexer.EventType{indexer.ACCOUNTS, indexer.USER_TRANSACTIONS, indexer.BLOCKS, indexer.TRANSACTIONS},
+		[]string{"klv1a", "klv1b", "klv1c"},
+		c,
+	))
+
+	killClient(c)
+	hub.handleClientDelete(c)
+
+	hub.mu.RLock()
+	defer hub.mu.RUnlock()
+	require.Empty(t, hub.addressSubscription, "address subscriptions must not outlive the client")
+	require.NotContains(t, hub.clientAddresses, c, "per-client address count must not outlive the client")
+	require.NotContains(t, hub.blockSubscription, c, "blocks subscription must not outlive the client")
+	require.NotContains(t, hub.transactionSubscription, c, "transactions subscription must not outlive the client")
+
+	return 1
 }
 
 func TestHandleClientInsertion_RejectsOversizedSubscribe(t *testing.T) {
@@ -268,4 +447,315 @@ func TestClient_IdleConnectionReclaimedAtPongWait(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("idle client was not reclaimed at pongWait; connection slot leaked")
 	}
+}
+
+// upgradedConn returns the server side of a live websocket connection. The peer end is
+// never read from and is closed with the test.
+func upgradedConn(t *testing.T) *ws.Conn {
+	t.Helper()
+	conns := make(chan *ws.Conn, 1)
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&ws.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return // the dial below fails too, and that is where the test reports it
+		}
+		conns <- conn
+	}))
+	t.Cleanup(s.Close)
+
+	peer, _, err := ws.DefaultDialer.Dial("ws"+strings.TrimPrefix(s.URL, "http"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = peer.Close() })
+	return <-conns
+}
+
+// newConnClient builds a client over conn without starting loopIn/loopOut, so a test can
+// drive one loop synchronously.
+func newConnClient(hub *SocketHub, conn *ws.Conn) *client {
+	c := newTestClient(hub)
+	c.conn = conn
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+	return c
+}
+
+// TestClient_LoopInReturnsWhenConnIsClosedBeforeStart pins the rejected-insertion race:
+// processSubscription may Close() the client before loopIn is even scheduled, so its
+// very first SetReadDeadline fails and the goroutine must tear the client down instead
+// of entering the read loop.
+func TestClient_LoopInReturnsWhenConnIsClosedBeforeStart(t *testing.T) {
+	conn := upgradedConn(t)
+	require.NoError(t, conn.Close())
+
+	c := NewClient(conn, newTestHub(nil))
+	select {
+	case <-c.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("loopIn must tear the client down when its connection is already closed")
+	}
+	assert.False(t, c.IsAlive())
+}
+
+// TestClient_LoopOutClosesOnWriteFailure covers loopOut's failure exits: a write or a
+// keepalive ping failing must tear the client down rather than leave it half-dead in
+// the hub. (gorilla's SetWriteDeadline only stores the deadline and cannot fail, so that
+// guard is not reachable from a test.)
+func TestClient_LoopOutClosesOnWriteFailure(t *testing.T) {
+	t.Run("write on a closed conn", func(t *testing.T) {
+		conn := upgradedConn(t)
+		require.NoError(t, conn.Close())
+		c := newConnClient(newTestHub(nil), conn)
+		c.out <- WSResponse{}
+
+		assertReturnsQuickly(t, 2*time.Second, "loopOut must exit when WriteJSON fails", c.loopOut)
+		assert.False(t, c.IsAlive())
+	})
+
+	t.Run("ping on a closed conn", func(t *testing.T) {
+		hub := NewHub("", "", nil, Limits{PingPeriod: 20 * time.Millisecond, PongWait: 60 * time.Millisecond})
+		conn := upgradedConn(t)
+		require.NoError(t, conn.Close())
+		c := newConnClient(hub, conn)
+
+		assertReturnsQuickly(t, 2*time.Second, "loopOut must exit when the keepalive ping fails", c.loopOut)
+		assert.False(t, c.IsAlive())
+	})
+}
+
+// TestStartServer_ClearsClosedSoAHubCanBeRestarted pins that the shutdown flag does not
+// outlive the shutdown that set it. deleteAll sets closed and nothing else clears it, so
+// without this a hub whose context was cancelled would reject every later insertion with
+// ErrHubClosed forever. No production caller restarts a hub today — api.go builds a fresh
+// one per registration — but the type is exported and its own flush comment already
+// reasons about hub reuse.
+func TestStartServer_ClearsClosedSoAHubCanBeRestarted(t *testing.T) {
+	hub := newTestHub(nil)
+
+	// Joining the first StartServer rather than just waiting for closed is the point: the
+	// documented contract is restart-after-return, not overlapping starts, so a test that
+	// began the second run while the first was still tearing down would be asserting a
+	// guarantee the code does not make.
+	stopped := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		defer close(stopped)
+		hub.StartServer(ctx)
+	}()
+	cancel()
+
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StartServer did not return after its context was cancelled")
+	}
+
+	hub.mu.RLock()
+	closedAfterShutdown := hub.closed
+	hub.mu.RUnlock()
+	require.True(t, closedAfterShutdown, "deleteAll must mark the hub closed on shutdown")
+
+	require.ErrorIs(t,
+		hub.HandleClientInsertion([]indexer.EventType{indexer.ACCOUNTS}, []string{"klv1a"}, newTestClient(hub)),
+		ErrHubClosed,
+		"a shut-down hub must reject insertions")
+
+	restartCtx, stopRestart := context.WithCancel(context.Background())
+	go hub.StartServer(restartCtx)
+
+	c := newTestClient(hub)
+	require.Eventually(t, func() bool {
+		return hub.HandleClientInsertion([]indexer.EventType{indexer.ACCOUNTS}, []string{"klv1a"}, c) == nil
+	}, time.Second, time.Millisecond, "a restarted hub must accept insertions again")
+
+	// newTestClient has a nil conn, so it must not still be registered when the deferred
+	// shutdown reaches deleteAll's c.Close() — the same invariant killClient exists for.
+	killClient(c)
+	hub.handleClientDelete(c)
+	stopRestart()
+}
+
+// TestValidateSubscription_AppliesTheSameCapsAsInsertion pins that the exported validator
+// routes.go calls up front and the check HandleClientInsertion repeats cannot drift apart.
+func TestValidateSubscription_AppliesTheSameCapsAsInsertion(t *testing.T) {
+	hub := newTestHub(nil)
+	addressScoped := []indexer.EventType{indexer.ACCOUNTS}
+
+	oversized := strings.Repeat("k", maxEncodedAddressLength+1)
+	atCap := strings.Repeat("k", maxEncodedAddressLength)
+
+	require.Error(t, hub.ValidateSubscription(addressScoped, []string{oversized}))
+	require.NoError(t, hub.ValidateSubscription(addressScoped, []string{atCap}),
+		"exactly the cap must still be accepted")
+
+	// Insertion must agree, or the route would pre-accept something the hub then rejects.
+	require.Error(t, hub.HandleClientInsertion(addressScoped, []string{oversized}, newTestClient(hub)))
+	require.NoError(t, hub.HandleClientInsertion(addressScoped, []string{atCap}, newTestClient(hub)))
+
+	// Addresses are meaningless for a blocks-only subscribe, so neither path inspects them.
+	require.NoError(t, hub.ValidateSubscription([]indexer.EventType{indexer.BLOCKS}, []string{oversized}))
+}
+
+// TestUnexpectedClose_TreatsEveryPeerChosenCodeAsOrdinary pins the property that makes this
+// predicate safe: the peer picks the code it closes with, so no close frame — whatever the
+// code — may cost a log line. An earlier version listed the "ordinary" codes and warned on
+// the rest, which only moved the lever: a peer that wants a log line just closes with 1002
+// or 4000 instead of 1000. The codes below are exactly that bypass.
+func TestUnexpectedClose_TreatsEveryPeerChosenCodeAsOrdinary(t *testing.T) {
+	peerChosen := map[string]int{
+		"normal closure":     ws.CloseNormalClosure,
+		"going away":         ws.CloseGoingAway,
+		"no status received": ws.CloseNoStatusReceived,
+		// synthesised locally when the peer vanishes without a close frame
+		"abnormal closure": ws.CloseAbnormalClosure,
+		// the bypass codes: nothing stops a peer choosing these
+		"protocol error":   ws.CloseProtocolError,
+		"message too big":  ws.CloseMessageTooBig,
+		"internal error":   ws.CloseInternalServerErr,
+		"application code": 4000,
+	}
+	for name, code := range peerChosen {
+		require.Falsef(t, unexpectedClose(&ws.CloseError{Code: code}),
+			"%s is peer-chosen, so it must not cost a log line", name)
+	}
+
+	// A read that fails with no close frame at all is the only thing left that can say
+	// something about this node — and the call site still rate-limits even that.
+	require.True(t, unexpectedClose(errors.New("read tcp: connection reset by peer")),
+		"a failure that is not a close frame must still be reportable")
+}
+
+// TestLoggableHash_KeepsPeerContentOutOfTheLog pins the sanitiser on the one peer-supplied
+// string that reached a log line raw. It is capped only by the inbound message limit, so
+// without this a query could write a megabyte into the log — or, worse, embed newlines and
+// forge log entries of its own.
+func TestLoggableHash_KeepsPeerContentOutOfTheLog(t *testing.T) {
+	realHash := "a3f1" + strings.Repeat("0", 60)
+	require.Len(t, realHash, 64)
+	require.Equal(t, realHash, loggableHash(realHash), "a well-formed hash must still be readable")
+	require.Equal(t, "ABCDEF0123", loggableHash("ABCDEF0123"), "upper-case hex is a hash too")
+	require.Equal(t, "", loggableHash(""), "an empty hash carries nothing to sanitise")
+
+	// Anything a hash cannot be must not reach the log as bytes.
+	forged := "deadbeef\nWARN  everything is fine, nothing to see here"
+	require.NotContains(t, loggableHash(forged), "\n",
+		"a newline must never survive into a log line")
+	require.NotContains(t, loggableHash(forged), "nothing to see here")
+
+	require.Equal(t, "<1048576 bytes>", loggableHash(strings.Repeat("a", 1<<20)),
+		"an oversized value must be reduced to its length")
+	require.Equal(t, "<5 bytes, not hex>", loggableHash("zzzzz"))
+}
+
+// TestPeerDrivenBudgets_EachSourceKeepsItsOwn is the discriminating version of a test I got
+// wrong twice. Asserting on the counters directly, or driving every source the same number
+// of times, passes against an implementation that routes them all to one budget or swaps
+// two of them. Every source is driven through its own logging method a distinct number of
+// times, so each destination's count identifies which callers reached it.
+//
+// It matters because only the caller that opens a window has its message logged. If two
+// sources share a budget, a flood of the cheap one hides the identity of the rare one; if
+// two are swapped, a summary is attributed to the wrong subsystem.
+func TestPeerDrivenBudgets_EachSourceKeepsItsOwn(t *testing.T) {
+	hub := newTestHub(nil)
+
+	boom := errors.New("boom")
+	drive := map[string]struct {
+		warner *dropWarner
+		times  int
+		call   func()
+	}{
+		"upgrade":   {&hub.upgradeFailWarn, 3, func() { hub.LogUpgradeFailure("ws.Subscribe", boom) }},
+		"handshake": {&hub.handshakeFailWarn, 5, func() { hub.LogHandshakeFailure("ws.Subscribe", boom) }},
+		"read":      {&hub.readFailWarn, 7, func() { hub.logReadFailure("ws.loopIn", boom) }},
+		"sendDrop":  {&hub.sendDropWarn, 11, func() { hub.logSendDrop("ws.send", "buffer full") }},
+		"write":     {&hub.writeFailWarn, 13, func() { hub.logWriteFailure("ws.loopOut", boom) }},
+		"query":     {&hub.queryFailWarn, 17, func() { hub.logQueryFailure("ws.handleGetBlock", "hash", "abc", boom) }},
+	}
+
+	// Open every window first, so each subsequent call folds instead of reporting.
+	for name, source := range drive {
+		_, reported := source.warner.fire()
+		require.Truef(t, reported, "%s: the first occurrence must open the window", name)
+	}
+
+	for _, source := range drive {
+		for i := 0; i < source.times; i++ {
+			source.call()
+		}
+	}
+
+	// Distinct counts, so a budget holding the wrong number names the miswiring.
+	for name, source := range drive {
+		count, pending := source.warner.flush()
+		require.Truef(t, pending, "%s: folded occurrences must still be pending", name)
+		require.EqualValuesf(t, source.times, count,
+			"%s budget holds %d occurrences, expected %d — a source is wired to the wrong budget",
+			name, count, source.times)
+	}
+}
+
+// TestLoggableError_KeepsPeerContentOutOfTheLog covers the hole the hash sanitiser alone
+// left open. Bounding the fields we choose to log is not enough, because the error text
+// carries peer input back out by itself.
+func TestLoggableError_KeepsPeerContentOutOfTheLog(t *testing.T) {
+	// The real shape: a storage miss quotes the whole key it was handed, so a 100KB hash
+	// reaches the log through err even though loggableHash reduced the hash field.
+	hugeHash := strings.Repeat("ab", 50_000)
+	storageMiss := fmt.Errorf("key %s not found in %s", hugeHash, "TransactionsUnit")
+	rendered := loggableError(storageMiss)
+	require.NotContains(t, rendered, hugeHash, "the full key must not survive into the log")
+	require.Less(t, len(rendered), 400, "a bounded error must stay bounded")
+	require.Contains(t, rendered, fmt.Sprintf("(%d bytes)", len(storageMiss.Error())),
+		"the size that was dropped must still be stated")
+
+	// A websocket close reason arrives verbatim in CloseError.Error(); the logger passes
+	// CR/LF through, so a newline here would forge a log line of its own.
+	forging := &ws.CloseError{Code: ws.CloseNormalClosure, Text: "\nWARN  all clear, nothing to see"}
+	rendered = loggableError(forging)
+	require.NotContains(t, rendered, "\n", "a newline must never survive into a log line")
+	require.NotContains(t, rendered, "\r")
+	require.Contains(t, rendered, "all clear", "the text itself stays readable")
+
+	// The Unicode line and paragraph separators are not control runes, and some log
+	// aggregators break lines on them just the same.
+	separators := loggableError(errors.New("before\u2028WARN forged\u2029after"))
+	require.NotContains(t, separators, "\u2028")
+	require.NotContains(t, separators, "\u2029")
+
+	require.Equal(t, "", loggableError(nil))
+}
+
+// TestUnexpectedClose_ANodeSideCloseIsNotAReadFailure pins the one non-close-frame error
+// that must not count: our own Close() makes the blocked ReadMessage return net.ErrClosed,
+// which is not a *CloseError. Counting it billed the read budget for every shutdown, every
+// write failure and every rejected insert — the cross-contamination the per-source budgets
+// exist to prevent, reintroduced from the inside. The socket is real so the error is the
+// one gorilla actually produces, not a hand-built stand-in.
+func TestUnexpectedClose_ANodeSideCloseIsNotAReadFailure(t *testing.T) {
+	readErrs := make(chan error, 1)
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&ws.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		go func() {
+			_, _, rerr := conn.ReadMessage()
+			readErrs <- rerr
+		}()
+		time.Sleep(50 * time.Millisecond)
+		_ = conn.Close() // the node's side, as client.Close() does
+	}))
+	defer s.Close()
+
+	peer, _, err := ws.DefaultDialer.Dial("ws"+strings.TrimPrefix(s.URL, "http"), nil)
+	require.NoError(t, err)
+	defer peer.Close()
+
+	rerr := <-readErrs
+	require.ErrorIs(t, rerr, net.ErrClosed, "a local close must surface as net.ErrClosed")
+	require.False(t, unexpectedClose(rerr),
+		"a close the node performed itself must not be counted as a read failure")
+
+	// A peer that simply goes quiet still is: an idle read deadline is a genuine signal,
+	// and it stays on the read budget where it is bounded.
+	require.True(t, unexpectedClose(errors.New("i/o timeout")))
 }
