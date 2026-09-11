@@ -59,9 +59,12 @@ type ResourceManagerConfig struct {
 	ConnRateBurst         int     `yaml:"connRateBurst"`         // burst allowance over ConnRatePerSec
 }
 
-// DirectSendConfig caps the inbound direct-send streams a node accepts; 0 = built-in default
-// (4 per peer, 512 in total across all peers).
+// DirectSendConfig bounds what a node accepts over direct send: the inbound streams (0 = built-in
+// default of 4 per peer, 512 in total) and the replay cache that deduplicates frames per peer
+// (MaxSeenMessages, 0 = 131072; every peer holds a fixed share of 64, so this also sets how many
+// peers are tracked at once).
 type DirectSendConfig struct {
 	MaxInboundStreamsPerPeer int `yaml:"maxInboundStreamsPerPeer"`
 	MaxInboundStreamsTotal   int `yaml:"maxInboundStreamsTotal"`
+	MaxSeenMessages          int `yaml:"maxSeenMessages"`
 }

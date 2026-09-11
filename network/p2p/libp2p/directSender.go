@@ -22,12 +22,32 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/whyrusleeping/timecache"
 )
 
 var _ p2p.DirectSender = (*directSender)(nil)
 
 const timeSeenMessages = time.Second * 120
+
+// defaultMaxSeenMessages bounds the direct-send replay cache by entry count. The TTL alone does
+// not bound it: a connected peer can emit fresh, never-before-seen identifiers faster than they
+// expire, so entries accumulate for the whole span. Overridable through
+// config.DirectSendConfig.MaxSeenMessages.
+//
+// 131072 is 2048 peer shares. Buckets are allocated as peers appear, so the figure is a ceiling
+// (about 5 MiB with every slot held), not a working-set cost. It is churn headroom, not a
+// guarantee: a slot is held by any peer whose bucket was touched in the last 120s, connected or
+// not, so what fills the table is distinct direct-send peers per span. go-libp2p's default
+// connection manager holds a node near 192 connections; getting from there to 2048 inside one
+// span takes more than 15 new direct-send peers a second on average, or a burst of that many
+// identities. That is well past honest churn, and a source rotating identities has to mint them.
+const defaultMaxSeenMessages = 131072
+
+// seenMessagesPerPeer is each peer's fixed share of the replay cache, so the cache tracks up to
+// maxSeenMessages/seenMessagesPerPeer peers at once — 2048 by default — and no peer can spend
+// another's share. It is the peer count, not the entry count, that a source rotating identities
+// presses on, which is why the configurable total is what scales it.
+const seenMessagesPerPeer = 64
+
 const maxMutexes = 10000
 const seqnoLength = 8
 
@@ -68,8 +88,9 @@ type directSender struct {
 	ctx                 context.Context
 	hostP2P             host.Host
 	messageHandler      func(msg *pubsub.Message, fromConnectedPeer core.PeerID) error
-	mutSeenMessages     sync.Mutex
-	seenMessages        *timecache.TimeCache
+	hasTopicProcessor   func(topic string) bool
+	maxSeenMessages     int
+	seenMessages        *seenMessagesCache
 	mutexForPeer        *MutexHolder
 	recvIdleTimeout     time.Duration
 	sendWriteTimeout    time.Duration
@@ -83,6 +104,12 @@ type directSender struct {
 
 type directSenderOption func(*directSender)
 
+func withTopicProcessorChecker(hasTopicProcessor func(topic string) bool) directSenderOption {
+	return func(ds *directSender) {
+		ds.hasTopicProcessor = hasTopicProcessor
+	}
+}
+
 func withDirectSendConfig(dsCfg config.DirectSendConfig) directSenderOption {
 	return func(ds *directSender) {
 		if dsCfg.MaxInboundStreamsPerPeer > 0 {
@@ -90,6 +117,9 @@ func withDirectSendConfig(dsCfg config.DirectSendConfig) directSenderOption {
 		}
 		if dsCfg.MaxInboundStreamsTotal > 0 {
 			ds.recvStreamsTotalCap = dsCfg.MaxInboundStreamsTotal
+		}
+		if dsCfg.MaxSeenMessages > 0 {
+			ds.maxSeenMessages = dsCfg.MaxSeenMessages
 		}
 	}
 }
@@ -121,7 +151,7 @@ func NewDirectSender(
 		counter:             uint64(time.Now().UnixNano()), // #nosec G115
 		ctx:                 ctx,
 		hostP2P:             h,
-		seenMessages:        timecache.NewTimeCache(timeSeenMessages),
+		maxSeenMessages:     defaultMaxSeenMessages,
 		messageHandler:      messageHandler,
 		mutexForPeer:        mutexForPeer,
 		recvIdleTimeout:     directRecvIdleTimeout,
@@ -135,6 +165,16 @@ func NewDirectSender(
 	for _, opt := range opts {
 		opt(ds)
 	}
+
+	// Required, not optional: validateDirectMessage consults it on every inbound frame to decide
+	// whether the frame is dispatchable at all. A directSender built without it would be a silent
+	// downgrade rather than a build error.
+	if ds.hasTopicProcessor == nil {
+		return nil, fmt.Errorf("%w for topic processor checker", p2p.ErrNilValidator)
+	}
+
+	// Built after the options so the configured cap applies.
+	ds.seenMessages = newSeenMessagesCache(timeSeenMessages, ds.maxSeenMessages, seenMessagesPerPeer)
 
 	//wire-up a handler for direct messages
 	h.SetStreamHandler(DirectSendID, ds.directStreamHandler)
@@ -312,25 +352,23 @@ func (ds *directSender) validateDirectMessage(message *pubsubPb.Message, fromCon
 	if len(message.GetSeqno()) != seqnoLength {
 		return fmt.Errorf("%w unexpected seqno length %d", p2p.ErrInvalidValue, len(message.GetSeqno()))
 	}
-	if ds.checkAndSetSeenMessage(message) {
+	// A frame on a topic no processor serves cannot be dispatched, so it must not consume a
+	// replay-cache entry. It still has to reach the handler though: directMessageHandler
+	// unmarshals before it looks the processor up, and that unmarshal is what blacklists both
+	// identities on a malformed payload. Rejecting here instead would let a peer emit malformed
+	// frames on an unserved topic forever without ever earning a denial.
+	if ds.hasTopicProcessor(*message.Topic) && ds.checkAndSetSeenMessage(fromConnectedPeer, message) {
 		return p2p.ErrAlreadySeenMessage
 	}
 
 	return nil
 }
 
-func (ds *directSender) checkAndSetSeenMessage(msg *pubsubPb.Message) bool {
-	msgId := string(msg.GetFrom()) + string(msg.GetSeqno())
-
-	ds.mutSeenMessages.Lock()
-	defer ds.mutSeenMessages.Unlock()
-
-	if ds.seenMessages.Has(msgId) {
-		return true
-	}
-
-	ds.seenMessages.Add(msgId)
-	return false
+// checkAndSetSeenMessage buckets on the connected peer — which From was just pinned to, so the
+// bucket key is the libp2p-authenticated identity and not a field the sender chose — and keys on
+// the sequence number, pinned to seqnoLength above so the uint64 conversion is exact.
+func (ds *directSender) checkAndSetSeenMessage(fromConnectedPeer peer.ID, msg *pubsubPb.Message) bool {
+	return ds.seenMessages.hasOrAdd(string(fromConnectedPeer), binary.BigEndian.Uint64(msg.GetSeqno()))
 }
 
 // NextSeqno returns the next uint64 found in *counter as byte slice

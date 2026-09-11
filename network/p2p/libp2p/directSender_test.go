@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"testing"
@@ -29,6 +30,12 @@ const timeout = time.Second * 5
 
 var blankMessageHandler = func(msg *pubsub.Message, fromConnectedPeer core.PeerID) error {
 	return nil
+}
+
+// The topic-processor checker is a required constructor argument, so every directSender under test
+// needs one. Permissive by default; tests that care about the gate pass their own.
+var allTopicsRegistered = func(topic string) bool {
+	return true
 }
 
 func generateHostStub() *mock.ConnectableHostStub {
@@ -96,10 +103,17 @@ func TestNewDirectSender_NilMessageHandlerShouldErr(t *testing.T) {
 	assert.Equal(t, p2p.ErrNilDirectSendMessageHandler, err)
 }
 
+func TestNewDirectSender_NilTopicProcessorCheckerShouldErr(t *testing.T) {
+	ds, err := libp2p.NewDirectSender(context.Background(), generateHostStub(), blankMessageHandler)
+
+	assert.True(t, check.IfNil(ds))
+	assert.True(t, errors.Is(err, p2p.ErrNilValidator))
+}
+
 func TestNewDirectSender_OkValsShouldWork(t *testing.T) {
 	ds, err := libp2p.NewDirectSender(context.Background(), generateHostStub(), func(msg *pubsub.Message, fromConnectedPeer core.PeerID) error {
 		return nil
-	})
+	}, libp2p.WithTopicProcessorChecker(allTopicsRegistered))
 
 	assert.False(t, check.IfNil(ds))
 	assert.Nil(t, err)
@@ -118,7 +132,7 @@ func TestNewDirectSender_OkValsShouldCallSetStreamHandlerWithCorrectValues(t *te
 
 	_, _ = libp2p.NewDirectSender(context.Background(), hs, func(msg *pubsub.Message, fromConnectedPeer core.PeerID) error {
 		return nil
-	})
+	}, libp2p.WithTopicProcessorChecker(allTopicsRegistered))
 
 	assert.NotNil(t, handlerCalled)
 	assert.Equal(t, libp2p.DirectSendID, pidCalled)
@@ -174,6 +188,7 @@ func TestDirectSender_ValidateDirectMessageNilMessageShouldErr(t *testing.T) {
 		context.Background(),
 		generateHostStub(),
 		blankMessageHandler,
+		libp2p.WithTopicProcessorChecker(allTopicsRegistered),
 	)
 
 	err := ds.ValidateDirectMessage(nil, "peer id")
@@ -186,6 +201,7 @@ func TestDirectSender_ValidateDirectMessageNilTopicIdsShouldErr(t *testing.T) {
 		context.Background(),
 		generateHostStub(),
 		blankMessageHandler,
+		libp2p.WithTopicProcessorChecker(allTopicsRegistered),
 	)
 
 	id, _ := createLibP2PCredentialsDirectSender()
@@ -206,6 +222,7 @@ func TestDirectSender_ValidateDirectMessageAlreadySeenMsgShouldErr(t *testing.T)
 		context.Background(),
 		generateHostStub(),
 		blankMessageHandler,
+		libp2p.WithTopicProcessorChecker(allTopicsRegistered),
 	)
 
 	id, _ := createLibP2PCredentialsDirectSender()
@@ -217,8 +234,7 @@ func TestDirectSender_ValidateDirectMessageAlreadySeenMsgShouldErr(t *testing.T)
 	topic := "topic"
 	msg.Topic = &topic
 
-	msgId := string(msg.GetFrom()) + string(msg.GetSeqno())
-	ds.SeenMessages().Add(msgId)
+	ds.MarkSeen(msg.GetFrom(), msg.GetSeqno())
 
 	err := ds.ValidateDirectMessage(msg, id)
 
@@ -230,6 +246,7 @@ func TestDirectSender_ValidateDirectMessageUnexpectedSeqnoLengthShouldErr(t *tes
 		context.Background(),
 		generateHostStub(),
 		blankMessageHandler,
+		libp2p.WithTopicProcessorChecker(allTopicsRegistered),
 	)
 
 	id, _ := createLibP2PCredentialsDirectSender()
@@ -244,14 +261,14 @@ func TestDirectSender_ValidateDirectMessageUnexpectedSeqnoLengthShouldErr(t *tes
 	err := ds.ValidateDirectMessage(msg, id)
 
 	assert.True(t, errors.Is(err, p2p.ErrInvalidValue))
-	assert.False(t, ds.SeenMessages().Has(string(msg.GetFrom())+string(msg.GetSeqno())))
+	assert.Equal(t, 0, ds.SeenMessagesLen(), "a rejected seqno must not be recorded")
 
 	msg.Seqno = []byte("111")
 
 	err = ds.ValidateDirectMessage(msg, id)
 
 	assert.True(t, errors.Is(err, p2p.ErrInvalidValue))
-	assert.False(t, ds.SeenMessages().Has(string(msg.GetFrom())+string(msg.GetSeqno())))
+	assert.Equal(t, 0, ds.SeenMessagesLen(), "a rejected seqno must not be recorded")
 }
 
 func TestDirectSender_ValidateDirectMessageShouldWork(t *testing.T) {
@@ -259,6 +276,7 @@ func TestDirectSender_ValidateDirectMessageShouldWork(t *testing.T) {
 		context.Background(),
 		generateHostStub(),
 		blankMessageHandler,
+		libp2p.WithTopicProcessorChecker(allTopicsRegistered),
 	)
 
 	id, _ := createLibP2PCredentialsDirectSender()
@@ -302,6 +320,7 @@ func TestDirectSender_SendDirectToConnectedPeerBufferToLargeShouldErr(t *testing
 			},
 		},
 		blankMessageHandler,
+		libp2p.WithTopicProcessorChecker(allTopicsRegistered),
 	)
 
 	messageTooLarge := bytes.Repeat([]byte{65}, libp2p.MaxSendBuffSize)
@@ -327,6 +346,7 @@ func TestDirectSender_SendDirectToConnectedPeerNotConnectedPeerShouldErr(t *test
 			},
 		},
 		blankMessageHandler,
+		libp2p.WithTopicProcessorChecker(allTopicsRegistered),
 	)
 
 	err := ds.Send("topic", []byte("data"), "not connected peer")
@@ -350,6 +370,7 @@ func TestDirectSender_SendDirectToConnectedPeerNewStreamErrorsShouldErr(t *testi
 		context.Background(),
 		hs,
 		blankMessageHandler,
+		libp2p.WithTopicProcessorChecker(allTopicsRegistered),
 	)
 
 	id, sk := createLibP2PCredentialsDirectSender()
@@ -385,6 +406,7 @@ func TestDirectSender_SendDirectToConnectedPeerExistingStreamShouldSendToStream(
 			},
 		},
 		blankMessageHandler,
+		libp2p.WithTopicProcessorChecker(allTopicsRegistered),
 	)
 
 	id, sk := createLibP2PCredentialsDirectSender()
@@ -446,6 +468,7 @@ func TestDirectSender_SendDirectToConnectedPeerNewStreamShouldSendToStream(t *te
 		context.Background(),
 		hs,
 		blankMessageHandler,
+		libp2p.WithTopicProcessorChecker(allTopicsRegistered),
 	)
 
 	id, sk := createLibP2PCredentialsDirectSender()
@@ -526,6 +549,7 @@ func TestDirectSender_ReceivedSentMessageShouldCallMessageHandlerTestFullCycle(t
 			chanDone <- true
 			return nil
 		},
+		libp2p.WithTopicProcessorChecker(allTopicsRegistered),
 	)
 
 	id, sk := createLibP2PCredentialsDirectSender()
@@ -573,6 +597,7 @@ func TestDirectSender_ValidateDirectMessageFromMismatchesFromConnectedPeerShould
 		context.Background(),
 		generateHostStub(),
 		blankMessageHandler,
+		libp2p.WithTopicProcessorChecker(allTopicsRegistered),
 	)
 
 	id, _ := createLibP2PCredentialsDirectSender()
@@ -592,7 +617,7 @@ func TestDirectSender_ValidateDirectMessageFromMismatchesFromConnectedPeerShould
 // ------- directStreamHandler
 
 func TestDirectSender_DirectStreamHandlerFailedReadDeadlineShouldFailClosed(t *testing.T) {
-	ds, err := libp2p.NewDirectSender(context.Background(), generateHostStub(), blankMessageHandler)
+	ds, err := libp2p.NewDirectSender(context.Background(), generateHostStub(), blankMessageHandler, libp2p.WithTopicProcessorChecker(allTopicsRegistered))
 	assert.Nil(t, err)
 
 	stream := mock.NewStreamMock()
@@ -611,4 +636,127 @@ func TestDirectSender_DirectStreamHandlerFailedReadDeadlineShouldFailClosed(t *t
 	}
 	assert.True(t, stream.IsReset(),
 		"stream with an unenforceable read deadline must be reset (fail closed)")
+}
+
+// An unknown topic must not consume a replay-cache entry, but validation must still pass so the
+// frame reaches directMessageHandler: that is where the payload is unmarshalled, and a malformed
+// payload has to keep earning its blacklist even on a topic nobody serves.
+func TestDirectSender_ValidateDirectMessageUnknownTopicDoesNotConsumeReplayCacheEntry(t *testing.T) {
+	t.Parallel()
+
+	handlerCalled := false
+	ds, _ := libp2p.NewDirectSender(
+		context.Background(),
+		generateHostStub(),
+		func(msg *pubsub.Message, fromConnectedPeer core.PeerID) error {
+			handlerCalled = true
+			return nil
+		},
+		libp2p.WithTopicProcessorChecker(func(topic string) bool { return topic == "known" }),
+	)
+
+	id, _ := createLibP2PCredentialsDirectSender()
+
+	msg := &pubsub_pb.Message{}
+	msg.Data = []byte("data")
+	msg.Seqno = []byte("11111111")
+	msg.From = []byte(id)
+	topic := "unknown"
+	msg.Topic = &topic
+
+	err := ds.ValidateDirectMessage(msg, id)
+
+	assert.Nil(t, err)
+	assert.False(t, ds.HasSeen(msg.GetFrom(), msg.GetSeqno()))
+	assert.Equal(t, 0, ds.SeenMessagesLen())
+
+	stream := mock.NewStreamMock()
+	stream.SetConn(&mock.ConnStub{RemotePeerCalled: func() peer.ID { return id }})
+	_ = ds.ProcessInboundFrame(msg, stream)
+
+	assert.True(t, handlerCalled, "an unknown-topic frame must still reach the handler")
+}
+
+func TestDirectSender_ValidateDirectMessageKnownTopicMarksReplayCacheEntry(t *testing.T) {
+	t.Parallel()
+
+	ds, _ := libp2p.NewDirectSender(
+		context.Background(),
+		generateHostStub(),
+		blankMessageHandler,
+		libp2p.WithTopicProcessorChecker(func(topic string) bool { return topic == "known" }),
+	)
+
+	id, _ := createLibP2PCredentialsDirectSender()
+
+	msg := &pubsub_pb.Message{}
+	msg.Data = []byte("data")
+	msg.Seqno = []byte("11111111")
+	msg.From = []byte(id)
+	topic := "known"
+	msg.Topic = &topic
+
+	err := ds.ValidateDirectMessage(msg, id)
+
+	assert.Nil(t, err)
+	assert.True(t, ds.HasSeen(msg.GetFrom(), msg.GetSeqno()))
+	assert.Equal(t, 1, ds.SeenMessagesLen())
+}
+
+func TestDirectSender_FloodingPeerDoesNotEvictAnotherPeersReplayEntry(t *testing.T) {
+	t.Parallel()
+
+	// room for exactly the two peers, so the flooder gets a bucket and has to overflow its own;
+	// sized through the config path, the same way production sizes it
+	ds, err := libp2p.NewDirectSenderWithConfig(
+		context.Background(),
+		generateHostStub(),
+		blankMessageHandler,
+		config.DirectSendConfig{MaxSeenMessages: 2 * libp2p.SeenMessagesPerPeer},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	victim, _ := createLibP2PCredentialsDirectSender()
+	flooder, _ := createLibP2PCredentialsDirectSender()
+
+	seqno := []byte("11111111")
+	ds.MarkSeen([]byte(victim), seqno)
+
+	for i := 0; i < libp2p.SeenMessagesPerPeer*4; i++ {
+		fresh := make([]byte, 8)
+		binary.BigEndian.PutUint64(fresh, uint64(i))
+		ds.MarkSeen([]byte(flooder), fresh)
+	}
+
+	assert.True(t, ds.HasSeen([]byte(victim), seqno))
+}
+
+// TestNewDirectSender_ConfiguredMaxSeenMessagesIsApplied pins that the configured value reaches
+// the cache. Three peers against a cap sized for two: the third is refused a bucket, so its
+// frames are not counted. Under the 131072 default all three would be tracked and the count
+// would be 30 — which is what dropping the config wiring produced before this test existed.
+func TestNewDirectSender_ConfiguredMaxSeenMessagesIsApplied(t *testing.T) {
+	ds, err := libp2p.NewDirectSenderWithConfig(
+		context.Background(),
+		generateHostStub(),
+		blankMessageHandler,
+		config.DirectSendConfig{MaxSeenMessages: 2 * libp2p.SeenMessagesPerPeer},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for p := 0; p < 3; p++ {
+		peerID, _ := createLibP2PCredentialsDirectSender()
+		for i := 0; i < 10; i++ {
+			seqno := make([]byte, 8)
+			binary.BigEndian.PutUint64(seqno, uint64(p*100+i))
+			ds.MarkSeen([]byte(peerID), seqno)
+		}
+	}
+
+	assert.Equal(t, 20, ds.SeenMessagesLen(),
+		"a cap sized for two peers must track exactly two; a third counted means the configured value never reached the cache")
 }

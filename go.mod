@@ -50,7 +50,6 @@ require (
 	github.com/swaggo/swag v1.16.6
 	github.com/syndtr/goleveldb v1.0.1-0.20210819022825-2ae1ddf74ef7
 	github.com/urfave/cli v1.22.10
-	github.com/whyrusleeping/timecache v0.0.0-20160911033111-cfcb2f1abfee
 	golang.org/x/crypto v0.52.0
 	golang.org/x/term v0.43.0
 	golang.org/x/text v0.37.0

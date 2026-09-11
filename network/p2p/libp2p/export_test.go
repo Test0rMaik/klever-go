@@ -2,6 +2,7 @@ package libp2p
 
 import (
 	"context"
+	"encoding/binary"
 	"time"
 
 	"github.com/klever-io/klever-go/config"
@@ -17,10 +18,10 @@ import (
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	rate "github.com/libp2p/go-libp2p/x/rate"
 	ma "github.com/multiformats/go-multiaddr"
-	"github.com/whyrusleeping/timecache"
 )
 
 var MaxSendBuffSize = maxSendBuffSize
+var SeenMessagesPerPeer = seenMessagesPerPeer
 var BroadcastGoRoutines = broadcastGoRoutines
 var PubsubTimeCacheDuration = pubsubTimeCacheDuration
 var AcceptMessagesInAdvanceDuration = acceptMessagesInAdvanceDuration
@@ -69,7 +70,9 @@ func NewDirectSenderWithConfig(
 	messageHandler func(msg *pubsub.Message, fromConnectedPeer core.PeerID) error,
 	dsCfg config.DirectSendConfig,
 ) (*directSender, error) {
-	return NewDirectSender(ctx, h, messageHandler, withDirectSendConfig(dsCfg))
+	permissive := func(topic string) bool { return true }
+
+	return NewDirectSender(ctx, h, messageHandler, withDirectSendConfig(dsCfg), withTopicProcessorChecker(permissive))
 }
 
 func (ds *directSender) InboundStreamCaps() (int, int) {
@@ -108,8 +111,26 @@ func (ds *directSender) ValidateDirectMessage(message *pubsub_pb.Message, fromCo
 	return ds.validateDirectMessage(message, fromConnectedPeer)
 }
 
-func (ds *directSender) SeenMessages() *timecache.TimeCache {
-	return ds.seenMessages
+func (ds *directSender) ProcessInboundFrame(msg *pubsub_pb.Message, s network.Stream) error {
+	return ds.processInboundFrame(msg, s)
+}
+
+func (ds *directSender) MarkSeen(from []byte, seqno []byte) {
+	ds.seenMessages.hasOrAdd(string(from), binary.BigEndian.Uint64(seqno))
+}
+
+func (ds *directSender) HasSeen(from []byte, seqno []byte) bool {
+	return ds.seenMessages.has(string(from), binary.BigEndian.Uint64(seqno))
+}
+
+func (ds *directSender) SeenMessagesLen() int {
+	return ds.seenMessages.len()
+}
+
+// WithTopicProcessorChecker exposes the (required) constructor option to the external test
+// package, which cannot name the unexported directSenderOption type but can pass one along.
+func WithTopicProcessorChecker(hasTopicProcessor func(topic string) bool) directSenderOption {
+	return withTopicProcessorChecker(hasTopicProcessor)
 }
 
 func (ds *directSender) Counter() uint64 {

@@ -2060,8 +2060,10 @@ func TestValidateDirectSendConfig_RejectsNegativeStreamCaps(t *testing.T) {
 	t.Parallel()
 
 	for name, dsCfg := range map[string]config.DirectSendConfig{
-		"negative per-peer cap":  {MaxInboundStreamsPerPeer: -1},
-		"negative node-wide cap": {MaxInboundStreamsTotal: -1},
+		"negative per-peer cap":                 {MaxInboundStreamsPerPeer: -1},
+		"negative node-wide cap":                {MaxInboundStreamsTotal: -1},
+		"negative replay cache cap":             {MaxSeenMessages: -1},
+		"replay cache cap below one peer share": {MaxSeenMessages: 63},
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := libp2p.ValidateDirectSendConfig(dsCfg)
@@ -2078,5 +2080,8 @@ func TestValidateDirectSendConfig_AcceptsUnsetAndPositiveStreamCaps(t *testing.T
 	require.Nil(t, libp2p.ValidateDirectSendConfig(config.DirectSendConfig{
 		MaxInboundStreamsPerPeer: 8,
 		MaxInboundStreamsTotal:   1024,
+		MaxSeenMessages:          4096,
 	}))
+	require.Nil(t, libp2p.ValidateDirectSendConfig(config.DirectSendConfig{MaxSeenMessages: 64}),
+		"exactly one peer share is the smallest honest cap and must be accepted")
 }

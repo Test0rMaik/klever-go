@@ -344,6 +344,7 @@ func createMessenger(
 		p2pHost,
 		netMes.directMessageHandler,
 		withDirectSendConfig(args.P2pConfig.DirectSend),
+		withTopicProcessorChecker(netMes.hasTopicProcessor),
 	)
 	if err != nil {
 		return nil, err
@@ -1150,6 +1151,13 @@ func (netMes *networkMessenger) sendDirectToSelf(topic string, buff []byte) erro
 	return netMes.directMessageHandler(msg, netMes.ID())
 }
 
+func (netMes *networkMessenger) hasTopicProcessor(topic string) bool {
+	netMes.mutTopics.RLock()
+	defer netMes.mutTopics.RUnlock()
+
+	return netMes.processors[topic] != nil
+}
+
 func (netMes *networkMessenger) directMessageHandler(message *pubsub.Message, fromConnectedPeer core.PeerID) (err error) {
 	var processor p2p.MessageProcessor
 
@@ -1384,6 +1392,19 @@ func validateDirectSendConfig(dsCfg config.DirectSendConfig) error {
 	if dsCfg.MaxInboundStreamsTotal < 0 {
 		return fmt.Errorf("p2p.directSend.maxInboundStreamsTotal must be non-negative, got %d",
 			dsCfg.MaxInboundStreamsTotal)
+	}
+
+	if dsCfg.MaxSeenMessages < 0 {
+		return fmt.Errorf("p2p.directSend.maxSeenMessages must be non-negative, got %d",
+			dsCfg.MaxSeenMessages)
+	}
+
+	// Every tracked peer holds a fixed share of seenMessagesPerPeer entries, so a total below one
+	// share still allocates a full share: 1 would be a 64-entry cache. Reject it rather than
+	// silently exceed what the operator wrote.
+	if dsCfg.MaxSeenMessages > 0 && dsCfg.MaxSeenMessages < seenMessagesPerPeer {
+		return fmt.Errorf("p2p.directSend.maxSeenMessages must be 0 (default) or at least %d, got %d",
+			seenMessagesPerPeer, dsCfg.MaxSeenMessages)
 	}
 
 	return nil

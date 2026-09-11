@@ -611,7 +611,7 @@ func TestDirectSender_SendDoesNotRetryAfterWriteTimeout(t *testing.T) {
 		},
 	}
 
-	ds, err := libp2p.NewDirectSender(context.Background(), hs, blankMessageHandler)
+	ds, err := libp2p.NewDirectSender(context.Background(), hs, blankMessageHandler, libp2p.WithTopicProcessorChecker(allTopicsRegistered))
 	require.Nil(t, err)
 
 	start := time.Now()
@@ -747,6 +747,7 @@ func TestDirectSender_StalledStreamReaderIsReclaimed(t *testing.T) {
 			SetStreamHandlerCalled: func(protocol.ID, network.StreamHandler) {},
 		},
 		func(*pubsub.Message, core.PeerID) error { return nil },
+		libp2p.WithTopicProcessorChecker(allTopicsRegistered),
 	)
 	require.Nil(t, err)
 

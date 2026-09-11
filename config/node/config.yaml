@@ -50,9 +50,22 @@ p2p:
   # the node logs "refusing inbound direct stream" when a cap is hit. Negative
   # values are a configuration error and the node refuses to start.
   #
+  # maxSeenMessages caps the direct-send replay cache, which rejects a repeated
+  # (peer, sequence number) inside a 120s window. Every peer gets a fixed share of
+  # 64 identifiers, so the cache tracks maxSeenMessages/64 peers (2048 by default)
+  # and a peer's own traffic is the only thing that can shorten its own window. A
+  # peer arriving while every slot is held by a peer active in the last 120s is
+  # not tracked, and so not deduplicated, until one of them goes quiet. The node
+  # warns when that happens ("direct-send replay cache full"), at most once per
+  # 120s; if you see it, raise this value. Memory is about 2.5 KiB per tracked peer,
+  # allocated only as peers appear, so the value is a ceiling and raising it is
+  # cheap. 0 means the default; a positive value below 64 is rejected at startup,
+  # since one peer share is the smallest real cap.
+  #
   # directSend:
   #   maxInboundStreamsPerPeer: 4
   #   maxInboundStreamsTotal: 512
+  #   maxSeenMessages: 131072
 
 logs:
   logFileLifeSpanInSec: 86400
