@@ -5,15 +5,15 @@ import (
 	"sync"
 )
 
-// connLimiter caps the number of simultaneous live /subscribe WebSocket connections,
-// both node-wide and per source IP. The gin global throttler cannot do this: it
-// releases its slot at the HTTP->WS upgrade, so live connections are uncounted
+// ConnLimiter caps the number of simultaneous live WebSocket connections on a route
+// (/subscribe, /log), both node-wide and per source IP. The gin global throttler cannot
+// do this: it releases its slot at the HTTP->WS upgrade, so live connections are uncounted
 // (GHSA-4fwh-wrm6-97xm, GAP#3). A slot is acquired before the upgrade and released
 // exactly once when the connection is torn down.
 //
 // A zero maximum means "unlimited" for that dimension. Per-IP must be tunable to 0
 // because behind a reverse proxy every client shares the proxy's source IP.
-type connLimiter struct {
+type ConnLimiter struct {
 	mu        sync.Mutex
 	global    int
 	maxGlobal int
@@ -21,8 +21,9 @@ type connLimiter struct {
 	maxPerIP  int
 }
 
-func newConnLimiter(maxGlobal, maxPerIP uint32) *connLimiter {
-	return &connLimiter{
+// NewConnLimiter builds a limiter with the given node-wide and per-IP caps (0 = unlimited).
+func NewConnLimiter(maxGlobal, maxPerIP uint32) *ConnLimiter {
+	return &ConnLimiter{
 		maxGlobal: ClampUint32ToInt(maxGlobal),
 		maxPerIP:  ClampUint32ToInt(maxPerIP),
 		perIP:     make(map[string]int),
@@ -40,9 +41,9 @@ func ClampUint32ToInt(v uint32) int {
 	return int(v)
 }
 
-// acquire reserves a connection slot for ip. It returns an idempotent release func
+// Acquire reserves a connection slot for ip. It returns an idempotent release func
 // and true on success, or nil and false when a cap is reached.
-func (l *connLimiter) acquire(ip string) (func(), bool) {
+func (l *ConnLimiter) Acquire(ip string) (func(), bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 

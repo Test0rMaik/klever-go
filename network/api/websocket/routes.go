@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	gorilla "github.com/gorilla/websocket"
 	logger "github.com/klever-io/klever-go-logger"
 	indexer "github.com/klever-io/klever-go/indexer"
+	"github.com/klever-io/klever-go/network/api/shared"
 	"github.com/klever-io/klever-go/websocket"
 )
 
@@ -20,12 +22,27 @@ const (
 	subscribeOp          = "ws.Subscribe"
 )
 
+// HandshakeTimeout bounds the write of the 101 upgrade response. Gorilla clears every deadline
+// on the hijacked socket before that write and re-arms one only when this field is set, and the
+// HTTP server's write timeout is deliberately unset, so without it a peer that leaves the send
+// buffer full and then upgrades parks the handler inside Upgrade — holding the connection-limiter
+// slot and the global throttler slot, with no deadline anywhere to reclaim either. The sender's
+// own handshake deadline only starts once Upgrade has returned.
+const HandshakeTimeout = 10 * time.Second
+
 var upgrader = gorilla.Upgrader{
 	// Origin isn't enforced here by design: the node runs headless behind an operator proxy
-	// that owns origin/CORS policy, and /subscribe carries no ambient credentials (KLC-2450).
+	// that owns origin/CORS policy (KLC-2450). Note this is a delegation, not an absence of
+	// risk — the original rationale claimed /subscribe carries no ambient credentials, which
+	// is wrong: api.go attaches Basic Auth when the route is `secured`, and browsers replay
+	// cached credentials on a same-host WebSocket handshake. A secured /subscribe fronted by
+	// a proxy that does not check Origin is CSWSH-exposed the way /log was before
+	// AllowedOriginChecker below. Enforce origin at the proxy, or keep /subscribe unsecured
+	// and public.
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
+	HandshakeTimeout: HandshakeTimeout,
 }
 
 type subscribeRequest struct {
@@ -50,7 +67,7 @@ func SubscribeTopics(ws *gin.Engine, hub *websocket.SocketHub, opts ...Subscribe
 	}
 
 	// One limiter shared by every connection for the server lifetime.
-	limiter := newConnLimiter(opt.MaxConnections, opt.MaxConnectionsPerIP)
+	limiter := NewConnLimiter(opt.MaxConnections, opt.MaxConnectionsPerIP)
 
 	handlers := append([]gin.HandlerFunc{}, opt.AuthHandlers...)
 	handlers = append(handlers, func(c *gin.Context) {
@@ -59,8 +76,8 @@ func SubscribeTopics(ws *gin.Engine, hub *websocket.SocketHub, opts ...Subscribe
 	ws.GET("/subscribe", handlers...)
 }
 
-func handleSubscribe(c *gin.Context, hub *websocket.SocketHub, limiter *connLimiter) {
-	release, ok := limiter.acquire(remoteIP(c.Request))
+func handleSubscribe(c *gin.Context, hub *websocket.SocketHub, limiter *ConnLimiter) {
+	release, ok := limiter.Acquire(RemoteIP(c.Request))
 	if !ok {
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, map[string]string{"error": "too many websocket connections"})
 		return
@@ -76,7 +93,7 @@ func handleSubscribe(c *gin.Context, hub *websocket.SocketHub, limiter *connLimi
 		return
 	}
 
-	go processSubscription(conn, hub, release)
+	shared.SafeGo(log, subscribeOp, conn, func() { processSubscription(conn, hub, release) })
 }
 
 // rejectHandshake answers a bad subscribe with a reason and closes. The write is bounded
@@ -91,20 +108,67 @@ func rejectHandshake(conn *gorilla.Conn, reason string) {
 	_ = conn.Close()
 }
 
-// remoteIP returns the connecting peer's IP from the raw remote address. It does not
-// trust X-Forwarded-For, so the per-IP connection cap cannot be spoofed (matches the
-// existing sourceThrottler middleware).
-func remoteIP(r *http.Request) string {
+// RemoteIP returns the per-IP cap key for the connecting peer, derived from the raw remote
+// address. It does not trust X-Forwarded-For, so the key cannot be spoofed (matches the
+// existing sourceThrottler middleware), and it buckets IPv6 by /64 so a single routed
+// allocation cannot masquerade as unlimited distinct sources.
+func RemoteIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		return shared.IPBucket(r.RemoteAddr)
 	}
-	return host
+	return shared.IPBucket(host)
+}
+
+// AllowedOriginChecker returns a gorilla CheckOrigin func for a route that may carry ambient
+// credentials. A request with no Origin header is a non-browser client — the log viewer, curl,
+// wscat. Origin is set by the browser and page script cannot forge it, so its absence means no
+// web page is driving the connection, and the request is allowed. A request that does carry an
+// Origin came from a page, and is allowed only if that origin is on the list: this is what stops
+// a site an operator happens to visit from opening ws://localhost:8080/log and streaming node
+// logs on their credentials (CSWSH).
+//
+// An empty allowlist therefore blocks every browser origin while leaving every non-browser
+// client working, which is the right default for a headless node.
+func AllowedOriginChecker(allowed []string) func(*http.Request) bool {
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, origin := range allowed {
+		allowedSet[strings.ToLower(strings.TrimSpace(origin))] = struct{}{}
+	}
+
+	return func(r *http.Request) bool {
+		// Values, not Get: Get returns the first value only and reports an explicitly empty
+		// header the same as an absent one. Absent is the non-browser case and is allowed.
+		// An empty value, or more than one, is neither what a browser sends nor what the
+		// operator listed, and is refused rather than matched on its first entry.
+		origins := r.Header.Values("Origin")
+		if len(origins) == 0 {
+			return true
+		}
+		if len(origins) != 1 || origins[0] == "" {
+			return false
+		}
+
+		_, ok := allowedSet[strings.ToLower(origins[0])]
+		return ok
+	}
+}
+
+// NewUpgrader builds the upgrader for a route that may carry ambient credentials: the origin
+// allowlist above, and the handshake write bound every upgrader here must carry. Built once at
+// registration and never mutated afterwards; assigning CheckOrigin per request raced with
+// Upgrade reading it.
+func NewUpgrader(allowedOrigins []string) gorilla.Upgrader {
+	return gorilla.Upgrader{
+		CheckOrigin:      AllowedOriginChecker(allowedOrigins),
+		HandshakeTimeout: HandshakeTimeout,
+	}
 }
 
 func processSubscription(conn *gorilla.Conn, hub *websocket.SocketHub, release func()) {
-	// Held for the whole connection lifetime: fires on every early return below and, once
-	// the client is live, after <-client.Done() unblocks at teardown.
+	// Held for the whole connection lifetime: fires on every early return below, once the
+	// client is live after <-client.Done() unblocks at teardown, and on the unwind if anything
+	// below panics (SafeGo recovers above this frame).
 	defer release()
 
 	// Bound the handshake frame before it is read.

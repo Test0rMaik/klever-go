@@ -21,7 +21,6 @@ import (
 	"github.com/gin-contrib/pprof"
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
-	"github.com/gorilla/websocket"
 	logger "github.com/klever-io/klever-go-logger"
 	"github.com/klever-io/klever-go/config"
 	"github.com/klever-io/klever-go/core"
@@ -33,6 +32,7 @@ import (
 	"github.com/klever-io/klever-go/network/api/middleware"
 	"github.com/klever-io/klever-go/network/api/network"
 	"github.com/klever-io/klever-go/network/api/node"
+	"github.com/klever-io/klever-go/network/api/shared"
 	"github.com/klever-io/klever-go/network/api/transaction"
 	valStats "github.com/klever-io/klever-go/network/api/validator"
 	wsocket "github.com/klever-io/klever-go/network/api/websocket"
@@ -50,6 +50,15 @@ const (
 
 	subscribePackage = "subscribe"
 	subscribeRoute   = "/subscribe"
+
+	// defaultLogWSMaxConnections is the node-wide /log cap used when logWebSocketConnections
+	// resolves to 0 (a config.yaml predating the key). It cannot be disabled: before the cap
+	// existed, live /log connections still ran inside the gin global throttler's slot and were
+	// bounded by simultaneousRequests. Streaming now runs off the request goroutine, so that
+	// slot is released at the upgrade — treating 0 as "unlimited" here would leave an
+	// unmigrated node strictly weaker than before. To lift the cap, set an explicit high value
+	// (the same rule the address caps follow).
+	defaultLogWSMaxConnections = 32
 )
 
 type validatorInput struct {
@@ -136,10 +145,15 @@ func RegisterRoutes(ctx context.Context, ws *gin.Engine, routesConfig config.API
 	if ok && apiHandler.PprofEnabled() {
 		pprof.Register(ws)
 	}
-
 	if routesConfig.IsRouteEnabled(logPackage, logRoute) {
-		marshalizerForLogs := &marshal.ProtoMarshalizer{}
-		registerLoggerWsRoute(ws, marshalizerForLogs, routesConfig)
+		var logMaxConns, logMaxConnsPerIP uint32
+		var logAllowedOrigins []string
+		if ok {
+			logMaxConns = apiHandler.LogWSMaxConnections()
+			logMaxConnsPerIP = apiHandler.LogWSMaxConnectionsPerIP()
+			logAllowedOrigins = apiHandler.LogWSAllowedOrigins()
+		}
+		registerLoggerWsRoute(ws, &marshal.ProtoMarshalizer{}, routesConfig, logMaxConns, logMaxConnsPerIP, logAllowedOrigins)
 	}
 
 	// secured only attaches the auth handler; the route is registered on open. Warn on
@@ -200,31 +214,67 @@ func RegisterDefaultValidators() error {
 	return nil
 }
 
-func registerLoggerWsRoute(ws *gin.Engine, marshalizer marshal.Marshalizer, routesConfig config.APIRoutesConfig) {
-	upgrader := websocket.Upgrader{}
+func registerLoggerWsRoute(
+	ws *gin.Engine,
+	marshalizer marshal.Marshalizer,
+	routesConfig config.APIRoutesConfig,
+	maxConns uint32,
+	maxConnsPerIP uint32,
+	allowedOrigins []string,
+) {
+	// Built once and never mutated afterwards. The origin check used to be assigned on every
+	// request, which raced with Upgrade reading it as soon as two clients dialled /log at the
+	// same time — the exact concurrency this route now invites.
+	upgrader := wsocket.NewUpgrader(allowedOrigins)
+
+	if maxConns == 0 {
+		maxConns = defaultLogWSMaxConnections
+		log.Warn("logWebSocketConnections is 0; applying the built-in /log cap",
+			"maxConnections", maxConns)
+	}
+	// maxConnsPerIP keeps 0 = unlimited: behind a reverse proxy every client shares the proxy's
+	// IP, so the per-IP dimension has to stay disableable. It is a new protection, not a
+	// replacement for one, and maxConns still bounds the route when it is off.
+	limiter := wsocket.NewConnLimiter(maxConns, maxConnsPerIP)
+	// A rejected upgrade is peer-driven: a page an operator visits can retry an unlisted
+	// origin at will on cached credentials, and on an unsecured /log a bare GET does the same.
+	// One budget for the route, as /subscribe has: one line per window with the count.
+	upgradeFailWarn := clientSocket.NewDropWarner(clientSocket.PeerDrivenLogWindow)
 
 	// Only an authenticated (secured) /log may apply a client-supplied logger profile to the
 	// process-global logger; on an unauthenticated /log profiles are ignored (GHSA-9v8p-frvj-2pcm).
 	secured := routesConfig.IsRouteSecured(logPackage, logRoute)
 
 	logHandler := func(c *gin.Context) {
-		upgrader.CheckOrigin = func(r *http.Request) bool {
-			return true
+		release, ok := limiter.Acquire(wsocket.RemoteIP(c.Request))
+		if !ok {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, map[string]string{"error": "too many websocket connections"})
+			return
 		}
 
 		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
-			log.Error(err.Error())
+			release()
+			if count, ok := upgradeFailWarn.Fire(); ok {
+				log.Warn("/log websocket upgrade failed", "error", shared.QuoteForLog(err.Error()), "similarSinceLastLog", count)
+			}
 			return
 		}
 
 		ls, err := logs.NewLogSender(marshalizer, conn, log, secured)
 		if err != nil {
-			log.Error(err.Error())
+			release()
+			_ = conn.Close()
+			log.Error("/log cannot create log sender", "error", shared.QuoteForLog(err.Error()))
 			return
 		}
 
-		ls.StartSendingBlocking()
+		// Streaming no longer runs on the request goroutine, so gin.Recovery() no longer
+		// contains it; SafeGo does, and release() runs on the unwind.
+		shared.SafeGo(log, "/log stream", conn, func() {
+			defer release()
+			ls.StartSendingBlocking()
+		})
 	}
 
 	handlers := []gin.HandlerFunc{logHandler}

@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	logger "github.com/klever-io/klever-go-logger"
+	"github.com/klever-io/klever-go/common/mock"
 	"github.com/klever-io/klever-go/config"
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/network/api/httpserver"
@@ -135,6 +139,45 @@ func TestLogRoute_UnsecuredReachesUpgrade(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (reaches upgrader, no auth gate)", w.Code)
+	}
+}
+
+// TestLogRoute_BrowserOriginRejected covers the seednode CSWSH guard (CWE-1385): /log ships
+// secured, and secured also enables profile application, so a page an operator visits must not
+// be able to open the socket on cached Basic credentials. A request carrying an Origin is a
+// browser and is rejected; one without is a non-browser client and passes the origin check
+// (then fails on the missing Sec-WebSocket-Key, which is past the check).
+func TestLogRoute_BrowserOriginRejected(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	srv := &server{
+		marshalizer:  &marshal.ProtoMarshalizer{},
+		messenger:    &stubMessenger{},
+		routesConfig: seedLogRoutesConfig(true, false),
+	}
+	r := gin.New()
+	srv.registerRoutes(r)
+
+	for _, tc := range []struct {
+		origin string
+		want   int
+	}{
+		{origin: "https://evil.example", want: http.StatusForbidden},
+		{origin: "null", want: http.StatusForbidden},
+		{origin: "", want: http.StatusBadRequest},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/log", nil)
+		req.Header.Set("Connection", "upgrade")
+		req.Header.Set("Upgrade", "websocket")
+		req.Header.Set("Sec-Websocket-Version", "13")
+		if tc.origin != "" {
+			req.Header.Set("Origin", tc.origin)
+		}
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != tc.want {
+			t.Errorf("Origin %q: status = %d, want %d", tc.origin, w.Code, tc.want)
+		}
 	}
 }
 
@@ -378,4 +421,175 @@ func countNonEmptyLines(body string) int {
 		}
 	}
 	return n
+}
+
+// startSeednodeLogServer serves the seednode's open, unsecured /log over a real socket so a
+// test can dial it with a websocket client.
+func startSeednodeLogServer(t *testing.T, marshalizer marshal.Marshalizer) string {
+	t.Helper()
+
+	gin.SetMode(gin.TestMode)
+	srv := &server{
+		marshalizer:  marshalizer,
+		messenger:    &stubMessenger{},
+		routesConfig: seedLogRoutesConfig(true, false),
+	}
+	r := gin.New()
+	srv.registerRoutes(r)
+
+	hs := httptest.NewServer(r)
+	t.Cleanup(hs.Close)
+
+	return hs.Listener.Addr().String()
+}
+
+func dialSeednodeLog(addr string, header http.Header) (*websocket.Conn, *http.Response, error) {
+	return websocket.DefaultDialer.Dial("ws://"+addr+"/log", header)
+}
+
+// fillSeednodeLogCap opens and handshakes logWSMaxConnections sessions and returns them; the
+// caller owns their closing.
+func fillSeednodeLogCap(t *testing.T, addr string) []*websocket.Conn {
+	t.Helper()
+
+	conns := make([]*websocket.Conn, 0, logWSMaxConnections)
+	for i := 0; i < logWSMaxConnections; i++ {
+		conn, _, err := dialSeednodeLog(addr, nil)
+		if err != nil {
+			t.Fatalf("dial %d within the cap: %v", i, err)
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(core.DefaultLogProfileIdentifier)); err != nil {
+			t.Fatalf("handshake %d: %v", i, err)
+		}
+		conns = append(conns, conn)
+	}
+
+	return conns
+}
+
+func expectSeednodeLogRefused(t *testing.T, addr string) {
+	t.Helper()
+
+	_, resp, err := dialSeednodeLog(addr, nil)
+	if err == nil {
+		t.Fatal("a dial beyond the cap must be refused")
+	}
+	if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("beyond the cap: resp = %v, want 503", resp)
+	}
+}
+
+// TestLogRoute_ConnectionCap covers the seednode's built-in cap: it has no config to size one
+// from, so live /log sessions are bounded at logWSMaxConnections and the next dial is refused.
+func TestLogRoute_ConnectionCap(t *testing.T) {
+	addr := startSeednodeLogServer(t, &marshal.ProtoMarshalizer{})
+
+	conns := fillSeednodeLogCap(t, addr)
+	t.Cleanup(func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+
+	expectSeednodeLogRefused(t, addr)
+}
+
+// TestLogRoute_ConnectionCapIsReleasedOnClose is the other half of a cap: a session that ends
+// must hand its slot back, or the route fills up once and stays full. Filling the cap alone
+// cannot see a deleted release.
+func TestLogRoute_ConnectionCapIsReleasedOnClose(t *testing.T) {
+	addr := startSeednodeLogServer(t, &marshal.ProtoMarshalizer{})
+
+	conns := fillSeednodeLogCap(t, addr)
+	t.Cleanup(func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	expectSeednodeLogRefused(t, addr)
+
+	if err := conns[0].Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		reconnected, _, err := dialSeednodeLog(addr, nil)
+		if err == nil {
+			_ = reconnected.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("slot must be released once the session tears down; the cap is stuck")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestLogRoute_RejectedUpgradeReleasesSlot: a dial refused at the origin check takes a slot
+// before the upgrade and must give it back, or cap+1 rejected browsers lock every operator out.
+func TestLogRoute_RejectedUpgradeReleasesSlot(t *testing.T) {
+	addr := startSeednodeLogServer(t, &marshal.ProtoMarshalizer{})
+
+	for i := 0; i < logWSMaxConnections+1; i++ {
+		_, resp, err := dialSeednodeLog(addr, http.Header{"Origin": []string{"https://evil.example"}})
+		if err == nil || resp == nil || resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("dial %d: want 403, got err=%v resp=%v", i, err, resp)
+		}
+	}
+
+	conn, _, err := dialSeednodeLog(addr, nil)
+	if err != nil {
+		t.Fatalf("rejected dials must hand their slot back, leaving the cap free: %v", err)
+	}
+	_ = conn.Close()
+}
+
+// TestLogRoute_UpgradeFailuresAreBudgeted counts what the logger emits: twenty origin-rejected
+// dials, one line. A page an operator visits can drive these at will on cached credentials.
+func TestLogRoute_UpgradeFailuresAreBudgeted(t *testing.T) {
+	counter := mock.NewLogLineCounter("/log websocket upgrade failed")
+	if err := logger.AddLogObserver(counter, counter); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = logger.RemoveLogObserver(counter) })
+
+	addr := startSeednodeLogServer(t, &marshal.ProtoMarshalizer{})
+	for i := 0; i < 20; i++ {
+		_, resp, err := dialSeednodeLog(addr, http.Header{"Origin": []string{"https://evil.example"}})
+		if err == nil || resp == nil || resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("dial %d: want 403, got err=%v resp=%v", i, err, resp)
+		}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for counter.Count() < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := counter.Count(); got != 1 {
+		t.Fatalf("upgrade-failure lines = %d, want 1: the budget must fold twenty rejections into one line", got)
+	}
+}
+
+// TestLogRoute_SenderFailureClosesTheSocket: past Upgrade the socket is hijacked and nothing
+// but the handler will ever close it, so a sender that cannot be built must not leave it open.
+func TestLogRoute_SenderFailureClosesTheSocket(t *testing.T) {
+	// A nil marshalizer is the one way NewLogSender refuses a live connection.
+	addr := startSeednodeLogServer(t, nil)
+
+	conn, _, err := dialSeednodeLog(addr, nil)
+	if err != nil {
+		t.Fatalf("the upgrade completes before the sender is built: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _, err = conn.ReadMessage()
+	if err == nil {
+		t.Fatal("expected the server to close the socket")
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		t.Fatal("socket left open after the sender failed to build: the read timed out instead of failing on close")
+	}
 }

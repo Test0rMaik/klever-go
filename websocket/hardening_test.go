@@ -759,3 +759,15 @@ func TestUnexpectedClose_ANodeSideCloseIsNotAReadFailure(t *testing.T) {
 	// and it stays on the read budget where it is bounded.
 	require.True(t, unexpectedClose(errors.New("i/o timeout")))
 }
+
+// TestNewDropWarner_ClampsNonPositiveWindow pins the constructor: the zero value of dropWarner is
+// not a rate limiter, since a zero window lets every occurrence through, so a caller that passes
+// a zero or sub-second window must still get one that suppresses.
+func TestNewDropWarner_ClampsNonPositiveWindow(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, int64(1), NewDropWarner(0).w.windowSecs, "a zero window would let every occurrence through")
+	assert.Equal(t, int64(1), NewDropWarner(-time.Second).w.windowSecs)
+	assert.Equal(t, int64(1), NewDropWarner(500*time.Millisecond).w.windowSecs)
+	assert.Equal(t, int64(10), NewDropWarner(10*time.Second).w.windowSecs)
+}

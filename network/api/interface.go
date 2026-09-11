@@ -21,6 +21,9 @@ type MainAPIHandler interface {
 	WSMaxConnections() uint32
 	WSMaxConnectionsPerIP() uint32
 	WSMaxAddressesPerSubscribe() uint32
+	LogWSMaxConnections() uint32
+	LogWSMaxConnectionsPerIP() uint32
+	LogWSAllowedOrigins() []string
 	WSMaxAddressesPerClient() uint32
 	WSPostWorkers() uint32
 	WSPostQueueSize() uint32

@@ -384,6 +384,25 @@ func (nf *nodeFacade) WSMaxConnectionsPerIP() uint32 {
 	return nf.wsAntifloodConfig.WebSocketConnectionsPerIP
 }
 
+// LogWSMaxConnections returns the node-wide cap on simultaneous live /log
+// WebSocket connections (0 = use the built-in default). Unlike the /subscribe caps
+// this one cannot be disabled; see defaultLogWSMaxConnections in network/api/api.go.
+func (nf *nodeFacade) LogWSMaxConnections() uint32 {
+	return nf.wsAntifloodConfig.LogWebSocketConnections
+}
+
+// LogWSMaxConnectionsPerIP returns the per-source-IP cap on simultaneous live
+// /log WebSocket connections (0 = unlimited).
+func (nf *nodeFacade) LogWSMaxConnectionsPerIP() uint32 {
+	return nf.wsAntifloodConfig.LogWebSocketConnectionsPerIP
+}
+
+// LogWSAllowedOrigins returns the browser origins allowed to open /log. An empty list
+// blocks every browser origin; clients that send no Origin header are unaffected.
+func (nf *nodeFacade) LogWSAllowedOrigins() []string {
+	return nf.wsAntifloodConfig.LogWebSocketAllowedOrigins
+}
+
 // WSMaxAddressesPerSubscribe returns the per-call address cap for a /subscribe
 // request (0 = built-in default).
 func (nf *nodeFacade) WSMaxAddressesPerSubscribe() uint32 {

@@ -9,17 +9,26 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
 	logger "github.com/klever-io/klever-go-logger"
 	"github.com/klever-io/klever-go/config"
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/network/api/httpserver"
 	"github.com/klever-io/klever-go/network/api/logs"
 	"github.com/klever-io/klever-go/network/api/middleware"
+	"github.com/klever-io/klever-go/network/api/shared"
+	wsocket "github.com/klever-io/klever-go/network/api/websocket"
 	"github.com/klever-io/klever-go/tools/marshal"
+	clientSocket "github.com/klever-io/klever-go/websocket"
 )
 
 var log = logger.GetOrCreate("seednode/api")
+
+// logWSMaxConnections caps live seednode /log connections, node-wide, with no per-IP dimension
+// and no knob: the seednode has no webServer antiflood section to read one from, and every live
+// session registers a process-global observer that formats every log line, so unbounded is the
+// wrong default for a route nobody needs tens of. It is the node's built-in fallback, for the
+// same reason.
+const logWSMaxConnections = 32
 
 // Route package keys, config route names, and served URL paths, kept as constants to avoid
 // duplicating the string literals across registration and the fail-safe default.
@@ -107,26 +116,48 @@ func (s *server) registerGet(ws *gin.Engine, pkg, configName, path string, handl
 }
 
 func (s *server) registerLoggerWsRoute(ws *gin.Engine) {
-	upgrader := websocket.Upgrader{}
+	// Built once and never mutated afterwards: assigning CheckOrigin per request raced with
+	// Upgrade reading it whenever two clients dialled /log at the same time. The seednode has no
+	// allowlist config, so the nil list applies the node's default: non-browser clients (no
+	// Origin header) are allowed, every browser origin is rejected. /log ships secured, and
+	// secured also enables profile application, so an unconditional CheckOrigin let a page an
+	// operator visited stream seednode logs on cached Basic credentials and mute the
+	// process-global logger (CSWSH, CWE-1385).
+	upgrader := wsocket.NewUpgrader(nil)
+	limiter := wsocket.NewConnLimiter(logWSMaxConnections, 0)
+	// Rejected upgrades are peer-driven — a page an operator visits can retry them at will on
+	// cached credentials — so they share one budget: one line per window with the count.
+	upgradeFailWarn := clientSocket.NewDropWarner(clientSocket.PeerDrivenLogWindow)
 
 	// Only an authenticated (secured) /log may apply a client-supplied logger profile to the
 	// process-global logger; on an unauthenticated /log profiles are ignored (GHSA-9v8p-frvj-2pcm).
 	secured := s.routesConfig.IsRouteSecured(logPackage, logRoute)
 
 	logHandler := func(c *gin.Context) {
-		upgrader.CheckOrigin = func(r *http.Request) bool {
-			return true
+		// Auth runs before this handler, so an unauthenticated peer takes no slot.
+		release, ok := limiter.Acquire(wsocket.RemoteIP(c.Request))
+		if !ok {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, map[string]string{"error": "too many websocket connections"})
+			return
 		}
+		// Streaming stays on the request goroutine — the seednode has no global throttler
+		// whose slot would need releasing — so this deferred release covers every exit,
+		// including a panic, which gin.Recovery contains here.
+		defer release()
 
 		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
-			log.Error(err.Error())
+			if count, ok := upgradeFailWarn.Fire(); ok {
+				log.Warn("/log websocket upgrade failed", "error", shared.QuoteForLog(err.Error()), "similarSinceLastLog", count)
+			}
 			return
 		}
 
 		ls, err := logs.NewLogSender(s.marshalizer, conn, log, secured)
 		if err != nil {
-			log.Error(err.Error())
+			// Past Upgrade the socket is hijacked; nothing else will close it.
+			_ = conn.Close()
+			log.Error("/log cannot create log sender", "error", shared.QuoteForLog(err.Error()))
 			return
 		}
 

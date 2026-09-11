@@ -48,6 +48,11 @@ var (
 	ErrHubClosed = errors.New("websocket hub is shutting down")
 )
 
+// PeerDrivenLogWindow is the window behind every peer-driven warning: one line per window,
+// carrying the count of what was folded into it. Shared with the /log routes, which have the
+// same class of event and no hub of their own.
+const PeerDrivenLogWindow = postQueueDropLogIntervalSeconds * time.Second
+
 // dropWarner rate-limits a recurring warning behind a fixed window: every occurrence
 // calls fire(), which folds the count since the last log into one summary line at most
 // once per window instead of logging every single occurrence. Deliberately a per-instance
@@ -59,6 +64,38 @@ type dropWarner struct {
 	count      atomicPkg.Counter
 	lastLogged int64 // unix seconds; accessed only via sync/atomic
 	windowSecs int64
+}
+
+// DropWarner is dropWarner for callers outside this package — the /log routes on the node and
+// the seednode, and the log sender — which have the same class of peer-driven event and no hub
+// of their own. It wraps rather than exports dropWarner so the hub's own call sites stay
+// exactly as #68 left them.
+type DropWarner struct {
+	w dropWarner
+}
+
+// NewDropWarner builds a warner for callers outside this package. The zero value of the
+// underlying warner is not a rate limiter — a zero window lets every occurrence through — so
+// the window is taken explicitly and a non-positive one is clamped to a second rather than
+// silently disabling it.
+func NewDropWarner(window time.Duration) *DropWarner {
+	secs := int64(window / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+
+	return &DropWarner{w: dropWarner{windowSecs: secs}}
+}
+
+// Fire records one occurrence and reports (count, true) with the number folded into the window
+// at most once per window; otherwise (0, false). See dropWarner.fire.
+func (d *DropWarner) Fire() (int64, bool) {
+	return d.w.fire()
+}
+
+// Flush reports any occurrences still pending in the current window. See dropWarner.flush.
+func (d *DropWarner) Flush() (int64, bool) {
+	return d.w.flush()
 }
 
 // fire records one occurrence and reports (count, true) with the number of occurrences

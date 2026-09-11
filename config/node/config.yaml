@@ -211,13 +211,31 @@ antiflood:
     # SameSourceResetIntervalInSec time frame between counter reset, in seconds
     sameSourceResetIntervalInSec: 1
     # WebSocketConnections caps simultaneous live /subscribe WebSocket connections node-wide.
-    # The throttlers above release their slot at the HTTP->WS upgrade and so do not bound live
-    # WS connections. 0 = unlimited.
+    # Neither throttler above bounds live WS connections: simultaneousRequests releases its slot
+    # at the HTTP->WS upgrade, and sameSourceRequests counts requests until its periodic reset,
+    # so a long-lived socket costs it one request. 0 = unlimited.
     webSocketConnections: 4096
     # WebSocketConnectionsPerIP caps simultaneous live /subscribe connections from a single
     # source IP. Behind a reverse proxy every client shares the proxy IP, so raise this (or set
     # 0 to disable) for proxied/public deployments. 0 = unlimited.
     webSocketConnectionsPerIP: 1024
+    # LogWebSocketConnections caps simultaneous live /log WebSocket connections node-wide.
+    # Each live /log connection registers a process-global log observer, so every log line is
+    # formatted and fanned out once per connection. Keep this small: /log is an operator
+    # diagnostic route, not a public feed. 0 = built-in default (32); this cap cannot be
+    # disabled, so set a high value rather than 0 to lift it.
+    logWebSocketConnections: 32
+    # LogWebSocketConnectionsPerIP caps simultaneous live /log connections from a single
+    # source IP. Behind a reverse proxy every client shares the proxy IP, so raise this (or set
+    # 0 to disable) for proxied deployments — it is much tighter than webSocketConnectionsPerIP
+    # above, so it is the one that will bite first. 0 = unlimited.
+    logWebSocketConnectionsPerIP: 8
+    # LogWebSocketAllowedOrigins lists the browser origins allowed to open /log. Clients that
+    # send no Origin header (the log viewer, curl, wscat) are always allowed; a browser is only
+    # allowed on an exact match, so the empty default blocks web pages while leaving normal
+    # tooling working. Add an entry (e.g. "https://ops.example.com") only for a browser-based
+    # log viewer you run yourself.
+    logWebSocketAllowedOrigins: []
     # WebSocketMaxAddressesPerSubscribe caps addresses accepted in one /subscribe call. The
     # inbound frame read limit is derived from this so a maximal subscribe always fits. 0 = default.
     webSocketMaxAddressesPerSubscribe: 10000

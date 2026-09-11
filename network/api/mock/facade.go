@@ -105,6 +105,21 @@ func (f *Facade) WSMaxConnectionsPerIP() uint32 {
 	return 0
 }
 
+// LogWSMaxConnections - distinct non-zero values so a test can tell the two caps apart.
+func (f *Facade) LogWSMaxConnections() uint32 {
+	return 32
+}
+
+// LogWSMaxConnectionsPerIP -
+func (f *Facade) LogWSMaxConnectionsPerIP() uint32 {
+	return 8
+}
+
+// LogWSAllowedOrigins -
+func (f *Facade) LogWSAllowedOrigins() []string {
+	return nil
+}
+
 // WSMaxAddressesPerSubscribe -
 func (f *Facade) WSMaxAddressesPerSubscribe() uint32 {
 	return 0

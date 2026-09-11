@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -234,4 +235,27 @@ func TestSubscribeTopics_ThenSendRequest(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "test-1", resp.ID)
 	assert.Contains(t, resp.Error, "facade unavailable")
+}
+
+// TestNewUpgrader_BoundsTheHandshakeWrite pins the two fields every upgrader built here must
+// carry. Gorilla clears the socket's deadlines before writing the 101 response and bounds that
+// write only when HandshakeTimeout is set; unset, a peer whose receive window is full parks the
+// handler inside Upgrade with the limiter slot and the throttler slot both held.
+func TestNewUpgrader_BoundsTheHandshakeWrite(t *testing.T) {
+	t.Parallel()
+
+	u := wsocket.NewUpgrader([]string{"https://ops.example.com"})
+
+	assert.Equal(t, wsocket.HandshakeTimeout, u.HandshakeTimeout)
+	assert.Positive(t, u.HandshakeTimeout, "an unset HandshakeTimeout leaves the 101 write unbounded")
+	assert.Equal(t, wsocket.HandshakeTimeout, wsocket.SubscribeUpgraderHandshakeTimeout(),
+		"/subscribe builds its upgrader separately and must carry the same bound")
+
+	require.NotNil(t, u.CheckOrigin)
+	listed := httptest.NewRequest(http.MethodGet, "/log", nil)
+	listed.Header.Set("Origin", "https://ops.example.com")
+	unlisted := httptest.NewRequest(http.MethodGet, "/log", nil)
+	unlisted.Header.Set("Origin", "https://evil.example.com")
+	assert.True(t, u.CheckOrigin(listed))
+	assert.False(t, u.CheckOrigin(unlisted))
 }

@@ -144,9 +144,10 @@ To help secure the Klever blockchain ecosystem:
 
 ## Deploying / Exposing the REST API
 
-The node's REST and WebSocket API performs **no origin checking**, and applies access control only
-where a route is explicitly marked `secured` in `api.yaml`. Whether it is safe is entirely a function
-of how you deploy it. This section is the operator-facing counterpart to the user guidance above, and
+The node's REST API performs **no origin checking** (the node `/log` WebSocket route is the sole
+exception — see [WebSocket origin policy](#websocket-origin-policy)), and applies access control
+only where a route is explicitly marked `secured` in `api.yaml`. Whether it is safe is entirely a
+function of how you deploy it. This section is the operator-facing counterpart to the user guidance above, and
 covers both deployables: the validator/observer node (`config/node/`) and the seednode
 (`config/seednode/`), which ship separate API configurations.
 
@@ -158,14 +159,16 @@ node does not second-guess it.**
 
 If you expose the API, it MUST be fronted by a reverse proxy that terminates TLS, enforces
 origin/CORS policy, and requires authentication. Firewall the API port so the node is reachable only
-through that proxy. The node itself will not reject a cross-origin request: `CheckOrigin` returns
-`true` unconditionally at all three WebSocket entry points
-(`network/api/websocket/routes.go`, `network/api/api.go`, `cmd/seednode/api/api.go`).
+through that proxy. Outside `/log`, the node itself will not reject a cross-origin request:
+`CheckOrigin` returns `true` unconditionally for `/subscribe` (`network/api/websocket/routes.go`).
 That is by design — origin policy belongs to the proxy — but it means an exposed node with no proxy
-has no origin protection at all.
+has essentially no origin protection. `/log` is the exception on both deployables: the node route
+(`network/api/api.go`) enforces `logWebSocketAllowedOrigins`, and the seednode route
+(`cmd/seednode/api/api.go`) has no allowlist and blocks every browser origin, because `/log` can be
+Basic-Auth protected and streams internal node state.
 
-**Do not run a browser on a validator host.** Because the API has no origin control, any page you
-visit can issue cross-origin requests to `localhost:8080` and reach the node.
+**Do not run a browser on a validator host.** Because the rest of the API has no origin control, any
+page you visit can issue cross-origin requests to `localhost:8080` and reach the node.
 
 ### Per-endpoint guidance
 
@@ -294,27 +297,107 @@ rule restricting the port to the proxy host.
 
 ### WebSocket resource limits
 
-`/subscribe` connection and subscription limits are tunable under `webServer` in
+`/subscribe` and `/log` connection and subscription limits are tunable under `webServer` in
 `config/node/config.yaml`:
 
 | Setting | Purpose | `0` means |
 |---|---|---|
-| `webSocketConnections` | node-wide cap on live connections | unlimited |
-| `webSocketConnectionsPerIP` | per-source-IP cap | unlimited |
+| `webSocketConnections` | node-wide cap on live `/subscribe` connections | unlimited |
+| `webSocketConnectionsPerIP` | per-source-IP cap for `/subscribe` | unlimited |
 | `webSocketMaxAddressesPerSubscribe` | addresses accepted in one subscribe call | use the built-in default |
 | `webSocketMaxAddressesPerClient` | total addresses one connection may watch | use the built-in default |
+| `logWebSocketConnections` | node-wide cap on live `/log` connections | use the built-in default |
+| `logWebSocketConnectionsPerIP` | per-source-IP cap for `/log` | unlimited |
+| `logWebSocketAllowedOrigins` | browser origins allowed to open `/log` | block every browser origin |
 
-Note the split in the last column. Only the two connection caps treat `0` as unlimited. The two
-address caps fall back to their built-in defaults on any non-positive value, so they **cannot be
-disabled** — to lift them, set an explicit high value rather than `0`.
+Note the split in the last column. `webSocketConnections`, `webSocketConnectionsPerIP` and
+`logWebSocketConnectionsPerIP` treat `0` as unlimited. The two address caps and
+`logWebSocketConnections` fall back to their built-in defaults on `0` (the fields are unsigned, so
+there is no negative to reject), so they **cannot be disabled** — to lift them, set an explicit
+high value rather than `0`.
 
-**Behind a reverse proxy, every client shares the proxy's IP**, so `webSocketConnectionsPerIP` will
-throttle all of them together. Raise it, or set it to `0` to disable, for proxied deployments — and
-enforce per-client limits at the proxy instead.
+`logWebSocketConnections` is in the second group on purpose. Before the `/log` cap existed,
+streaming ran on the request goroutine and so held a `simultaneousRequests` slot for the whole
+connection, bounding live `/log` connections at that setting (100 in the shipped config). Streaming
+now runs off that goroutine and the
+slot is released at the upgrade, so treating `0` as unlimited would leave a node upgraded with a
+`config.yaml` predating the key *weaker* than before. It falls back to 32 instead, and the node
+logs a warning at startup when that happens. The per-IP cap keeps `0` = unlimited because behind a
+proxy it has to be disableable; the node-wide cap still bounds the route when it is off.
 
-Note that the HTTP throttlers (`simultaneousRequests`, `sameSourceRequests`) release their slot at
-the HTTP-to-WebSocket upgrade, so they do not bound live WebSocket connections. The `webSocket*`
-settings are what do.
+The `/log` caps are deliberately far smaller than `/subscribe`'s (32/8 versus 4096/1024). Every
+live `/log` connection registers a process-global log observer, so each log line is formatted and
+fanned out once per connection; `/log` is an operator diagnostic route, not a public feed.
+
+**A raised log profile stays raised while any `/log` session is connected.** On a secured `/log`,
+an authenticated client may send a logger profile in its handshake, and that profile is applied to
+the *process-global* logger — so `*:TRACE` writes trace output to every configured sink (disk
+included), not just to that websocket. The original profile is snapshotted when the first session
+connects and restored when the last one disconnects, which is what stops two overlapping sessions
+from reverting the node to each other's setting. The trade-off is that the raised profile is only
+reverted at the *last* disconnect: a session that raised verbosity and left keeps the node at that
+level for as long as any other `/log` client — including an idle one that answers pings and never
+asked for it — stays connected. Restart the tailer set, or reapply the intended profile, after a
+verbose debugging session.
+
+**Behind a reverse proxy, every client shares the proxy's IP**, so the per-IP caps throttle all of
+them together. Raise them, or set them to `0` to disable, for proxied deployments — and enforce
+per-client limits at the proxy instead. `logWebSocketConnectionsPerIP` is the one that bites first:
+at its default of 8, a proxied deployment reaches the per-IP limit long before the node-wide 32.
+
+Per-IP caps (and the `sameSourceRequests` throttler) bucket IPv6 sources by their `/64` prefix.
+Keying on the full `/128` would let anyone holding a routed `/64` pick a fresh source address per
+connection and walk past every per-IP limit. `/64` is a reduction, not an identity: it is the
+smallest prefix ISPs delegate, but `/56` and `/48` are common, so one customer can still hold 256
+to 65536 buckets. The `/log` per-IP cap is backstopped by the node-wide cap; `sameSourceRequests`
+is not, and there the quota is multiplied by the client's allocation size. Link-local zone
+identifiers are dropped before bucketing, NAT64 (`64:ff9b::/96`) keys on the embedded IPv4 since
+the translator — not the peer — writes those bits, and Teredo and 6to4 are bucketed like any other
+IPv6 because their embedded IPv4 is client-constructed.
+
+Note that neither HTTP throttler bounds live WebSocket connections. `simultaneousRequests`
+releases its slot at the HTTP-to-WebSocket upgrade, and `sameSourceRequests` counts requests per
+source until its periodic reset, so a long-lived socket costs it exactly one request. The
+`webSocket*` and `logWebSocket*` settings are what do.
+
+### WebSocket origin policy
+
+The two WebSocket routes take deliberately different stances, because they differ in what an
+attacker gains by driving one from a web page:
+
+- **`/log` enforces an origin allowlist.** A client that sends no `Origin` header (the log viewer,
+  `curl`, `wscat`) is always allowed — `Origin` is set by the browser and page script cannot forge
+  it, so its absence means no page is driving the connection. A request that *does* carry an
+  `Origin` is a browser, and is admitted only if `logWebSocketAllowedOrigins` lists it. The empty
+  default therefore blocks every web page while leaving normal tooling working. This matters
+  because `/log` can be Basic-Auth protected: without it, any site an operator visits could open
+  `ws://localhost:8080/log` and stream node logs on their credentials.
+- **`/subscribe` does not enforce origin** (KLC-2450): the node is expected to run headless behind
+  an operator proxy that owns origin/CORS policy. This is a delegation, not an absence of risk. An
+  earlier version of this document said `/subscribe` "carries no ambient credentials" — that is
+  wrong. When the route is marked `secured`, Basic Auth is attached to it exactly as it is to
+  `/log`, and browsers replay cached Basic credentials on a same-host WebSocket handshake. **A
+  secured `/subscribe` reachable from a browser without a proxy enforcing `Origin` is exposed to
+  the same CSWSH that the `/log` allowlist closes.** Either enforce origin at the proxy, or leave
+  `/subscribe` unsecured and treat its feed as public.
+
+### Seednode `/log`
+
+The seednode's `/log` route (`cmd/seednode/api/api.go`) shares the sender with the node, so the
+handshake limit and deadline, the rolling `pongWait` deadline, the ping loop, the write deadline,
+the profile refcount, the log-injection guard and the panic containment all apply, and its
+upgrader blocks every browser origin (there is no allowlist to configure, so no browser can open
+it at all). That matters because the seednode ships `/log` with `secured: true`
+(GHSA-9v8p-frvj-2pcm / KLC-2438), and `secured` also turns profile application on: without the
+origin check, a page an operator visited could stream seednode logs on cached Basic credentials
+and mute the process-global logger.
+
+Live seednode `/log` connections are capped at a built-in 32, node-wide, with no per-IP dimension
+and no configuration knob: the seednode has no `webServer` antiflood section to read one from,
+and every live session registers a process-global observer that formats every log line, so
+unbounded is the wrong default for a route nobody needs tens of. Rejected upgrades are budgeted
+the same way as the node's, one line per window with a counter of their own. Keep the route
+disabled unless you are actively tailing it.
 
 ### Operational checklist
 
@@ -329,7 +412,10 @@ settings are what do.
 - [ ] Seednode `/peers` disabled or secured unless network topology is meant to be public
 - [ ] `--profile-mode` off, or API localhost-only — `/debug/pprof` is unauthenticated
 - [ ] `/swagger` blocked at the proxy if you do not want the API surface enumerated
-- [ ] `webSocketConnectionsPerIP` adjusted if behind a proxy
+- [ ] `webSocketConnectionsPerIP` and `logWebSocketConnectionsPerIP` adjusted if behind a proxy
+- [ ] `logWebSocketConnections` sized for the deployment — `0` falls back to the built-in 32
+- [ ] `logWebSocketAllowedOrigins` left empty unless a browser-based log viewer is actually used
+- [ ] Seednode `/log` disabled unless actively in use — its cap is a built-in 32 with no per-IP dimension
 - [ ] No browser running on validator hosts
 - [ ] Node software kept up to date
 - [ ] Key management per the practices above

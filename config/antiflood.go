@@ -49,6 +49,23 @@ type WebServerAntifloodConfig struct {
 	// single source IP. Behind a reverse proxy all clients share the proxy IP, so size
 	// this accordingly or set 0 to disable the per-IP cap. 0 = unlimited.
 	WebSocketConnectionsPerIP uint32 `yaml:"webSocketConnectionsPerIP"`
+	// LogWebSocketConnections caps simultaneous live /log WebSocket connections node-wide.
+	// Each live /log connection registers a process-global log observer, so every log line
+	// is formatted and fanned out once per connection. 0 = built-in default (32); unlike the
+	// /subscribe caps this one cannot be disabled, because before it existed live /log
+	// connections were still bounded by simultaneousRequests. Set a high value to lift it.
+	LogWebSocketConnections uint32 `yaml:"logWebSocketConnections"`
+	// LogWebSocketConnectionsPerIP caps simultaneous live /log connections from a single
+	// source IP. Behind a reverse proxy all clients share the proxy IP, so size this
+	// accordingly or set 0 to disable the per-IP cap — note this default is far tighter
+	// than the /subscribe one, so it bites first. 0 = unlimited.
+	LogWebSocketConnectionsPerIP uint32 `yaml:"logWebSocketConnectionsPerIP"`
+	// LogWebSocketAllowedOrigins lists the browser origins allowed to open /log. A client
+	// that sends no Origin header (the log viewer, curl) is always allowed; a browser is
+	// allowed only on a match, so an empty list blocks every web page while leaving normal
+	// tooling working. /log can be Basic-Auth protected, so an unrestricted origin would let
+	// any page an operator visits stream node logs on their credentials.
+	LogWebSocketAllowedOrigins []string `yaml:"logWebSocketAllowedOrigins"`
 	// WebSocketMaxAddressesPerSubscribe caps addresses accepted in one /subscribe call.
 	// The inbound frame read limit is derived from this so a maximal subscribe always
 	// fits. 0 = built-in default.

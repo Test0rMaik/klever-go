@@ -33,7 +33,7 @@ func NewSourceThrottler(maxNumRequests uint32) (*sourceThrottler, error) {
 // MiddlewareHandlerFunc returns the handler func used by the gin server when processing requests
 func (st *sourceThrottler) MiddlewareHandlerFunc() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		remoteAddr, _, err := net.SplitHostPort(c.Request.RemoteAddr)
+		host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
 		if err != nil {
 			c.AbortWithStatusJSON(
 				http.StatusInternalServerError,
@@ -45,6 +45,10 @@ func (st *sourceThrottler) MiddlewareHandlerFunc() gin.HandlerFunc {
 			)
 			return
 		}
+
+		// Bucket IPv6 by /64 so one routed allocation cannot present itself as an
+		// unlimited supply of distinct sources and walk past the per-source quota.
+		remoteAddr := shared.IPBucket(host)
 
 		st.mutRequests.Lock()
 		requests := st.sourceRequests[remoteAddr]
