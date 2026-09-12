@@ -6,6 +6,7 @@ import (
 
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/crypto/hashing/sha256"
+	"github.com/klever-io/klever-go/kapps"
 	"github.com/stretchr/testify/require"
 )
 
@@ -304,6 +305,40 @@ func TestToProposalKey(t *testing.T) {
 			require.Equal(t, []byte(tt.expected), result)
 		})
 	}
+}
+
+func TestToAccountProposalVotesKey(t *testing.T) {
+	tests := []struct {
+		name       string
+		hexAddress string
+		expected   string
+	}{
+		{"Empty address", "", "PROPVOTES/"},
+		{"Basic address", "abcdef", "PROPVOTES/abcdef"},
+		{"Uppercase address", "ABCDEF", "PROPVOTES/ABCDEF"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ToAccountProposalVotesKey(tt.hexAddress)
+			require.Equal(t, []byte(tt.expected), result)
+		})
+	}
+}
+
+func TestActiveProposalIDs(t *testing.T) {
+	require.Empty(t, ActiveProposalIDs(nil), "a nil controller has no active proposal")
+	require.Empty(t, ActiveProposalIDs(&kapps.ProposalController{}))
+
+	ids := ActiveProposalIDs(&kapps.ProposalController{
+		ActiveProposals: map[uint32]*kapps.ActiveProposals{
+			10: {ProposalIDs: []uint64{3, 1}},
+			20: {ProposalIDs: []uint64{7}},
+			30: nil,
+		},
+	})
+
+	require.Equal(t, map[uint64]struct{}{1: {}, 3: {}, 7: {}}, ids, "every bucket contributes, whatever its epoch")
 }
 
 func TestToITOKey(t *testing.T) {

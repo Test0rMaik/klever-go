@@ -162,6 +162,15 @@ type KDAKapp interface {
 	IsInterfaceNil() bool
 }
 
+// ProposalVoteIndexEntry is one entry of an account's proposal vote index: the proposal voted on
+// and the amount currently voted. The amount is the proposal's own record for that voter — set on
+// vote, refreshed on every subtraction — so an unfreeze can tell without loading the proposal
+// whether the remaining frozen balance still covers the vote.
+type ProposalVoteIndexEntry struct {
+	ProposalID uint64
+	Amount     int64
+}
+
 type ProposalKapp interface {
 	SetKAppController(controller KAppController) error
 	SetAccountsCacher(cacher state.AccountsCacher) error
@@ -170,6 +179,10 @@ type ProposalKapp interface {
 	SetProposal(proposalKapp state.KAppAccountHandler, proposalID uint64, proposal *kapps.ProposalData, controller *kapps.ProposalController) error
 	Create(sender []byte, tc *transaction.ProposalContract) (transaction.Transaction_TXResultCode, error)
 	Vote(tsender []byte, c *transaction.VoteContract) (transaction.Transaction_TXResultCode, error)
+	GetProposalData(proposalKapp state.KAppAccountHandler, proposalID uint64) (*kapps.ProposalData, error)
+	GetAccountProposalVotes(proposalKapp state.KAppAccountHandler, encodedAddr string) ([]ProposalVoteIndexEntry, error)
+	SetAccountProposalVotes(proposalKapp state.KAppAccountHandler, encodedAddr string, entries []ProposalVoteIndexEntry) error
+	PreForkVoteIDBound(proposalKapp state.KAppAccountHandler, controller *kapps.ProposalController) (uint64, error)
 	IsInterfaceNil() bool
 }
 

@@ -50,6 +50,14 @@ var KDAPrefix = "KDA"
 // ProposalPrefix is the key prefix of the proposal kapp
 var ProposalPrefix = "PROP"
 
+// ProposalVotesPrefix is the key prefix of the per-account proposal vote index
+var ProposalVotesPrefix = "PROPVOTES"
+
+// ProposalPreForkVotesKey holds the last proposal id handed out before the
+// FixAuditChangesV5 activation, the highest id a KFI unfreeze must still scan for
+// votes cast before the per-account vote index existed.
+var ProposalPreForkVotesKey = "PROPPREFORK"
+
 // ITOPrefix is the key prefix of the ITO kapp
 var ITOPrefix = "ITO"
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -2078,6 +2079,770 @@ func TestUnfreezeKFIAndUpdatingProposals(t *testing.T) {
 			require.NoError(t, err)
 		},
 	)
+}
+
+type proposalVotesConfig struct {
+	fixAuditChangesV5    bool
+	enableSmartContracts bool
+	controller           *kapps.ProposalController
+	// indexIDs builds the stored index with each entry's amount taken from the proposal's own
+	// record for the voter, or math.MaxInt64 when there is none, so an entry with nothing behind
+	// it is always read and pruned. indexEntries overrides that with exact entries.
+	indexIDs     []uint64
+	indexEntries []kapp.ProposalVoteIndexEntry
+	proposals    map[uint64]*kapps.ProposalData
+	// idBound, when set, is what the stubbed PreForkVoteIDBound returns: the highest proposal id
+	// the pre-fork scan still reads. Unset means unbounded, so every active id is scanned.
+	idBound    *uint64
+	indexErr   error
+	idBoundErr error
+	loadErr    error
+	pruneErr   error
+	saveErr    error
+	stakingErr error
+}
+
+type proposalVotesHarness struct {
+	accountsKapp *accountsKapp
+	loaded       []uint64
+	// stakingLoads counts KFI staking reads; controllerRewrites counts proposal saves that
+	// carried a controller, which the unfreeze path never needs to write.
+	stakingLoads       int
+	controllerRewrites int
+	// pruned is derived: the ids of the stored index that the written index no longer carries.
+	pruned       []uint64
+	prunedAddrs  []string
+	queriedAddrs []string
+	indexWrites  int
+	written      []kapp.ProposalVoteIndexEntry
+	saved        []uint64
+}
+
+func (cfg proposalVotesConfig) storedIndex() []kapp.ProposalVoteIndexEntry {
+	if cfg.indexEntries != nil {
+		return cfg.indexEntries
+	}
+
+	entries := make([]kapp.ProposalVoteIndexEntry, 0, len(cfg.indexIDs))
+	for _, id := range cfg.indexIDs {
+		amount := int64(math.MaxInt64)
+		if proposal, ok := cfg.proposals[id]; ok && proposal != nil {
+			if voter, voted := proposal.Voters[hex.EncodeToString(txSender)]; voted && voter != nil {
+				amount = voter.Amount
+			}
+		}
+		entries = append(entries, kapp.ProposalVoteIndexEntry{ProposalID: id, Amount: amount})
+	}
+
+	return entries
+}
+
+func newProposalVotesHarness(t *testing.T, cfg proposalVotesConfig) *proposalVotesHarness {
+	t.Helper()
+
+	if cfg.controller == nil {
+		// The unfreeze drops an entry whose id is in no bucket without reading it, so a harness
+		// that gives no controller lists, in one bucket, every active proposal it knows and
+		// every indexed id whose record is missing — tests that expect a missing record to be
+		// read and pruned keep doing so. The bound is defaulted to 0 alongside, so this bucket
+		// feeds the index pass and not the pre-fork scan; tests about the scan set their own.
+		bucket := &kapps.ActiveProposals{}
+		for id, proposal := range cfg.proposals {
+			if proposal != nil && proposal.ProposalStatus == kapps.ProposalData_ActiveProposal {
+				bucket.ProposalIDs = append(bucket.ProposalIDs, id)
+			}
+		}
+		for _, entry := range cfg.storedIndex() {
+			if _, known := cfg.proposals[entry.ProposalID]; !known {
+				bucket.ProposalIDs = append(bucket.ProposalIDs, entry.ProposalID)
+			}
+		}
+		slices.Sort(bucket.ProposalIDs)
+		cfg.controller = &kapps.ProposalController{
+			ActiveProposals: map[uint32]*kapps.ActiveProposals{500: bucket},
+		}
+		if cfg.idBound == nil {
+			noScan := uint64(0)
+			cfg.idBound = &noScan
+		}
+	}
+
+	h := &proposalVotesHarness{}
+
+	accsKapp, err := NewAccountKApp(&ArgsNewAccountKApp{
+		Hasher:      &commonMock.HasherMock{},
+		Marshalizer: &commonMock.MarshalizerMock{},
+		PubkeyConv:  commonMock.NewPubkeyConverterMock(4),
+		ForkController: &integrationMock.ForkControllerStub{
+			EnableSmartContractsCalled: func() bool {
+				return cfg.enableSmartContracts
+			},
+			FixAuditChangesV5Called: func() bool {
+				return cfg.fixAuditChangesV5
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	proposalKapp, err := state.NewKAppAccount([]byte("proposalKappAddress"))
+	require.NoError(t, err)
+
+	err = accsKapp.SetKAppController(&kvmStub.KAppControllerStub{
+		GetCurrentKAppContextCalled: func() kapp.KappContext {
+			return kapp.NewKappContext(kapp.ArgsNewKAppContext{
+				OriginalSender: txSender,
+				ContractID:     0,
+				ContractType:   transaction.TXContract_UnfreezeContractType,
+				Block: &block.Block{
+					Header: &block.BlockHeader{
+						Timestamp: 1000,
+					},
+				},
+			})
+		},
+		GetKDAKAppCalled: func() kapp.KDAKapp {
+			return &kvmStub.KDAKappStub{
+				GetStakingCalled: func(_ []byte) (state.KAppAccountHandler, *kapps.StakingData, error) {
+					h.stakingLoads++
+
+					if cfg.stakingErr != nil {
+						return nil, nil, cfg.stakingErr
+					}
+
+					// A different total per load, so a memo that should have been rebuilt and
+					// was not writes a stale TotalStaked that a test can see.
+					return nil, &kapps.StakingData{TotalStaked: int64(1000 * h.stakingLoads)}, nil
+				},
+			}
+		},
+		GetProposalKAppCalled: func() kapp.ProposalKapp {
+			return &commonMock.ProposalKappStub{
+				GetProposalCalled: func(proposalID uint64) (state.KAppAccountHandler, *kapps.ProposalData, *kapps.ProposalController, error) {
+					if proposalID == 0 {
+						return proposalKapp, nil, cfg.controller, nil
+					}
+
+					// GetProposal re-reads and unmarshals the controller on every call. The
+					// unfreeze holds the account already and must read proposals through
+					// GetProposalData; a revert to this path fails here by name.
+					t.Errorf("unfreeze read proposal %d through GetProposal instead of GetProposalData", proposalID)
+
+					return nil, nil, nil, errors.New("proposal read through the wrong path")
+				},
+				GetProposalDataCalled: func(proposalID uint64) (*kapps.ProposalData, error) {
+					h.loaded = append(h.loaded, proposalID)
+
+					if cfg.loadErr != nil {
+						return nil, cfg.loadErr
+					}
+
+					proposal, ok := cfg.proposals[proposalID]
+					if !ok {
+						return nil, common.ErrProposalNotFound
+					}
+
+					return proposal, nil
+				},
+				GetAccountProposalVotesCalled: func(encodedAddr string) ([]kapp.ProposalVoteIndexEntry, error) {
+					h.queriedAddrs = append(h.queriedAddrs, encodedAddr)
+
+					if cfg.indexErr != nil {
+						return nil, cfg.indexErr
+					}
+
+					return cfg.storedIndex(), nil
+				},
+				PreForkVoteIDBoundCalled: func() (uint64, error) {
+					if cfg.idBoundErr != nil {
+						return 0, cfg.idBoundErr
+					}
+					if cfg.idBound != nil {
+						return *cfg.idBound, nil
+					}
+
+					return math.MaxUint64, nil
+				},
+				SetAccountProposalVotesCalled: func(encodedAddr string, entries []kapp.ProposalVoteIndexEntry) error {
+					if cfg.pruneErr != nil {
+						return cfg.pruneErr
+					}
+
+					h.indexWrites++
+					h.written = entries
+					h.prunedAddrs = append(h.prunedAddrs, encodedAddr)
+
+					kept := make(map[uint64]struct{}, len(entries))
+					for _, entry := range entries {
+						kept[entry.ProposalID] = struct{}{}
+					}
+					for _, stored := range cfg.storedIndex() {
+						if _, ok := kept[stored.ProposalID]; !ok {
+							h.pruned = append(h.pruned, stored.ProposalID)
+						}
+					}
+
+					return nil
+				},
+				SetProposalCalled: func(_ state.KAppAccountHandler, proposalID uint64, _ *kapps.ProposalData, controller *kapps.ProposalController) error {
+					if cfg.saveErr != nil {
+						return cfg.saveErr
+					}
+
+					if controller != nil {
+						h.controllerRewrites++
+					}
+					h.saved = append(h.saved, proposalID)
+
+					return nil
+				},
+			}
+		},
+	})
+	require.NoError(t, err)
+
+	err = accsKapp.SetAccountsCacher(&commonMock.AccountsCacherStub{
+		UpdateKappCalled: func(_ state.AccountHandler) error {
+			return nil
+		},
+	})
+	require.NoError(t, err)
+
+	h.accountsKapp = accsKapp
+
+	return h
+}
+
+func (h *proposalVotesHarness) unfreezeVotes(frozenBalance, unfrozenAmount int64) (transaction.Transaction_TXResultCode, error) {
+	owner := &commonMock.UserAccountHandlerStub{
+		GetUserKDACalled: func(_, _ []byte, _ bool) (*kapps.UserKDA, error) {
+			return &kapps.UserKDA{FrozenBalance: frozenBalance}, nil
+		},
+		AddressBytesCalled: func() []byte {
+			return txSender
+		},
+	}
+
+	return h.accountsKapp.handleProposalVotesOnUnfreeze(owner, kdautils.KFIIdentifier, txSender, unfrozenAmount)
+}
+
+func newVotedProposal(voteAmount, totalVotes int64) *kapps.ProposalData {
+	return &kapps.ProposalData{
+		Voters: map[string]*kapps.ProposalData_VoteDetail{
+			hex.EncodeToString(txSender): {
+				Type:   kapps.ProposalData_VoteDetail_No,
+				Amount: voteAmount,
+			},
+		},
+		Votes: map[int32]int64{
+			int32(kapps.ProposalData_VoteDetail_No): totalVotes,
+		},
+	}
+}
+
+func voterAmountOf(proposal *kapps.ProposalData) int64 {
+	return proposal.Voters[hex.EncodeToString(txSender)].Amount
+}
+
+func noVotesOf(proposal *kapps.ProposalData) int64 {
+	return proposal.Votes[int32(kapps.ProposalData_VoteDetail_No)]
+}
+
+func TestUnfreezeReducesVotesOnlyForIndexedProposals(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{
+		1: newVotedProposal(100, 500),
+		2: newVotedProposal(100, 500),
+		3: newVotedProposal(100, 500),
+	}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		indexIDs:          []uint64{1, 3},
+		proposals:         proposals,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{1, 3}, h.loaded)
+	require.Equal(t, []uint64{1, 3}, h.saved)
+	require.Empty(t, h.pruned)
+
+	require.Equal(t, int64(60), voterAmountOf(proposals[1]))
+	require.Equal(t, int64(460), noVotesOf(proposals[1]))
+	require.Equal(t, int64(60), voterAmountOf(proposals[3]))
+	require.Equal(t, int64(460), noVotesOf(proposals[3]))
+
+	require.Equal(t, int64(100), voterAmountOf(proposals[2]))
+	require.Equal(t, int64(500), noVotesOf(proposals[2]))
+}
+
+func TestUnfreezeWritesTheVoteIndexOnceForManyStaleEntries(t *testing.T) {
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		indexIDs:          []uint64{1, 2, 3, 4, 5},
+		proposals:         map[uint64]*kapps.ProposalData{},
+	})
+
+	resCode, err := h.unfreezeVotes(10, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{1, 2, 3, 4, 5}, h.pruned)
+	require.Equal(t, 1, h.indexWrites)
+}
+
+func TestUnfreezeAppliesARepeatedIndexEntryOnlyOnce(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{
+		1: newVotedProposal(100, 500),
+	}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		indexIDs:          []uint64{1, 1},
+		proposals:         proposals,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{1}, h.loaded)
+	require.Equal(t, int64(60), voterAmountOf(proposals[1]))
+	require.Equal(t, int64(460), noVotesOf(proposals[1]))
+	require.Equal(t, []kapp.ProposalVoteIndexEntry{{ProposalID: 1, Amount: 60}}, h.written,
+		"the duplicate collapses and the entry carries the vote that remains")
+}
+
+func TestUnfreezeKeysTheVoteIndexOnTheSenderAddress(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{
+		1: newVotedProposal(100, 500),
+		2: newVotedProposal(100, 500),
+	}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		indexIDs:          []uint64{1, 2},
+		proposals:         proposals,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 150)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	wantAddr := hex.EncodeToString(txSender)
+	require.Equal(t, []string{wantAddr}, h.queriedAddrs)
+	require.Equal(t, []string{wantAddr}, h.prunedAddrs)
+}
+
+func TestUnfreezeRemovesVoterWhenUnfrozenAmountCoversWholeVote(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{
+		1: newVotedProposal(100, 500),
+	}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		indexIDs:          []uint64{1},
+		proposals:         proposals,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 150)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.NotContains(t, proposals[1].Voters, hex.EncodeToString(txSender))
+	require.Equal(t, int64(400), noVotesOf(proposals[1]))
+	require.Equal(t, []uint64{1}, h.saved)
+}
+
+func TestUnfreezePrunesIndexEntriesForMissingProposals(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{
+		1: newVotedProposal(100, 500),
+	}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		indexIDs:          []uint64{2, 1},
+		proposals:         proposals,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{2}, h.pruned)
+	require.Equal(t, []uint64{1}, h.saved)
+	require.Equal(t, int64(60), voterAmountOf(proposals[1]))
+}
+
+func TestUnfreezePrunesIndexEntriesWhenAccountIsNotAVoter(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{
+		1: newVotedProposal(100, 500),
+		2: {
+			Voters: map[string]*kapps.ProposalData_VoteDetail{},
+			Votes:  map[int32]int64{},
+		},
+	}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		indexIDs:          []uint64{2, 1},
+		proposals:         proposals,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{2}, h.pruned)
+	require.Equal(t, []uint64{1}, h.saved)
+}
+
+func TestUnfreezePrunesIndexEntriesWithANilVoteDetail(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{
+		1: {
+			Voters: map[string]*kapps.ProposalData_VoteDetail{
+				hex.EncodeToString(txSender): nil,
+			},
+			Votes: map[int32]int64{},
+		},
+	}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		indexIDs:          []uint64{1},
+		proposals:         proposals,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{1}, h.pruned)
+	require.Empty(t, h.saved)
+}
+
+func TestUnfreezeKeepsVoteWhenFrozenBalanceStillCoversIt(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{
+		1: newVotedProposal(50, 500),
+	}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		indexIDs:          []uint64{1},
+		proposals:         proposals,
+	})
+
+	resCode, err := h.unfreezeVotes(80, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Empty(t, h.loaded, "a vote the remaining frozen balance covers is not even read; the index says so")
+	require.Empty(t, h.saved)
+	require.Empty(t, h.pruned)
+	require.Equal(t, 0, h.indexWrites, "nothing changed, so the index is not rewritten")
+	require.Equal(t, int64(50), voterAmountOf(proposals[1]))
+	require.Equal(t, int64(500), noVotesOf(proposals[1]))
+}
+
+// TestUnfreezeReadsTheStakingTotalAgainOnTheNextUnfreeze: the read is memoised for one unfreeze
+// and no longer. The total drops as buckets leave the stake, so a memo that outlived the
+// transaction would stamp a stale TotalStaked onto every proposal a later unfreeze touched, on
+// every node that had run the earlier one.
+func TestUnfreezeReadsTheStakingTotalAgainOnTheNextUnfreeze(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{
+		1: newVotedProposal(100, 500),
+		2: newVotedProposal(100, 500),
+	}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5:    true,
+		enableSmartContracts: true,
+		indexIDs:             []uint64{1, 2},
+		proposals:            proposals,
+	})
+
+	for i := 1; i <= 2; i++ {
+		resCode, err := h.unfreezeVotes(10, 40)
+		require.NoError(t, err)
+		require.Equal(t, transaction.Transaction_Ok, resCode)
+
+		require.Equal(t, i, h.stakingLoads,
+			"exactly one staking read per unfreeze: the memo lasts one call, not the life of the kapp")
+		require.Equal(t, int64(1000*i), proposals[1].TotalStaked,
+			"and the total written is the one this unfreeze read, not a remembered one")
+	}
+
+	require.Equal(t, int64(20), voterAmountOf(proposals[1]), "both unfreezes were applied")
+}
+
+// TestUnfreezeLeavesTotalStakedAloneWhenSmartContractsAreOff: the refresh is gated, so before
+// EnableSmartContracts the shrunk proposal keeps the total it was stored with and the staking
+// total is never read. TestUnfreezeLoadsTheStakingTotalOnce covers the enabled side.
+func TestUnfreezeLeavesTotalStakedAloneWhenSmartContractsAreOff(t *testing.T) {
+	proposal := newVotedProposal(100, 500)
+	proposal.TotalStaked = 900
+	proposals := map[uint64]*kapps.ProposalData{1: proposal}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		indexIDs:          []uint64{1},
+		proposals:         proposals,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{1}, h.saved)
+	require.Equal(t, int64(900), proposals[1].TotalStaked)
+	require.Equal(t, 0, h.stakingLoads, "the total is not read while the gate is closed")
+}
+
+func TestUnfreezeWithoutVoteIndexScansActiveProposals(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{
+		1: newVotedProposal(100, 500),
+		2: newVotedProposal(100, 500),
+	}
+
+	controller := &kapps.ProposalController{
+		ActiveProposals: map[uint32]*kapps.ActiveProposals{
+			1: {ProposalIDs: []uint64{1, 2}},
+		},
+	}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: false,
+		controller:        controller,
+		proposals:         proposals,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{1, 2}, h.saved)
+	require.Empty(t, h.pruned)
+	require.Equal(t, int64(60), voterAmountOf(proposals[1]))
+	require.Equal(t, int64(60), voterAmountOf(proposals[2]))
+}
+
+func TestUnfreezeFailsWhenProposalVotesCannotBeResolved(t *testing.T) {
+	votedProposal := func() map[uint64]*kapps.ProposalData {
+		return map[uint64]*kapps.ProposalData{1: newVotedProposal(100, 500)}
+	}
+	nonVotedProposal := func() map[uint64]*kapps.ProposalData {
+		return map[uint64]*kapps.ProposalData{
+			2: {
+				Voters: map[string]*kapps.ProposalData_VoteDetail{},
+				Votes:  map[int32]int64{},
+			},
+		}
+	}
+
+	tests := []struct {
+		name string
+		cfg  proposalVotesConfig
+	}{
+		{
+			name: "vote index is unreadable",
+			cfg:  proposalVotesConfig{indexErr: mockError},
+		},
+		{
+			name: "the stored scan bound cannot be read",
+			cfg:  proposalVotesConfig{idBoundErr: mockError},
+		},
+		{
+			name: "proposal lookup fails for a reason other than a missing proposal",
+			cfg:  proposalVotesConfig{indexIDs: []uint64{1}, proposals: votedProposal(), loadErr: mockError},
+		},
+		{
+			name: "pruning a stale index entry fails",
+			cfg:  proposalVotesConfig{indexIDs: []uint64{7}, proposals: votedProposal(), pruneErr: mockError},
+		},
+		{
+			name: "pruning an entry the account no longer votes on fails",
+			cfg:  proposalVotesConfig{indexIDs: []uint64{2}, proposals: nonVotedProposal(), pruneErr: mockError},
+		},
+		{
+			name: "total staked refresh fails",
+			cfg: proposalVotesConfig{
+				enableSmartContracts: true,
+				indexIDs:             []uint64{1},
+				proposals:            votedProposal(),
+				stakingErr:           mockError,
+			},
+		},
+		{
+			name: "saving the updated proposal fails",
+			cfg:  proposalVotesConfig{indexIDs: []uint64{1}, proposals: votedProposal(), saveErr: mockError},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.cfg.fixAuditChangesV5 = true
+			h := newProposalVotesHarness(t, tt.cfg)
+
+			resCode, err := h.unfreezeVotes(10, 40)
+
+			require.ErrorIs(t, err, mockError)
+			require.Equal(t, transaction.Transaction_AccountError, resCode)
+		})
+	}
+}
+
+func TestUnfreezeReducesVotesCastBeforeTheVoteIndexExisted(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{
+		1: newVotedProposal(100, 500),
+	}
+
+	controller := &kapps.ProposalController{
+		ActiveProposals: map[uint32]*kapps.ActiveProposals{
+			110: {ProposalIDs: []uint64{1}},
+		},
+	}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		controller:        controller,
+		proposals:         proposals,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{1}, h.saved)
+	require.Equal(t, int64(60), voterAmountOf(proposals[1]))
+	require.Equal(t, int64(460), noVotesOf(proposals[1]))
+}
+
+func TestUnfreezeCountsAnIndexedProposalOnlyOnceDuringThePreForkWindow(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{
+		1: newVotedProposal(100, 500),
+	}
+
+	controller := &kapps.ProposalController{
+		ActiveProposals: map[uint32]*kapps.ActiveProposals{
+			110: {ProposalIDs: []uint64{1}},
+		},
+	}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		controller:        controller,
+		indexIDs:          []uint64{1},
+		proposals:         proposals,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{1}, h.loaded)
+	require.Equal(t, []uint64{1}, h.saved)
+	require.Equal(t, int64(60), voterAmountOf(proposals[1]))
+}
+
+// TestThePreForkScanReadsNothingOnceItsProposalsHaveSettled: once the ids that predate the fork
+// are settled, every id left in the buckets was created after it, so the scan itself reads no
+// proposal at all. This is about the scan and not the whole unfreeze: an uncovered vote in the
+// caller's own index is still read by the pass above it.
+func TestThePreForkScanReadsNothingOnceItsProposalsHaveSettled(t *testing.T) {
+	// Voted by someone else, which is the only shape this can take: a post-fork vote by the
+	// caller would be in the index, so it could never reach the scan unindexed.
+	proposals := map[uint64]*kapps.ProposalData{
+		7: {
+			Voters: map[string]*kapps.ProposalData_VoteDetail{
+				"00112233445566778899aabbccddeeff": {Type: kapps.ProposalData_VoteDetail_No, Amount: 100},
+			},
+			Votes: map[int32]int64{int32(kapps.ProposalData_VoteDetail_No): 500},
+		},
+	}
+
+	controller := &kapps.ProposalController{
+		ActiveProposals: map[uint32]*kapps.ActiveProposals{
+			200: {ProposalIDs: []uint64{7}},
+		},
+	}
+
+	idBound := uint64(6)
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		controller:        controller,
+		proposals:         proposals,
+		idBound:           &idBound,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Empty(t, h.loaded)
+	require.Empty(t, h.saved)
+	require.Equal(t, int64(100), proposals[7].Voters["00112233445566778899aabbccddeeff"].Amount)
+}
+
+func TestUnfreezeLeavesConcludedProposalsUntouchedAndPrunesTheirIndexEntries(t *testing.T) {
+	concluded := newVotedProposal(100, 500)
+	concluded.ProposalStatus = kapps.ProposalData_ApprovedProposal
+	concluded.TotalStaked = 900
+
+	proposals := map[uint64]*kapps.ProposalData{1: concluded}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5:    true,
+		enableSmartContracts: true,
+		indexIDs:             []uint64{1},
+		proposals:            proposals,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{1}, h.pruned)
+	require.Empty(t, h.saved)
+	require.Equal(t, int64(100), voterAmountOf(concluded))
+	require.Equal(t, int64(500), noVotesOf(concluded))
+	require.Equal(t, int64(900), concluded.TotalStaked)
+}
+
+func TestUnfreezePrunesTheIndexEntryWhenTheWholeVoteIsRemoved(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{
+		1: newVotedProposal(100, 500),
+	}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		indexIDs:          []uint64{1},
+		proposals:         proposals,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 150)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{1}, h.saved)
+	require.Equal(t, []uint64{1}, h.pruned)
+	require.NotContains(t, proposals[1].Voters, hex.EncodeToString(txSender))
 }
 
 ///////////////
@@ -6779,4 +7544,242 @@ func TestAccountsKapp_AllMutatingOps_WritableController_NotRefused(t *testing.T)
 				"%s must not be refused when the controller is writable", op.name)
 		})
 	}
+}
+
+// TestUnfreezeSkipsProposalsTheRemainingFrozenBalanceStillCovers is the closing of KLR-26 rather
+// than its narrowing: an account that voted a token amount on every proposal and keeps a large
+// bucket frozen used to make every later unfreeze read every one of those proposals. The amount
+// now travels in the index, so a covered vote costs nothing and only the vote that has to shrink
+// is read, shrunk, and written back with its new amount.
+func TestUnfreezeSkipsProposalsTheRemainingFrozenBalanceStillCovers(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{
+		1: newVotedProposal(50, 500),
+		2: newVotedProposal(120, 500),
+	}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		indexIDs:          []uint64{1, 2},
+		proposals:         proposals,
+	})
+
+	// 120 frozen before, 40 unfrozen: 80 remain, which still covers the vote of 50 but not 120.
+	resCode, err := h.unfreezeVotes(80, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{2}, h.loaded, "only the vote the remaining balance no longer covers is read")
+	require.Equal(t, []uint64{2}, h.saved)
+	require.Equal(t, int64(50), voterAmountOf(proposals[1]))
+	require.Equal(t, int64(80), voterAmountOf(proposals[2]))
+	require.Equal(t, 1, h.indexWrites)
+	require.Equal(t, []kapp.ProposalVoteIndexEntry{{ProposalID: 1, Amount: 50}, {ProposalID: 2, Amount: 80}}, h.written,
+		"the shrunk vote is written back with its new amount so the next unfreeze can skip it too")
+}
+
+// TestUnfreezeDropsEntriesForSettledProposalsWithoutReadingThem: an id in none of the controller's
+// buckets is a settled proposal, so its entry is dropped on the strength of the controller the
+// unfreeze already holds. Without this the index kept every proposal ever voted on while the
+// vote stayed covered, and the first deep unfreeze read all of them.
+func TestUnfreezeDropsEntriesForSettledProposalsWithoutReadingThem(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{
+		1: newVotedProposal(100, 500),
+		2: newVotedProposal(100, 500),
+	}
+	noScan := uint64(0)
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		indexIDs:          []uint64{1, 2},
+		proposals:         proposals,
+		controller: &kapps.ProposalController{
+			ActiveProposals: map[uint32]*kapps.ActiveProposals{500: {ProposalIDs: []uint64{1}}},
+		},
+		idBound: &noScan,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{1}, h.loaded, "the settled proposal is never read")
+	require.Equal(t, []uint64{2}, h.pruned)
+	require.Equal(t, []kapp.ProposalVoteIndexEntry{{ProposalID: 1, Amount: 60}}, h.written)
+	require.Equal(t, int64(100), voterAmountOf(proposals[2]), "a settled proposal's record is left as it is")
+}
+
+// TestUnfreezeLoadsTheStakingTotalOnce: the KFI staking total cannot change within one unfreeze,
+// so it is read once, not once per proposal touched. The saves it makes carry no controller:
+// nothing on the unfreeze path changes it.
+func TestUnfreezeLoadsTheStakingTotalOnce(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{
+		1: newVotedProposal(100, 500),
+		2: newVotedProposal(100, 500),
+		3: newVotedProposal(100, 500),
+	}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5:    true,
+		enableSmartContracts: true,
+		indexIDs:             []uint64{1, 2, 3},
+		proposals:            proposals,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{1, 2, 3}, h.saved)
+	require.Equal(t, 1, h.stakingLoads, "one staking read per unfreeze, however many proposals it touches")
+	require.Equal(t, 0, h.controllerRewrites, "nothing on the unfreeze path changes the controller, so no save carries it")
+	for id := uint64(1); id <= 3; id++ {
+		require.Equal(t, int64(1000), proposals[id].TotalStaked)
+	}
+}
+
+// TestUnfreezeRefreshesAnEntryTheIndexOverstated: the proposal is the record. If the index says
+// more than the proposal does, the proposal wins, nothing is subtracted, and the entry is
+// corrected so the overstatement does not cost a read on every later unfreeze.
+func TestUnfreezeRefreshesAnEntryTheIndexOverstated(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{
+		1: newVotedProposal(50, 500),
+	}
+
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		indexEntries:      []kapp.ProposalVoteIndexEntry{{ProposalID: 1, Amount: 100}},
+		proposals:         proposals,
+	})
+
+	resCode, err := h.unfreezeVotes(80, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{1}, h.loaded)
+	require.Empty(t, h.saved, "a covered vote is not subtracted from, whatever the index claimed")
+	require.Equal(t, int64(50), voterAmountOf(proposals[1]))
+	require.Equal(t, []kapp.ProposalVoteIndexEntry{{ProposalID: 1, Amount: 50}}, h.written)
+}
+
+// TestUnfreezeScansActiveProposalsInEpochOrderAndOnlyUpToTheBound covers the pre-fork walk that
+// runs while the recorded bound is open. The controller keys its buckets by EpochEnd in a Go map,
+// so the walk sorts them: the receipts it emits then come out the same on every node. An id above
+// the bound was created after the fork, so its votes are all indexed and it is never read.
+// Eight ordered buckets make an unsorted walk fail with overwhelming probability; two would pass
+// half the time.
+func TestUnfreezeScansActiveProposalsInEpochOrderAndOnlyUpToTheBound(t *testing.T) {
+	proposals := map[uint64]*kapps.ProposalData{}
+	controller := &kapps.ProposalController{ActiveProposals: map[uint32]*kapps.ActiveProposals{}}
+	for id := uint64(1); id <= 8; id++ {
+		proposals[id] = newVotedProposal(100, 500)
+		controller.ActiveProposals[uint32(100+id)] = &kapps.ActiveProposals{ProposalIDs: []uint64{id}}
+	}
+	for _, late := range []uint64{50, 60} {
+		proposals[late] = newVotedProposal(100, 500)
+		controller.ActiveProposals[uint32(100+late)] = &kapps.ActiveProposals{ProposalIDs: []uint64{late}}
+	}
+
+	idBound := uint64(8)
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		controller:        controller,
+		proposals:         proposals,
+		idBound:           &idBound,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{1, 2, 3, 4, 5, 6, 7, 8}, h.loaded,
+		"buckets are walked in EpochEnd order and the two ids above the bound are never read")
+}
+
+// TestUnfreezeToleratesANilBucket: the buckets come back from protobuf, which can hold a nil map
+// value, and both paths through the scan walk them. kdautils.ActiveProposalIDs already reads them
+// nil-safely and has a test for it; if the scan does not, a KFI unfreeze panics the node instead
+// of failing the transaction.
+func TestUnfreezeToleratesANilBucket(t *testing.T) {
+	for _, fixV5 := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fixAuditChangesV5=%v", fixV5), func(t *testing.T) {
+			proposals := map[uint64]*kapps.ProposalData{
+				1: newVotedProposal(100, 500),
+			}
+
+			controller := &kapps.ProposalController{
+				ActiveProposals: map[uint32]*kapps.ActiveProposals{
+					10: nil,
+					20: {ProposalIDs: []uint64{1}},
+				},
+			}
+
+			idBound := uint64(1)
+			h := newProposalVotesHarness(t, proposalVotesConfig{
+				fixAuditChangesV5: fixV5,
+				controller:        controller,
+				proposals:         proposals,
+				idBound:           &idBound,
+			})
+
+			resCode, err := h.unfreezeVotes(10, 40)
+
+			require.NoError(t, err)
+			require.Equal(t, transaction.Transaction_Ok, resCode)
+			require.Equal(t, []uint64{1}, h.loaded)
+			require.Equal(t, int64(60), voterAmountOf(proposals[1]))
+		})
+	}
+}
+
+// TestUnfreezeDoesNotReadAProposalCreatedAfterTheFork is the guard on the transition window, and
+// it is written as the attack: proposal 2 belongs to someone else, the unfreezing account has
+// never voted on it, and reading it only to discover that is the unmetered work this PR removes.
+// It sits in a *lower* bucket than the pre-fork proposal, which is what Create allows and what an
+// epoch bound cannot exclude — a bound recorded as 60 here would read it on every unfreeze, for
+// as long as the attacker keeps making them. Its id is the thing that gives it away.
+func TestUnfreezeDoesNotReadAProposalCreatedAfterTheFork(t *testing.T) {
+	const otherVoter = "00112233445566778899aabbccddeeff"
+
+	postFork := &kapps.ProposalData{
+		Voters: map[string]*kapps.ProposalData_VoteDetail{
+			otherVoter: {Type: kapps.ProposalData_VoteDetail_No, Amount: 100},
+		},
+		Votes: map[int32]int64{int32(kapps.ProposalData_VoteDetail_No): 500},
+	}
+
+	proposals := map[uint64]*kapps.ProposalData{
+		1: newVotedProposal(100, 500),
+		2: postFork,
+	}
+
+	controller := &kapps.ProposalController{
+		ActiveProposals: map[uint32]*kapps.ActiveProposals{
+			60: {ProposalIDs: []uint64{1}},
+			50: {ProposalIDs: []uint64{2}},
+		},
+	}
+
+	idBound := uint64(1)
+	h := newProposalVotesHarness(t, proposalVotesConfig{
+		fixAuditChangesV5: true,
+		controller:        controller,
+		proposals:         proposals,
+		idBound:           &idBound,
+	})
+
+	resCode, err := h.unfreezeVotes(10, 40)
+
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, resCode)
+
+	require.Equal(t, []uint64{1}, h.loaded,
+		"the proposal created after the fork is never read, though its bucket sorts first")
+	require.Equal(t, []uint64{1}, h.saved)
+	require.Equal(t, int64(60), voterAmountOf(proposals[1]), "the pre-fork vote is still shrunk")
+	require.Equal(t, int64(100), postFork.Voters[otherVoter].Amount, "and the other voter is untouched")
 }

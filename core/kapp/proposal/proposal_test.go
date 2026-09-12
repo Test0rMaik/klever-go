@@ -1,7 +1,9 @@
 package proposal
 
 import (
+	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -890,4 +892,364 @@ func TestProposalKApp_Vote(t *testing.T) {
 		require.Equal(t, kapps.ProposalData_VoteDetail_No, updatedProposal.Voters[encodedVoter].Type)
 		require.Equal(t, int64(300), updatedProposal.Voters[encodedVoter].Amount)
 	})
+}
+
+func TestVoteWritesNoIndexKeyBeforeTheFork(t *testing.T) {
+	for _, fixV5 := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fixAuditChangesV5=%v", fixV5), func(t *testing.T) {
+			proposalKApp, accCacher, forkController, _ := setupVoteTest(t)
+			forkController.FixAuditChangesV5Value = fixV5
+
+			voterAddr := makeAddress("voter")
+			createActiveProposal(t, proposalKApp, accCacher, 1, map[string]*kapps.ProposalData_VoteDetail{})
+			createVoterAccount(t, accCacher, voterAddr, 1000)
+
+			resultCode, err := proposalKApp.Vote(voterAddr, &transaction.VoteContract{
+				ProposalID: 1,
+				Amount:     100,
+				Type:       transaction.VoteContract_Yes,
+			})
+			require.Equal(t, transaction.Transaction_Ok, resultCode)
+			require.NoError(t, err)
+
+			proposalKappAcc, err := accCacher.LoadKApp(kapps.ProposalKAppAddress)
+			require.NoError(t, err)
+
+			indexKey := string(kdautils.ToAccountProposalVotesKey(hex.EncodeToString(voterAddr)))
+			_, written := proposalKappAcc.DataTrieTracker().DirtyData()[indexKey]
+			require.Equal(t, fixV5, written)
+		})
+	}
+}
+
+func TestPreForkVoteIDBoundIsRecordedOnceAndNotExtendedByLaterProposals(t *testing.T) {
+	proposalKApp, accCacher, _, _ := setupVoteTest(t)
+
+	proposalKappAcc, err := accCacher.LoadKApp(kapps.ProposalKAppAddress)
+	require.NoError(t, err)
+
+	controller := &kapps.ProposalController{ProposalCount: 4}
+
+	first, err := proposalKApp.PreForkVoteIDBound(proposalKappAcc, controller)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), first)
+
+	controller.ProposalCount = 900
+
+	second, err := proposalKApp.PreForkVoteIDBound(proposalKappAcc, controller)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), second, "the bound is frozen at the ids that predate the fork")
+}
+
+var errScanEndUnavailable = errors.New("scan end unavailable")
+
+func TestPreForkVoteIDBoundRecomputesOnAToleratedReadError(t *testing.T) {
+	tests := []struct {
+		name        string
+		retrieveErr error
+	}{
+		{name: "data trie is missing", retrieveErr: common.ErrNilTrie},
+		{name: "stored entry was emptied", retrieveErr: common.ErrNegativeValue},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proposalKApp, _, _, _ := setupVoteTest(t)
+
+			var saved []byte
+			acc := &mock.KAppAccountHandlerStub{
+				DataTrieTrackerCalled: func() state.DataTrieTracker {
+					return &mock.DataTrieTrackerStub{
+						RetrieveValueCalled: func(_ []byte) ([]byte, error) {
+							return nil, tt.retrieveErr
+						},
+						SaveKeyValueCalled: func(_ []byte, value []byte) error {
+							saved = value
+
+							return nil
+						},
+					}
+				},
+			}
+
+			controller := &kapps.ProposalController{ProposalCount: 77}
+
+			idBound, err := proposalKApp.PreForkVoteIDBound(acc, controller)
+			require.NoError(t, err)
+			require.Equal(t, uint64(77), idBound)
+			require.Equal(t, uint64(77), binary.BigEndian.Uint64(saved))
+		})
+	}
+}
+
+func TestPreForkVoteIDBoundPropagatesStorageErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		tracker func() state.DataTrieTracker
+	}{
+		{
+			name: "the stored bound cannot be read",
+			tracker: func() state.DataTrieTracker {
+				return &mock.DataTrieTrackerStub{
+					RetrieveValueCalled: func(_ []byte) ([]byte, error) {
+						return nil, errScanEndUnavailable
+					},
+				}
+			},
+		},
+		{
+			name: "the computed bound cannot be written",
+			tracker: func() state.DataTrieTracker {
+				return &mock.DataTrieTrackerStub{
+					RetrieveValueCalled: func(_ []byte) ([]byte, error) {
+						return nil, common.ErrNilTrie
+					},
+					SaveKeyValueCalled: func(_ []byte, _ []byte) error {
+						return errScanEndUnavailable
+					},
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proposalKApp, _, _, _ := setupVoteTest(t)
+
+			acc := &mock.KAppAccountHandlerStub{DataTrieTrackerCalled: tt.tracker}
+
+			idBound, err := proposalKApp.PreForkVoteIDBound(acc, &kapps.ProposalController{})
+			require.ErrorIs(t, err, errScanEndUnavailable)
+			require.Equal(t, uint64(0), idBound)
+		})
+	}
+}
+
+func TestPreForkVoteIDBoundIsZeroOnAChainWithNoProposals(t *testing.T) {
+	proposalKApp, accCacher, _, _ := setupVoteTest(t)
+
+	proposalKappAcc, err := accCacher.LoadKApp(kapps.ProposalKAppAddress)
+	require.NoError(t, err)
+
+	idBound, err := proposalKApp.PreForkVoteIDBound(proposalKappAcc, &kapps.ProposalController{})
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), idBound, "nothing predates the fork, so the scan reads nothing")
+}
+
+func TestAccountVoteIndexRoundTripsThroughStorage(t *testing.T) {
+	proposalKApp, accCacher, _, _ := setupVoteTest(t)
+
+	proposalKappAcc, err := accCacher.LoadKApp(kapps.ProposalKAppAddress)
+	require.NoError(t, err)
+
+	voter := hex.EncodeToString(makeAddress("indexedvoter"))
+
+	active := controllerWithActive(1, 2)
+	require.NoError(t, proposalKApp.addVoterToIndex(proposalKappAcc, voter, 1, 100, active))
+	require.NoError(t, proposalKApp.addVoterToIndex(proposalKappAcc, voter, 2, 200, active))
+	require.NoError(t, proposalKApp.addVoterToIndex(proposalKappAcc, voter, 1, 100, active))
+
+	entries, err := proposalKApp.GetAccountProposalVotes(proposalKappAcc, voter)
+	require.NoError(t, err)
+	require.Equal(t, []kapp.ProposalVoteIndexEntry{{ProposalID: 1, Amount: 100}, {ProposalID: 2, Amount: 200}}, entries)
+
+	require.NoError(t, proposalKApp.SetAccountProposalVotes(proposalKappAcc, voter, []kapp.ProposalVoteIndexEntry{{ProposalID: 2, Amount: 150}}))
+
+	entries, err = proposalKApp.GetAccountProposalVotes(proposalKappAcc, voter)
+	require.NoError(t, err)
+	require.Equal(t, []kapp.ProposalVoteIndexEntry{{ProposalID: 2, Amount: 150}}, entries)
+}
+
+func TestAccountVoteIndexReadsBackEmptyAfterLastEntryRemoved(t *testing.T) {
+	proposalKApp, accCacher, _, _ := setupVoteTest(t)
+
+	proposalKappAcc, err := accCacher.LoadKApp(kapps.ProposalKAppAddress)
+	require.NoError(t, err)
+
+	voter := hex.EncodeToString(makeAddress("indexedvoter"))
+
+	require.NoError(t, proposalKApp.addVoterToIndex(proposalKappAcc, voter, 7, 70, controllerWithActive(7)))
+	require.NoError(t, proposalKApp.SetAccountProposalVotes(proposalKappAcc, voter, nil))
+
+	entries, err := proposalKApp.GetAccountProposalVotes(proposalKappAcc, voter)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+
+	require.NoError(t, proposalKApp.addVoterToIndex(proposalKappAcc, voter, 8, 80, controllerWithActive(8)))
+
+	entries, err = proposalKApp.GetAccountProposalVotes(proposalKappAcc, voter)
+	require.NoError(t, err)
+	require.Equal(t, []kapp.ProposalVoteIndexEntry{{ProposalID: 8, Amount: 80}}, entries)
+}
+
+func TestAccountVoteIndexTreatsMissingDataTrieAsEmpty(t *testing.T) {
+	proposalKApp, _, _, _ := setupVoteTest(t)
+
+	freshKapp, err := state.NewKAppAccount(kapps.ProposalKAppAddress)
+	require.NoError(t, err)
+
+	voter := hex.EncodeToString(makeAddress("indexedvoter"))
+
+	entries, err := proposalKApp.GetAccountProposalVotes(freshKapp, voter)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+
+	require.NoError(t, proposalKApp.SetAccountProposalVotes(freshKapp, voter, nil))
+}
+
+// TestVoteRecordsTheAmountAndAReVoteReplacesIt drives the real Vote twice: the index must carry
+// the amount the proposal records for the voter, and a re-vote — which replaces the vote — must
+// replace the indexed amount too, or the unfreeze skip would trust a stale figure.
+func TestVoteRecordsTheAmountAndAReVoteReplacesIt(t *testing.T) {
+	proposalKApp, accCacher, forkController, _ := setupVoteTest(t)
+	forkController.FixAuditChangesV5Value = true
+
+	voterAddr := makeAddress("voter")
+	createActiveProposal(t, proposalKApp, accCacher, 1, map[string]*kapps.ProposalData_VoteDetail{})
+	createVoterAccount(t, accCacher, voterAddr, 1000)
+
+	for _, amount := range []int64{100, 40} {
+		resultCode, err := proposalKApp.Vote(voterAddr, &transaction.VoteContract{
+			ProposalID: 1,
+			Amount:     amount,
+			Type:       transaction.VoteContract_Yes,
+		})
+		require.Equal(t, transaction.Transaction_Ok, resultCode)
+		require.NoError(t, err)
+
+		proposalKappAcc, err := accCacher.LoadKApp(kapps.ProposalKAppAddress)
+		require.NoError(t, err)
+
+		entries, err := proposalKApp.GetAccountProposalVotes(proposalKappAcc, hex.EncodeToString(voterAddr))
+		require.NoError(t, err)
+		require.Equal(t, []kapp.ProposalVoteIndexEntry{{ProposalID: 1, Amount: amount}}, entries)
+	}
+}
+
+// TestPreForkVoteIDBoundFailsClosedOnAMalformedBound: a recorded bound of the wrong shape is
+// corruption. Recomputing it from the count as it stands now would let a later proposal widen the
+// scan this key exists to freeze, so the unfreeze must fail instead.
+func TestPreForkVoteIDBoundFailsClosedOnAMalformedBound(t *testing.T) {
+	proposalKApp, _, _, _ := setupVoteTest(t)
+
+	saves := 0
+	acc := &mock.KAppAccountHandlerStub{
+		DataTrieTrackerCalled: func() state.DataTrieTracker {
+			return &mock.DataTrieTrackerStub{
+				RetrieveValueCalled: func(_ []byte) ([]byte, error) {
+					return []byte{0, 0, 0, 1}, nil
+				},
+				SaveKeyValueCalled: func(_ []byte, _ []byte) error {
+					saves++
+					return nil
+				},
+			}
+		},
+	}
+
+	controller := &kapps.ProposalController{ProposalCount: 900}
+
+	_, err := proposalKApp.PreForkVoteIDBound(acc, controller)
+	require.ErrorIs(t, err, common.ErrInvalidValue)
+	require.Equal(t, 0, saves, "a malformed bound must not be recomputed and rewritten")
+}
+
+func controllerWithActive(ids ...uint64) *kapps.ProposalController {
+	return &kapps.ProposalController{
+		ActiveProposals: map[uint32]*kapps.ActiveProposals{100: {ProposalIDs: ids}},
+	}
+}
+
+// TestVoteDropsIndexEntriesForSettledProposals: a vote rewrites the index anyway, so it drops the
+// entries whose proposal is in none of the controller's buckets. That is what keeps the index at
+// the proposals still active for an account that votes for years and never unfreezes.
+func TestVoteDropsIndexEntriesForSettledProposals(t *testing.T) {
+	proposalKApp, accCacher, _, _ := setupVoteTest(t)
+
+	proposalKappAcc, err := accCacher.LoadKApp(kapps.ProposalKAppAddress)
+	require.NoError(t, err)
+
+	voter := hex.EncodeToString(makeAddress("indexedvoter"))
+
+	require.NoError(t, proposalKApp.addVoterToIndex(proposalKappAcc, voter, 7, 70, controllerWithActive(7)))
+	require.NoError(t, proposalKApp.addVoterToIndex(proposalKappAcc, voter, 1, 100, controllerWithActive(1, 7)))
+	require.NoError(t, proposalKApp.addVoterToIndex(proposalKappAcc, voter, 2, 20, controllerWithActive(1, 2)))
+
+	entries, err := proposalKApp.GetAccountProposalVotes(proposalKappAcc, voter)
+	require.NoError(t, err)
+	require.Equal(t, []kapp.ProposalVoteIndexEntry{{ProposalID: 1, Amount: 100}, {ProposalID: 2, Amount: 20}}, entries,
+		"proposal 7 is in no bucket any more, so its entry goes with this write; 1 is still active and stays")
+}
+
+// TestCreateRejectsAZeroDurationProposalAfterTheFork: a zero-duration proposal ends in the epoch
+// it is created in, whose bucket settlement already processed at that epoch's start, so it would
+// never be settled — active and votable forever, and never leaving the buckets, which is what
+// makes every voter's index entry for it unprunable. Pre-fork behaviour is unchanged.
+// TestCreateRecordsThePreForkIDBoundBeforeTakingTheNextID is the guard on the transition window.
+// A proposal created after the fork can be given any EpochEnd its proposer likes, including one
+// below anything active when the bound was recorded, so an epoch bound could not keep it out of
+// the unfreeze scan. Its id can only be above every pre-fork id, so Create records the bound
+// before it takes the next one. Without this, creating proposals after the fork would put the
+// unmetered per-proposal read back on every KFI unfreeze until they settled.
+func TestCreateRecordsThePreForkIDBoundBeforeTakingTheNextID(t *testing.T) {
+	proposalKApp, accCacher, forkController, _ := setupVoteTest(t)
+	forkController.FixAuditChangesV5Value = true
+
+	proposalKappAcc, err := accCacher.LoadKApp(kapps.ProposalKAppAddress)
+	require.NoError(t, err)
+
+	ctx := proposalKApp.KAppController.GetCurrentKAppContext()
+	controller := &kapps.ProposalController{ProposalCount: 4}
+	staking := &kapps.StakingData{TotalStaked: 10000000}
+
+	create := func(duration uint32) uint64 {
+		resCode, err := proposalKApp.finalizeProposal(
+			ctx,
+			proposalKappAcc,
+			&kapps.ProposalData{},
+			controller,
+			staking,
+			&transaction.ProposalContract{EpochsDuration: duration},
+			proposerAddr,
+		)
+		require.NoError(t, err)
+		require.Equal(t, transaction.Transaction_Ok, resCode)
+
+		return controller.ProposalCount
+	}
+
+	id := create(1)
+	require.Equal(t, uint64(5), id)
+
+	bound, err := proposalKApp.PreForkVoteIDBound(proposalKappAcc, controller)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), bound, "the bound is the last id handed out before the fork")
+	require.Greater(t, id, bound, "a proposal created after the fork is never scanned")
+
+	second := create(40)
+	require.Equal(t, uint64(6), second)
+
+	bound, err = proposalKApp.PreForkVoteIDBound(proposalKappAcc, controller)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4), bound, "and later proposals do not move it")
+}
+
+func TestCreateRejectsAZeroDurationProposalAfterTheFork(t *testing.T) {
+	for _, fixV5 := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fixAuditChangesV5=%v", fixV5), func(t *testing.T) {
+			proposalKApp, _, forkController, _ := setupVoteTest(t)
+			forkController.FixAuditChangesV5Value = fixV5
+
+			err := proposalKApp.validateCreateInput(&transaction.ProposalContract{
+				EpochsDuration: 0,
+				Parameters:     map[int32][]byte{int32(kapps.EnumParameter_ProposalMaxEpochsDuration): []byte("40")},
+			})
+
+			if fixV5 {
+				require.ErrorIs(t, err, common.ErrInvalidValue)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }

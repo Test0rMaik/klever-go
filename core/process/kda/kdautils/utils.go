@@ -18,12 +18,13 @@ const TickerSeparator = string(TickerSeparatorByte)
 const TickerRandomSequenceLength = 4
 
 var (
-	KLVIdentifier         = []byte("KLV")
-	KFIIdentifier         = []byte("KFI")
-	KLVKey                = ToKDAKey(KLVIdentifier, nil)
-	KFIKey                = ToKDAKey(KFIIdentifier, nil)
-	ProposalControllerKey = ToProposalKey(0)
-	MarketKeyLength       = 8
+	KLVIdentifier           = []byte("KLV")
+	KFIIdentifier           = []byte("KFI")
+	KLVKey                  = ToKDAKey(KLVIdentifier, nil)
+	KFIKey                  = ToKDAKey(KFIIdentifier, nil)
+	ProposalControllerKey   = ToProposalKey(0)
+	ProposalPreForkVotesKey = []byte(kapps.ProposalPreForkVotesKey)
+	MarketKeyLength         = 8
 )
 
 // IsTickerValid verifies if ticker satisfies all rules
@@ -168,6 +169,25 @@ func ToKDAKeyWithouPrefix(kdaID []byte, nonce []byte) []byte {
 // ToProposalKey parse a key for the given proposal
 func ToProposalKey(proposalID uint64) []byte {
 	return []byte(kapps.ProposalPrefix + kapps.Sp + strconv.FormatUint(proposalID, 10))
+}
+
+// ToAccountProposalVotesKey parse a key for the proposal vote index of the given account
+func ToAccountProposalVotesKey(hexAddress string) []byte {
+	return []byte(kapps.ProposalVotesPrefix + kapps.Sp + hexAddress)
+}
+
+// ActiveProposalIDs is the set of proposal ids in any of the controller's buckets: the proposals
+// still active, by construction — creation adds the id with its record and settlement flips the
+// record and drops the bucket together. A vote index entry for an id outside this set is stale.
+func ActiveProposalIDs(controller *kapps.ProposalController) map[uint64]struct{} {
+	ids := make(map[uint64]struct{})
+	for _, bucket := range controller.GetActiveProposals() {
+		for _, id := range bucket.GetProposalIDs() {
+			ids[id] = struct{}{}
+		}
+	}
+
+	return ids
 }
 
 // ToITOKey parse a key for the given ITO

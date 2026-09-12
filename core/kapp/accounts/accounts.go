@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"math"
+	"slices"
 	"strconv"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/klever-io/klever-go/common"
+	"github.com/klever-io/klever-go/common/types"
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/core/kapp"
 	"github.com/klever-io/klever-go/core/process"
@@ -1113,6 +1117,23 @@ func (a *accountsKapp) updateAccountState(
 	return transaction.Transaction_Ok, nil
 }
 
+type proposalVoteUpdate struct {
+	proposalKapp   state.KAppAccountHandler
+	controller     *kapps.ProposalController
+	encodedAddr    string
+	unfrozenAmount int64
+	ownerAcc       state.UserAccountHandler
+	userKDA        *kapps.UserKDA
+	// activeIDs is every proposal id in any of the controller's buckets, the proposals still
+	// active; used to drop index entries for the rest without a read.
+	activeIDs map[uint64]struct{}
+	// kfiStaked reads the KFI staking total once for this unfreeze, which is the scope that is
+	// actually safe: nothing between the first proposal it touches and the last changes the total,
+	// but a transaction can carry several unfreeze contracts and each one lowers it, so the memo
+	// must not outlive one call. It used to be reloaded and unmarshalled once per proposal.
+	kfiStaked func() (int64, error)
+}
+
 func (a *accountsKapp) handleProposalVotesOnUnfreeze(
 	ownerAcc state.UserAccountHandler,
 	assetID, sender []byte,
@@ -1132,12 +1153,31 @@ func (a *accountsKapp) handleProposalVotesOnUnfreeze(
 		return transaction.Transaction_AccountError, err
 	}
 
-	encodedAddr := hex.EncodeToString(sender)
+	update := proposalVoteUpdate{
+		proposalKapp:   proposalKapp,
+		controller:     controller,
+		encodedAddr:    hex.EncodeToString(sender),
+		unfrozenAmount: unfrozenAmount,
+		ownerAcc:       ownerAcc,
+		userKDA:        userKDA,
+		kfiStaked: sync.OnceValues(func() (int64, error) {
+			_, stakedKFI, err := a.KAppController.GetKDAKApp().GetStaking(kdautils.KFIIdentifier)
+			if err != nil {
+				return 0, err
+			}
 
-	for _, proposal := range controller.GetActiveProposals() {
-		if err := a.processActiveProposal(proposal, proposalKapp, controller, encodedAddr, unfrozenAmount, ownerAcc, userKDA); err != nil {
-			return transaction.Transaction_AccountError, err
-		}
+			return stakedKFI.TotalStaked, nil
+		}),
+	}
+
+	if a.forkController.FixAuditChangesV5() {
+		err = a.processIndexedProposalVotes(update)
+	} else {
+		err = a.scanActiveProposals(update, nil, math.MaxUint64)
+	}
+
+	if err != nil {
+		return transaction.Transaction_AccountError, err
 	}
 
 	if err := a.accountsCacher.UpdateKapp(proposalKapp); err != nil {
@@ -1147,59 +1187,192 @@ func (a *accountsKapp) handleProposalVotesOnUnfreeze(
 	return transaction.Transaction_Ok, nil
 }
 
-func (a *accountsKapp) processActiveProposal(
-	proposal *kapps.ActiveProposals,
-	proposalKapp state.KAppAccountHandler,
-	controller *kapps.ProposalController,
-	encodedAddr string,
-	unfrozenAmount int64,
-	ownerAcc state.UserAccountHandler,
-	userKDA *kapps.UserKDA,
-) error {
-	for _, id := range proposal.ProposalIDs {
-		_, proposal, _, err := a.KAppController.GetProposalKApp().GetProposal(id)
+// processIndexedProposalVotes walks the caller's own vote index instead of every active proposal,
+// rebuilds it in the same pass and writes it back only when the rebuilt index differs from the
+// stored one. skip holds every id seen, so a duplicate is applied once and the pre-fork scan
+// below leaves indexed proposals alone.
+func (a *accountsKapp) processIndexedProposalVotes(update proposalVoteUpdate) error {
+	proposalKApp := a.KAppController.GetProposalKApp()
+
+	entries, err := proposalKApp.GetAccountProposalVotes(update.proposalKapp, update.encodedAddr)
+	if err != nil {
+		return err
+	}
+
+	// Only the entries below need the set of proposals that are still active, so an empty index
+	// does not pay to build it. The scan further down still runs either way: an empty index does
+	// not mean the account never voted, because a vote cast before the fork is in no index.
+	if len(entries) > 0 {
+		update.activeIDs = kdautils.ActiveProposalIDs(update.controller)
+	}
+
+	skip := make(map[uint64]struct{}, len(entries))
+	kept := make([]kapp.ProposalVoteIndexEntry, 0, len(entries))
+
+	for _, entry := range entries {
+		if _, seen := skip[entry.ProposalID]; seen {
+			continue
+		}
+		skip[entry.ProposalID] = struct{}{}
+
+		rebuilt, err := a.rebuildIndexEntry(update, entry)
 		if err != nil {
 			return err
 		}
 
-		voter, exists := proposal.Voters[encodedAddr]
-		if !exists || voter == nil {
+		if rebuilt != nil {
+			kept = append(kept, *rebuilt)
+		}
+	}
+
+	if !slices.Equal(kept, entries) {
+		if err := proposalKApp.SetAccountProposalVotes(update.proposalKapp, update.encodedAddr, kept); err != nil {
+			return err
+		}
+	}
+
+	// Votes cast before the fork are in no index, so the proposals that can still hold one are
+	// scanned as well, minus what the index covered. That is every active proposal created
+	// before the fork, which is every active id at or below the recorded bound: ids are handed
+	// out in order, so one number separates the proposals that predate the fork from the rest.
+	// Those ids settle and leave the buckets, so this walk reads less and less, and nothing at
+	// all once they are gone. There is deliberately no epoch cut-off: a pre-fork proposal that
+	// outlives its EpochEnd unsettled would otherwise stop being scanned while its vote counts.
+	idBound, err := proposalKApp.PreForkVoteIDBound(update.proposalKapp, update.controller)
+	if err != nil {
+		return err
+	}
+
+	return a.scanActiveProposals(update, skip, idBound)
+}
+
+// rebuildIndexEntry is what one index entry becomes after the unfreeze: nil when its proposal is
+// in no active bucket, decided without a read; the entry as it is when the remaining frozen
+// balance still covers it, also without a read; otherwise the vote that remains once the proposal
+// is read and shrunk, nil if nothing is left of it.
+func (a *accountsKapp) rebuildIndexEntry(
+	update proposalVoteUpdate,
+	entry kapp.ProposalVoteIndexEntry,
+) (*kapp.ProposalVoteIndexEntry, error) {
+	if _, active := update.activeIDs[entry.ProposalID]; !active {
+		return nil, nil
+	}
+
+	if entry.Amount <= update.userKDA.FrozenBalance {
+		return &entry, nil
+	}
+
+	// The entry can outlive the record, so a proposal that is gone drops the entry rather than
+	// failing the unfreeze.
+	proposal, err := a.KAppController.GetProposalKApp().GetProposalData(update.proposalKapp, entry.ProposalID)
+	if err != nil {
+		if errors.Is(err, common.ErrProposalNotFound) {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+
+	remaining, err := a.shrinkVoteIfUncovered(update, proposal, entry.ProposalID)
+	if err != nil || remaining == nil {
+		return nil, err
+	}
+
+	return &kapp.ProposalVoteIndexEntry{ProposalID: entry.ProposalID, Amount: remaining.Amount}, nil
+}
+
+// scanActiveProposals is the walk over the active proposals, in ascending EpochEnd order so the
+// receipts it emits come out the same on every node: the controller's map has no order of its
+// own, and while receipts are not committed to state there is no reason to let them differ.
+func (a *accountsKapp) scanActiveProposals(update proposalVoteUpdate, skip map[uint64]struct{}, idBound uint64) error {
+	return types.NewDeterministicMap(update.controller.GetActiveProposals()).Each(
+		func(_ uint32, bucket *kapps.ActiveProposals) error {
+			return a.processActiveProposal(update, bucket, skip, idBound)
+		},
+	)
+}
+
+// shrinkVoteIfUncovered applies the unfreeze to the caller's vote on proposal when the remaining
+// frozen balance no longer covers it, and returns the vote that remains — the record as it stands
+// when nothing had to change, so an index that overstated it is corrected from the proposal — or
+// nil when the caller no longer votes on it.
+func (a *accountsKapp) shrinkVoteIfUncovered(
+	update proposalVoteUpdate,
+	proposal *kapps.ProposalData,
+	id uint64,
+) (*kapps.ProposalData_VoteDetail, error) {
+	voter, exists := proposal.Voters[update.encodedAddr]
+	if !exists || voter == nil {
+		return nil, nil
+	}
+
+	if voter.Amount > update.userKDA.FrozenBalance {
+		a.updateVoterAndProposal(update, voter, proposal, id)
+
+		if err := a.updateProposalTotalStaked(update, proposal); err != nil {
+			return nil, err
+		}
+
+		// Nothing on the unfreeze path changes the controller, so it is not rewritten: passing
+		// it would marshal every bucket and parameter once per proposal touched, for identical
+		// bytes.
+		if err := a.KAppController.GetProposalKApp().SetProposal(update.proposalKapp, id, proposal, nil); err != nil {
+			return nil, err
+		}
+	}
+
+	return proposal.Voters[update.encodedAddr], nil
+}
+
+// processActiveProposal walks one bucket. An id above idBound was created after the fork, so its
+// votes are all indexed and the index pass above has already applied them: skipping it here is
+// what keeps a proposal created after the fork from putting the old per-proposal read back on
+// every unfreeze for as long as its bucket lives.
+func (a *accountsKapp) processActiveProposal(
+	update proposalVoteUpdate,
+	activeProposals *kapps.ActiveProposals,
+	skip map[uint64]struct{},
+	idBound uint64,
+) error {
+	// GetProposalIDs, not the field: the buckets come back from protobuf, which can hold a nil
+	// map value, and a nil bucket must not panic the unfreeze. ActiveProposalIDs reads them the
+	// same way.
+	for _, id := range activeProposals.GetProposalIDs() {
+		if _, handled := skip[id]; handled {
 			continue
 		}
 
-		if voter.Amount <= userKDA.FrozenBalance {
+		if id > idBound {
 			continue
 		}
 
-		a.updateVoterAndProposal(voter, proposal, encodedAddr, unfrozenAmount, ownerAcc, id)
-
-		if err := a.updateProposalTotalStaked(proposal); err != nil {
+		// A missing record here fails the unfreeze, as it always has on this path; the index
+		// path tolerates it because its entries can outlive the record.
+		proposal, err := a.KAppController.GetProposalKApp().GetProposalData(update.proposalKapp, id)
+		if err != nil {
 			return err
 		}
 
-		if err := a.KAppController.GetProposalKApp().SetProposal(proposalKapp, id, proposal, controller); err != nil {
+		if _, err := a.shrinkVoteIfUncovered(update, proposal, id); err != nil {
 			return err
 		}
-
 	}
 
 	return nil
 }
 
 func (a *accountsKapp) updateVoterAndProposal(
+	update proposalVoteUpdate,
 	voter *kapps.ProposalData_VoteDetail,
 	proposal *kapps.ProposalData,
-	encodedAddr string,
-	unfrozenAmount int64,
-	ownerAcc state.UserAccountHandler,
 	proposalID uint64,
 ) {
-	votesToRemove := unfrozenAmount
+	votesToRemove := update.unfrozenAmount
 	receiptAmount := int64(0)
 
 	if votesToRemove >= voter.Amount {
 		votesToRemove = voter.Amount
-		delete(proposal.Voters, encodedAddr)
+		delete(proposal.Voters, update.encodedAddr)
 	} else {
 		voter.Amount -= votesToRemove
 		receiptAmount = voter.Amount
@@ -1211,21 +1384,25 @@ func (a *accountsKapp) updateVoterAndProposal(
 		txProcess.ProposalVote,
 		a.KAppController.GetCurrentKAppContext().ContractID(),
 		[]byte(strconv.FormatUint(proposalID, 10)),
-		ownerAcc.AddressBytes(),
+		update.ownerAcc.AddressBytes(),
 		[]byte(strconv.FormatInt(int64(voter.Type), 10)),
 		[]byte(strconv.FormatInt(receiptAmount, 10)),
 	)
 	a.KAppController.GetCurrentKAppContext().Receipts().Add(receipt)
 }
 
-func (a *accountsKapp) updateProposalTotalStaked(proposal *kapps.ProposalData) error {
-	if a.forkController.EnableSmartContracts() {
-		_, stakedKFI, err := a.KAppController.GetKDAKApp().GetStaking(kdautils.KFIIdentifier)
-		if err != nil {
-			return err
-		}
-		proposal.TotalStaked = stakedKFI.TotalStaked
+func (a *accountsKapp) updateProposalTotalStaked(update proposalVoteUpdate, proposal *kapps.ProposalData) error {
+	if !a.forkController.EnableSmartContracts() {
+		return nil
 	}
+
+	total, err := update.kfiStaked()
+	if err != nil {
+		return err
+	}
+
+	proposal.TotalStaked = total
+
 	return nil
 }
 

@@ -1,7 +1,9 @@
 package proposal
 
 import (
+	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"strconv"
 	"unicode/utf8"
 
@@ -128,22 +130,33 @@ func (p *proposalKapp) GetProposal(proposalID uint64) (state.KAppAccountHandler,
 
 	proposal := &kapps.ProposalData{}
 	if proposalID != 0 {
-		key := kdautils.ToProposalKey(proposalID)
-
-		proposalBytes, err := proposalKApp.DataTrieTracker().RetrieveValue(key)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		if len(proposalBytes) == 0 {
-			return nil, nil, nil, common.ErrProposalNotFound
-		}
-		err = p.marshalizer.Unmarshal(proposal, proposalBytes)
+		proposal, err = p.GetProposalData(proposalKApp, proposalID)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 	}
 
 	return proposalKApp, proposal, proposalController, nil
+}
+
+// GetProposalData reads one proposal from an already loaded proposal kapp account. GetProposal
+// re-reads and unmarshals the controller on every call; an unfreeze walking its index holds the
+// account and the controller already and must not pay that once per id.
+func (p *proposalKapp) GetProposalData(proposalKapp state.KAppAccountHandler, proposalID uint64) (*kapps.ProposalData, error) {
+	proposalBytes, err := proposalKapp.DataTrieTracker().RetrieveValue(kdautils.ToProposalKey(proposalID))
+	if err != nil {
+		return nil, err
+	}
+	if len(proposalBytes) == 0 {
+		return nil, common.ErrProposalNotFound
+	}
+
+	proposal := &kapps.ProposalData{}
+	if err := p.marshalizer.Unmarshal(proposal, proposalBytes); err != nil {
+		return nil, err
+	}
+
+	return proposal, nil
 }
 
 func (p *proposalKapp) SetProposal(proposalKapp state.KAppAccountHandler, proposalID uint64, proposal *kapps.ProposalData, controller *kapps.ProposalController) error {
@@ -185,6 +198,14 @@ func (p *proposalKapp) validateCreateInput(tc *transaction.ProposalContract) err
 	if uint64(tc.GetEpochsDuration()) >
 		p.KAppController.GetProposalController().GetParameterUint(kapps.EnumParameter_ProposalMaxEpochsDuration) ||
 		len(tc.GetParameters()) == 0 {
+		return common.ErrInvalidValue
+	}
+
+	if p.forkController.FixAuditChangesV5() && tc.GetEpochsDuration() == 0 {
+		// A zero-duration proposal ends in the epoch it is created in, whose bucket settlement
+		// processed at that epoch's start, so it would never be settled: active and votable
+		// forever, holding its bucket, and holding an entry in the index of every account that
+		// ever voted on it, since an entry is only prunable once its proposal leaves the buckets.
 		return common.ErrInvalidValue
 	}
 
@@ -288,6 +309,15 @@ func (p *proposalKapp) finalizeProposal(
 ) (transaction.Transaction_TXResultCode, error) {
 	// Prepare proposal details
 	copyProposalDetails(ctx, proposal, staking.TotalStaked, tc, sender)
+
+	// Record which ids predate the fork before taking the next one, so that this proposal, and
+	// every proposal created after it, falls above the bound a KFI unfreeze scans. Its own votes
+	// are all indexed, so nothing is lost by leaving it out of that scan.
+	if p.forkController.FixAuditChangesV5() {
+		if _, err := p.PreForkVoteIDBound(proposalKapp, controller); err != nil {
+			return transaction.Transaction_KAPPError, err
+		}
+	}
 
 	// Update controller and proposal
 	controller.ProposalCount++
@@ -451,6 +481,12 @@ func (p *proposalKapp) Vote(sender []byte, tc *transaction.VoteContract) (transa
 		return transaction.Transaction_ParameterInvalid, err
 	}
 
+	if p.forkController.FixAuditChangesV5() {
+		if err := p.addVoterToIndex(proposalKapp, encodedAddr, tc.GetProposalID(), tc.GetAmount(), controller); err != nil {
+			return transaction.Transaction_KAPPError, err
+		}
+	}
+
 	if err := p.accountsCacher.UpdateKapp(proposalKapp); err != nil {
 		return transaction.Transaction_SaveAccountError, err
 	}
@@ -465,4 +501,112 @@ func (p *proposalKapp) Vote(sender []byte, tc *transaction.VoteContract) (transa
 	))
 
 	return transaction.Transaction_Ok, nil
+}
+
+// PreForkVoteIDBound returns the highest proposal id that can still hold a vote cast before
+// FixAuditChangesV5, which is the last id handed out before the fork: ids are sequential, and
+// every vote cast after the fork is written to the caller's index or the vote fails. A KFI
+// unfreeze therefore has to scan ids at or below this bound and nothing above it.
+//
+// The bound is recorded the first time it is needed, from the controller's own count, and frozen
+// in state. Every path that could move the count past the pre-fork ids records it first — Create
+// before it takes the next id, the unfreeze before it scans — so whichever runs first stores the
+// same number, and a proposal created after the fork is always above it.
+func (p *proposalKapp) PreForkVoteIDBound(
+	proposalKapp state.KAppAccountHandler,
+	controller *kapps.ProposalController,
+) (uint64, error) {
+	raw, err := retrieveOptional(proposalKapp.DataTrieTracker(), kdautils.ProposalPreForkVotesKey)
+	if err != nil {
+		return 0, err
+	}
+
+	switch len(raw) {
+	case proposalIDSize:
+		return binary.BigEndian.Uint64(raw), nil
+	case 0:
+		// Not recorded yet.
+	default:
+		// Fail closed. A recorded bound of the wrong shape is corruption, and recomputing it
+		// from the count as it stands now is exactly the "later proposals widen the scan" path
+		// this key exists to close.
+		return 0, common.ErrInvalidValue
+	}
+
+	idBound := controller.GetProposalCount()
+
+	stored := binary.BigEndian.AppendUint64(make([]byte, 0, proposalIDSize), idBound)
+	if err := proposalKapp.DataTrieTracker().SaveKeyValue(kdautils.ProposalPreForkVotesKey, stored); err != nil {
+		return 0, err
+	}
+
+	return idBound, nil
+}
+
+// retrieveOptional reads a key that may legitimately be absent. A missing data trie means
+// nothing was ever written; ErrNegativeValue is how an empty value written earlier in the same
+// block reads back from the dirty cache, and an empty value is the delete on this trie. Both are
+// "absent", not failures; anything else is.
+func retrieveOptional(tracker state.DataTrieTracker, key []byte) ([]byte, error) {
+	raw, err := tracker.RetrieveValue(key)
+	if err != nil {
+		if errors.Is(err, common.ErrNilTrie) || errors.Is(err, common.ErrNegativeValue) {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+
+	return raw, nil
+}
+
+// GetAccountProposalVotes returns the account's vote index: each active proposal it has voted on
+// since FixAuditChangesV5 with the amount currently voted.
+func (p *proposalKapp) GetAccountProposalVotes(proposalKapp state.KAppAccountHandler, encodedAddr string) ([]kapp.ProposalVoteIndexEntry, error) {
+	raw, err := retrieveOptional(proposalKapp.DataTrieTracker(), kdautils.ToAccountProposalVotesKey(encodedAddr))
+	if err != nil {
+		return nil, err
+	}
+
+	return decodeProposalVoteIndex(raw)
+}
+
+// addVoterToIndex records the vote and, since the index is being rewritten anyway, drops every
+// entry whose proposal is in none of the controller's buckets — settled, so no unfreeze needs it.
+// That keeps the index bounded by the proposals still active, however long the account votes
+// without unfreezing.
+func (p *proposalKapp) addVoterToIndex(
+	proposalKapp state.KAppAccountHandler,
+	encodedAddr string,
+	proposalID uint64,
+	amount int64,
+	controller *kapps.ProposalController,
+) error {
+	entries, err := p.GetAccountProposalVotes(proposalKapp, encodedAddr)
+	if err != nil {
+		return err
+	}
+
+	entries, pruned := dropInactiveProposalVotes(entries, controller)
+	entries, changed := upsertProposalVoteIndex(entries, proposalID, amount)
+	if !pruned && !changed {
+		return nil
+	}
+
+	return p.SetAccountProposalVotes(proposalKapp, encodedAddr, entries)
+}
+
+// SetAccountProposalVotes stores the index in one write; an empty index is stored as an empty
+// value, which is the delete on this trie.
+func (p *proposalKapp) SetAccountProposalVotes(
+	proposalKapp state.KAppAccountHandler,
+	encodedAddr string,
+	entries []kapp.ProposalVoteIndexEntry,
+) error {
+	raw, err := encodeProposalVoteIndex(entries)
+	if err != nil {
+		return err
+	}
+
+	return proposalKapp.DataTrieTracker().SaveKeyValue(kdautils.ToAccountProposalVotesKey(encodedAddr), raw)
 }
