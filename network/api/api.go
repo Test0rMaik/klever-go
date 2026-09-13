@@ -51,6 +51,9 @@ const (
 	subscribePackage = "subscribe"
 	subscribeRoute   = "/subscribe"
 
+	nodePackage = "node"
+	debugRoute  = "/debug"
+
 	// defaultLogWSMaxConnections is the node-wide /log cap used when logWebSocketConnections
 	// resolves to 0 (a config.yaml predating the key). It cannot be disabled: before the cap
 	// existed, live /log connections still ran inside the gin global throttler's slot and were
@@ -161,6 +164,13 @@ func RegisterRoutes(ctx context.Context, ws *gin.Engine, routesConfig config.API
 	// is actually absent.
 	if routesConfig.IsRouteSecured(subscribePackage, subscribeRoute) && !routesConfig.IsRouteEnabled(subscribePackage, subscribeRoute) {
 		log.Warn("subscribe route has secured:true but open:false; /subscribe will not be registered. Set open:true to enable it (secured then requires Basic Auth).")
+	}
+
+	// Upgrading the binary does not rewrite an operator's api.yaml, so a node installed
+	// before /debug was secured keeps serving cached interceptor and resolver state
+	// unauthenticated with nothing to signal it. The edit is the operator's to make.
+	if routesConfig.IsRouteEnabled(nodePackage, debugRoute) && !routesConfig.IsRouteSecured(nodePackage, debugRoute) {
+		log.Warn("node debug route is open but not secured; /node/debug answers unauthenticated with cached interceptor and resolver state. Add secured:true to /debug in api.yaml.")
 	}
 
 	if routesConfig.IsRouteEnabled(subscribePackage, subscribeRoute) {

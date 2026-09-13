@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"crypto/subtle"
 	"encoding/hex"
 	"net/http"
 
@@ -39,6 +40,10 @@ func NewAuthenticationFunc(credentialsConfig config.APIRoutesConfig) gin.Handler
 		accounts[pair.Username] = pair.Password
 	}
 
+	// Stand-in digest for an unknown username, the same length as a real one so the
+	// comparison below cannot short-circuit on length. No password hashes to it.
+	unknownUserDigest := hex.EncodeToString(make([]byte, hasher.Size()))
+
 	authenticationFunction := func(c *gin.Context) {
 		user, pass, ok := c.Request.BasicAuth()
 		if !ok {
@@ -50,20 +55,19 @@ func NewAuthenticationFunc(credentialsConfig config.APIRoutesConfig) gin.Handler
 			return
 		}
 
-		userPassword, ok := accounts[user]
-		if !ok {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, shared.GenericAPIResponse{
-				Data:  nil,
-				Error: "username does not exist",
-				Code:  shared.ReturnCodeRequestError,
-			})
-			return
+		// An unknown username must cost and answer exactly what a wrong password does.
+		// Returning early with a distinct message made usernames enumerable one request
+		// at a time, and skipping the hash widened the timing gap on top of that.
+		userPassword, userExists := accounts[user]
+		if !userExists {
+			userPassword = unknownUserDigest
 		}
 
-		if userPassword != hex.EncodeToString(hasher.Compute(pass)) {
+		expected := hex.EncodeToString(hasher.Compute(pass))
+		if subtle.ConstantTimeCompare([]byte(userPassword), []byte(expected)) != 1 || !userExists {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, shared.GenericAPIResponse{
 				Data:  nil,
-				Error: "invalid password",
+				Error: "invalid credentials",
 				Code:  shared.ReturnCodeRequestError,
 			})
 			return
