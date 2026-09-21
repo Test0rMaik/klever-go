@@ -494,3 +494,49 @@ func TestMeteringContext_GasTracer(t *testing.T) {
 	require.Equal(t, 2, len(gasTrace))
 	require.Equal(t, gasUsed2, gasTrace["scAddress2"]["function2"][0])
 }
+
+// A successful UseGasBoundedAndAddTracedGas used to call UseGasBounded (which records into
+// whichever trace was current) and then append the same amount as a second slot under
+// functionName, so the charge showed up twice in the diagnostic trace while the meter deducted
+// once. On ErrNotEnoughGas the old helper returned before tracing anything, so only the success
+// case double-counted.
+func TestMeteringContext_UseGasBoundedAndAddTracedGas_TracesOnce(t *testing.T) {
+	t.Parallel()
+
+	newTracedMetering := func(gasProvided uint64) (*meteringContext, *contextmock.RuntimeContextMock) {
+		mockRuntime := &contextmock.RuntimeContextMock{SCAddress: []byte("scAddress1")}
+		meteringCtx, err := NewMeteringContext(&contextmock.VMHostMock{RuntimeContext: mockRuntime}, config.MakeGasMapForTests())
+		require.NoError(t, err)
+		meteringCtx.InitStateFromContractCallInput(&vmcommon.VMInput{GasProvided: gasProvided})
+		meteringCtx.SetGasTracing(true)
+		// the trace the leaked copy used to land in
+		meteringCtx.StartGasTracing("previousHook")
+		return meteringCtx, mockRuntime
+	}
+
+	t.Run("charge is deducted once and traced once under functionName", func(t *testing.T) {
+		meteringCtx, mockRuntime := newTracedMetering(1000)
+
+		require.NoError(t, meteringCtx.UseGasBoundedAndAddTracedGas("hook", 76))
+
+		require.Equal(t, uint64(76), mockRuntime.GetPointsUsed())
+		require.Equal(t, map[string]map[string][]uint64{"scAddress1": {
+			"previousHook": {0},
+			"hook":         {76},
+		}}, meteringCtx.GetGasTrace())
+	})
+
+	t.Run("not enough gas deducts nothing and leaves the [0] slot BeginTrace opened", func(t *testing.T) {
+		meteringCtx, mockRuntime := newTracedMetering(75)
+
+		require.ErrorIs(t, meteringCtx.UseGasBoundedAndAddTracedGas("hook", 76), vmhost.ErrNotEnoughGas)
+
+		require.Equal(t, uint64(0), mockRuntime.GetPointsUsed())
+		// tracing is on, the context address is set and "hook" was not traced before, so
+		// BeginTrace appended the [0] slot; UseGasBounded returned before traceGas wrote to it
+		require.Equal(t, map[string]map[string][]uint64{"scAddress1": {
+			"previousHook": {0},
+			"hook":         {0},
+		}}, meteringCtx.GetGasTrace())
+	})
+}
