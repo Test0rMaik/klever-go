@@ -137,6 +137,19 @@ By default, the seed node looks for configuration in `./config/seednode/`. See [
 
 For detailed CLI documentation, see [cmd/operator/docs/](cmd/operator/docs/).
 
+### Operator Shell Completion
+
+The operator CLI ships with Tab completion for Bash, Zsh, Fish and PowerShell. It
+completes subcommand names, the `claim` type argument, the `--kda` / `--id` asset flags
+of the `account` subcommands, and file paths. `account csv` filters them to `.csv` in
+Bash and Zsh; Fish and PowerShell offer every file.
+
+Run `operator completion <shell> --help` for the install instructions of your shell.
+
+Tab completion re-executes the binary with the command line typed so far, so a
+passphrase given with `--password` is visible in the process list before you press
+Enter. Prefer `--password-file`.
+
 ## Running a Node
 
 For comprehensive node setup and operation instructions, see the official documentation:
