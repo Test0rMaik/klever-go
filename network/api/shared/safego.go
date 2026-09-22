@@ -3,6 +3,7 @@ package shared
 import (
 	"fmt"
 	"io"
+	"runtime/debug"
 
 	logger "github.com/klever-io/klever-go-logger"
 )
@@ -17,7 +18,13 @@ import (
 func SafeRun(log logger.Logger, name string, conn io.Closer, fn func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Error("panic in detached websocket goroutine", "goroutine", name, "recover", fmt.Sprintf("%v", r))
+			// Quote the panic value: it can echo peer input and forge a log line (KLC-2596).
+			// The stack is this goroutine's trace, logged in full; Close ends the connection.
+			log.Error("panic in detached websocket goroutine",
+				"goroutine", name,
+				"recover", QuoteForLog(fmt.Sprintf("%v", r)),
+				"stack", string(debug.Stack()),
+			)
 			_ = conn.Close()
 		}
 	}()

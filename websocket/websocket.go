@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,6 +34,13 @@ const (
 	errMissingNonceHash = "must provide nonce or hash"
 	errTxNotFound       = "transaction not found"
 	errBlockNotFound    = "block not found"
+	// errInternal is the opaque answer for a panicked request. The value stays in the log (KLC-2596).
+	errInternal = "internal error"
+
+	// Client goroutines with their own log budget. See panicWarner.
+	opLoopIn              = "ws.loopIn"
+	opLoopOut             = "ws.loopOut"
+	opHandleClientRequest = "ws.HandleClientRequest"
 
 	postQueueDropLogIntervalSeconds = 10
 
@@ -170,6 +178,12 @@ type SocketHub struct {
 	sendDropWarn      dropWarner
 	writeFailWarn     dropWarner
 	queryFailWarn     dropWarner
+	// One stack budget per barrier, so a flood on one path cannot spend another's.
+	// These bound the stack only; the panic line is always logged.
+	loopInPanicWarn  dropWarner
+	loopOutPanicWarn dropWarner
+	requestPanicWarn dropWarner
+	otherPanicWarn   dropWarner
 	// appStatusHandler exports the mirror's cumulative drop/failure counts (see
 	// MetricWSMirrorQueueDroppedTotal/MetricWSMirrorPostFailuresTotal) alongside the
 	// rate-limited WARN logs above — the log is a periodic sample, this is the exact
@@ -226,6 +240,10 @@ func NewHub(postConnectionURL, postConnectionAPIKey string, facade WSFacade, lim
 		sendDropWarn:            dropWarner{windowSecs: postQueueDropLogIntervalSeconds},
 		writeFailWarn:           dropWarner{windowSecs: postQueueDropLogIntervalSeconds},
 		queryFailWarn:           dropWarner{windowSecs: postQueueDropLogIntervalSeconds},
+		loopInPanicWarn:         dropWarner{windowSecs: postQueueDropLogIntervalSeconds},
+		loopOutPanicWarn:        dropWarner{windowSecs: postQueueDropLogIntervalSeconds},
+		requestPanicWarn:        dropWarner{windowSecs: postQueueDropLogIntervalSeconds},
+		otherPanicWarn:          dropWarner{windowSecs: postQueueDropLogIntervalSeconds},
 		appStatusHandler:        statusHandler.NewNilStatusHandler(),
 	}
 }
@@ -392,6 +410,10 @@ func (h *SocketHub) StartServer(ctx context.Context) {
 				{&h.writeFailWarn, "connection writes failed (final)"},
 				{&h.queryFailWarn, "client queries failed (final)"},
 				{&h.rejectWarn, "subscription inserts rejected at a cap (final)"},
+				{&h.loopInPanicWarn, "reader-loop panics omitted (final)"},
+				{&h.loopOutPanicWarn, "writer-loop panics omitted (final)"},
+				{&h.requestPanicWarn, "client-request panics omitted (final)"},
+				{&h.otherPanicWarn, "other client panics omitted (final)"},
 			} {
 				if count, ok := final.warner.flush(); ok {
 					log.Warn(peerFailLogOp, "msg", final.msg, "count", count)
@@ -607,9 +629,14 @@ func loggableError(err error) string {
 		return ""
 	}
 
-	text := err.Error()
-	if len(text) > maxLoggableErrorLength {
-		text = text[:maxLoggableErrorLength] + fmt.Sprintf("… (%d bytes)", len(text))
+	return loggableText(err.Error(), maxLoggableErrorLength)
+}
+
+// loggableText bounds and scrubs one field of text that peer input may have reached. Shared
+// by loggableError and loggablePanic, which differ only in where the text comes from.
+func loggableText(text string, maxLength int) string {
+	if len(text) > maxLength {
+		text = text[:maxLength] + fmt.Sprintf("… (%d bytes)", len(text))
 	}
 
 	// Anything that could end a log line becomes a space: CR/LF, the other control runes,
@@ -625,6 +652,42 @@ func loggableError(err error) string {
 
 		return r
 	}, text)
+}
+
+// loggablePanic scrubs a recovered panic value. It can quote peer input, so it gets the
+// same bound and control-rune scrub as loggableError (KLC-2596).
+func loggablePanic(r interface{}) string {
+	const maxLoggablePanicLength = 256
+
+	return loggableText(fmt.Sprintf("%v", r), maxLoggablePanicLength)
+}
+
+// panicWarner is the log budget for one barrier. An unknown op shares otherPanicWarn.
+func (h *SocketHub) panicWarner(op string) *dropWarner {
+	switch op {
+	case opLoopIn:
+		return &h.loopInPanicWarn
+	case opLoopOut:
+		return &h.loopOutPanicWarn
+	case opHandleClientRequest:
+		return &h.requestPanicWarn
+	default:
+		return &h.otherPanicWarn
+	}
+}
+
+// logRecoveredPanic logs a panic from a client goroutine outside gin.Recovery (KLC-2596).
+// The whole line folds through the warner, like the other peer-driven sites: the request
+// barrier leaves the socket open, so budgeting the stack alone still bought a line per frame.
+// A second, distinct panic value inside a window survives only as the counter.
+func (h *SocketHub) logRecoveredPanic(op string, r interface{}) {
+	if count, ok := h.panicWarner(op).fire(); ok {
+		log.Error(op+" panicked",
+			"panic", loggablePanic(r),
+			"stack", string(debug.Stack()),
+			"similarSinceLastLog", count,
+		)
+	}
 }
 
 // loggableHash renders a peer-supplied hash safely: a well-formed one is returned as-is,

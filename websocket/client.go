@@ -22,7 +22,7 @@ type client struct {
 	sem       chan struct{}
 }
 
-// NewClient create a new client, add into hub and start ping and watch
+// NewClient creates a client and starts its read and write loops. The caller registers it with the hub.
 func NewClient(conn *ws.Conn, hub *SocketHub) *client {
 	client := &client{conn: conn, hub: hub, out: make(chan interface{}, outChannelSize), alive: true, sem: make(chan struct{}, maxWorkers)}
 	client.ctx, client.cancel = context.WithCancel(context.Background())
@@ -100,13 +100,41 @@ func unexpectedClose(err error) bool {
 	return !errors.Is(err, net.ErrClosed)
 }
 
+// recoverPanic is the barrier for client goroutines spawned outside gin.Recovery (KLC-2596).
+// teardown, when set, runs before the panic is logged, under a recover of its own.
+func (c *client) recoverPanic(op string, teardown func()) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	if teardown != nil {
+		c.runTeardown(op, teardown)
+	}
+	c.hub.logRecoveredPanic(op, r)
+}
+
+// runTeardown runs one barrier's teardown under its own recover: it runs after recover()
+// consumed the original panic, so a panic here would replace it and escape the goroutine.
+// Its own op falls to panicWarner's shared budget rather than spending the barrier's.
+func (c *client) runTeardown(op string, teardown func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.hub.logRecoveredPanic(op+".teardown", r)
+		}
+	}()
+
+	teardown()
+}
+
 // watch this function read client messages to check if client cancel the conn or send a ping
 func (c *client) loopIn() {
+	// After the teardown defer, so Close and deregister run first and a panic there is recovered.
+	defer c.recoverPanic(opLoopIn, nil)
 	defer func() {
 		c.Close()
 		c.hub.handleClientDelete(c)
 	}()
-	label := "ws.loopIn"
+	label := opLoopIn
 	// Bound every inbound frame and keep a lifetime read deadline, refreshed by the pong
 	// handler and each read. loopOut's pings keep a live client warm while a dead/idle one
 	// is reclaimed at pongWait (GHSA-4fwh-wrm6-97xm).
@@ -158,6 +186,10 @@ func (c *client) loopIn() {
 		}
 		ctx := c.ctx
 		go func(ctx context.Context, req WSRequest) {
+			// Peer request, outside gin.Recovery (KLC-2596). Registered first so it recovers last.
+			defer c.recoverPanic(opHandleClientRequest, func() {
+				c.send(WSResponse{ID: req.ID, Error: errInternal})
+			})
 			defer func() { <-c.sem }()
 			select {
 			case <-ctx.Done():
@@ -170,6 +202,9 @@ func (c *client) loopIn() {
 }
 
 func (c *client) loopOut() {
+	// The only writer; a panic here closes the client, and loopIn then deregisters it (KLC-2596).
+	defer c.recoverPanic(opLoopOut, c.Close)
+
 	// Ping the client periodically; its pong refreshes loopIn's read deadline, keeping
 	// passive-but-live subscribers up while dead ones time out. WriteControl is safe to
 	// call concurrently with the other writer.
