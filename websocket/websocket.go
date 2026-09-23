@@ -137,15 +137,15 @@ type userOptions struct {
 }
 
 type SocketHub struct {
-	mu                   sync.RWMutex
-	postConnectionURL    string
-	postConnectionAPIKey string
+	mu                      sync.RWMutex
+	postConnectionURL       string
+	postConnectionAPIKey    string
 	facade                  WSFacade
 	blockSubscription       map[*client]struct{}
 	transactionSubscription map[*client]struct{}
 	addressSubscription     map[string]map[*client]userOptions
 	clientAddresses         map[*client]int
-	limits resolvedLimits
+	limits                  resolvedLimits
 	// clients is every client the hub has accepted, so deleteAll can close all of them.
 	// The subscription maps alone are not enough: an address-scoped subscribe with an
 	// empty address list (or an unsubscribe that empties the last one) leaves a live
