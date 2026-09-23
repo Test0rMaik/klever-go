@@ -563,6 +563,33 @@ func TestHandleClientInsertion_AddressTypes(t *testing.T) {
 	assert.True(t, opts.acceptLogs)
 }
 
+// TestHandleClientInsertion_RejectsDeadClient_NoSubscriberCountLeak guards a race
+// fbsobreira flagged in review: NewClient starts loopIn/loopOut before the caller gets to
+// call HandleClientInsertion, so a client that disconnects immediately can have loopIn's
+// teardown (c.Close(), then handleClientDelete) run first. Without the IsAlive check under
+// h.mu, HandleClientInsertion would still insert the now-dead client and bump
+// logsSubscriberCount — which handleClientDelete already ran and so never undoes, leaving
+// HasLogsSubscriberOrMirror permanently true. Simulates the ordering directly (mark the
+// client dead before insertion) rather than racing real goroutines, since the property
+// under test is the guard itself, not the scheduler.
+func TestHandleClientInsertion_RejectsDeadClient_NoSubscriberCountLeak(t *testing.T) {
+	hub := newTestHub(nil)
+	c := newTestClient(hub)
+	c.alive = false // as if loopIn's teardown already ran
+
+	err := hub.HandleClientInsertion([]indexer.EventType{indexer.LOGS}, []string{"klv1test"}, c)
+
+	assert.ErrorIs(t, err, ErrClientClosed)
+	hub.mu.Lock()
+	_, tracked := hub.clients[c]
+	_, hasAddress := hub.addressSubscription["klv1test"]
+	count := hub.logsSubscriberCount.Load()
+	hub.mu.Unlock()
+	assert.False(t, tracked, "a dead client must never be tracked in hub.clients")
+	assert.False(t, hasAddress, "a dead client must never populate addressSubscription")
+	assert.Zero(t, count, "logsSubscriberCount must not be bumped for a client that never got inserted")
+}
+
 func TestContainsAddressScoped_Logs(t *testing.T) {
 	assert.True(t, containsAddressScoped([]indexer.EventType{indexer.LOGS}))
 }
@@ -1106,6 +1133,38 @@ func TestStartServer_LogsEvent(t *testing.T) {
 	s := awaitSend(t, c)
 	assert.Equal(t, indexer.LOGS, s.Type)
 	assert.Equal(t, "klv1contract", s.Address)
+	assert.Equal(t, "txhash1", s.Hash)
+
+	env.teardown(c)
+}
+
+// TestStartServer_LogsEvent_DeliversToNestedEventAddress guards fbsobreira's review
+// finding that a log entry was dispatched only under entry.Address, even though a deploy
+// tx attributes entry.Address to the *deployer* (see getLogAddressByTx in
+// core/process/transactionLog) while the entry's own events carry the newly deployed
+// contract's address — so a subscriber watching the new contract never saw its own
+// deploy/init events, only the deployer's wallet did. The same gap applied to any nested
+// cross-contract call's inner contract, the README's former "Known Limitations" entry.
+func TestStartServer_LogsEvent_DeliversToNestedEventAddress(t *testing.T) {
+	env := startServerEnv(t, nil)
+	c := newTestClient(env.hub)
+
+	env.hub.mu.Lock()
+	env.hub.addressSubscription["klv1newcontract"] = map[*client]userOptions{c: {acceptLogs: true}}
+	env.hub.mu.Unlock()
+
+	env.queue <- indexer.Event{
+		EvType: indexer.LOGS,
+		Message: []*data.Logs{{
+			ID:      "txhash1",
+			Address: "klv1deployer",
+			Events:  []*data.Event{{Address: "klv1newcontract", Identifier: "init"}},
+		}},
+	}
+
+	s := awaitSend(t, c)
+	assert.Equal(t, indexer.LOGS, s.Type)
+	assert.Equal(t, "klv1newcontract", s.Address, "a subscriber to the deployed contract's own address must be reached, not just the deployer's")
 	assert.Equal(t, "txhash1", s.Hash)
 
 	env.teardown(c)

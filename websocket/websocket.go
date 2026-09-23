@@ -140,11 +140,6 @@ type SocketHub struct {
 	mu                   sync.RWMutex
 	postConnectionURL    string
 	postConnectionAPIKey string
-	// mirrorConfigured mirrors postQueue != nil (the mirror's actual enable condition — see
-	// NewHub, URL is the single source of truth) as a plain bool so per-event dispatch
-	// doesn't need to reach through the channel. Computed once at construction; neither
-	// underlying field is ever mutated afterward.
-	mirrorConfigured        bool
 	facade                  WSFacade
 	blockSubscription       map[*client]struct{}
 	transactionSubscription map[*client]struct{}
@@ -242,7 +237,6 @@ func NewHub(postConnectionURL, postConnectionAPIKey string, facade WSFacade, lim
 		transactionSubscription: make(map[*client]struct{}),
 		postConnectionURL:       postConnectionURL,
 		postConnectionAPIKey:    postConnectionAPIKey,
-		mirrorConfigured:        postQueue != nil,
 		facade:                  facade,
 		limits:                  resolved,
 		postQueue:               postQueue,
@@ -345,7 +339,7 @@ func (h *SocketHub) dispatchToAddress(evType indexer.EventType, address, hash st
 	}
 	h.mu.RUnlock()
 
-	if len(snapshot) == 0 && !h.mirrorConfigured {
+	if len(snapshot) == 0 && h.postQueue == nil {
 		return
 	}
 
@@ -362,11 +356,11 @@ func (h *SocketHub) dispatchToAddress(evType indexer.EventType, address, hash st
 
 // HasLogsSubscriberOrMirror reports whether dispatching a LOGS event would actually be
 // delivered anywhere — a mirror endpoint is configured, or at least one client currently
-// watches an address with LOGS accepted. Wired into indexer.LogsSubscriberChecker (see
+// watches an address with LOGS accepted. Wired into indexer.SetLogsSubscriberChecker (see
 // network/api/api.go) so the block-commit goroutine can skip the log-conversion cost
 // entirely for a block that nobody would receive it for.
 func (h *SocketHub) HasLogsSubscriberOrMirror() bool {
-	return h.mirrorConfigured || h.logsSubscriberCount.Load() > 0
+	return h.postQueue != nil || h.logsSubscriberCount.Load() > 0
 }
 
 func (h *SocketHub) broadcastToSubscription(parsed *Send, subscription map[*client]struct{}) {
@@ -408,6 +402,12 @@ func (h *SocketHub) StartServer(ctx context.Context) {
 	h.mu.Lock()
 	h.closed = false
 	h.mu.Unlock()
+
+	// Wired here rather than at construction (network/api/api.go) so the global tracks
+	// this hub only while it is actually running — deleteAll clears it again on shutdown,
+	// so a later block never consults a stopped hub's stale subscriber state, and a
+	// restarted hub (see the reuse note above) re-wires itself rather than staying unwired.
+	indexer.SetLogsSubscriberChecker(h.HasLogsSubscriberOrMirror)
 
 	h.startPostWorkers(ctx)
 	for {
@@ -499,8 +499,38 @@ func (h *SocketHub) handleLogsEvent(event indexer.Event) {
 		// entry.ID is the hex-encoded hash of the transaction that produced this log
 		// (already computed for the Elasticsearch-facing shape; reused here as the
 		// envelope hash so a subscriber can correlate a log back to its transaction).
-		h.dispatchToAddress(event.EvType, entry.Address, entry.ID, entry, acceptLogs)
+		for address := range logEntryAddresses(entry) {
+			h.dispatchToAddress(event.EvType, address, entry.ID, entry, acceptLogs)
+		}
 	}
+}
+
+// logEntryAddresses returns the distinct set of addresses a log entry is relevant to:
+// entry.Address (for a deploy tx this is the deployer — see getLogAddressByTx in
+// core/process/transactionLog — for any other tx, the invoked contract) plus each
+// individual event's own Address. A deploy tx's init events carry the new contract's own
+// address, which entry.Address alone never does, so a subscriber to the just-deployed
+// contract would otherwise never see its own deploy/init events; the same gap applied to
+// any nested cross-contract call's inner contract (see websocket/README.md's former "Known
+// Limitations" entry on this, now resolved by delivering under both addresses).
+//
+// This can dispatch one entry to more than one address (up to 1+len(entry.Events) distinct
+// addresses), each a real marshal-and-post — and one more mirror POST each, if a mirror is
+// configured. Deliberately uncapped: every event.Address is the real, gas-priced address of
+// whichever contract called ManagedWriteLog (runtime.GetContextAddress(), not
+// attacker-supplied data), so distinct addresses in one entry cost the tx real gas to
+// produce, same as the event count itself already does — not a free amplification lever
+// under current gas economics. Revisit if that ever changes (e.g. a gas-schedule change
+// cheapening cross-contract calls or logging).
+func logEntryAddresses(entry *data.Logs) map[string]struct{} {
+	addresses := map[string]struct{}{entry.Address: {}}
+	for _, evt := range entry.Events {
+		if evt == nil || evt.Address == "" {
+			continue
+		}
+		addresses[evt.Address] = struct{}{}
+	}
+	return addresses
 }
 
 func (h *SocketHub) handleUserTransactionEvent(event indexer.Event) {
@@ -931,6 +961,7 @@ func (h *SocketHub) deleteAll() {
 
 	h.closed = true
 	h.logsSubscriberCount.Store(0)
+	indexer.SetLogsSubscriberChecker(nil)
 
 	for c := range h.clients {
 		c.Close()

@@ -11,15 +11,31 @@ const eventQueueBufferSize = 1000
 var EventQueue = make(chan Event, eventQueueBufferSize)
 var UseEventQueue bool
 
-// LogsSubscriberChecker, when set (by the websocket hub during its construction),
-// reports whether dispatching a LOGS event would actually be delivered anywhere — an
-// address-scoped LOGS subscriber, or a configured mirror endpoint. dispatchLogEvents
-// consults it before paying the full bech32/hex-encoding conversion cost on the
-// block-commit goroutine, so a block with many SC events costs nothing extra when nobody
-// would receive them. nil (no hub wired yet, or this indexer package used outside the
-// websocket feature) is treated as "yes, convert" so nothing is silently dropped absent a
-// hub that could report otherwise.
-var LogsSubscriberChecker func() bool
+// logsSubscriberChecker backs SetLogsSubscriberChecker/GetLogsSubscriberChecker. An
+// atomic.Value instead of a plain package-level func var: it is written once (by the
+// websocket hub during its construction) and cleared again on hub shutdown, but read on
+// every block from the commit goroutine — a bare var would race between that write and
+// those reads.
+var logsSubscriberChecker atomic.Value // holds a `func() bool`, possibly nil
+
+// SetLogsSubscriberChecker installs the function dispatchLogEvents consults before paying
+// the full bech32/hex-encoding conversion cost on the block-commit goroutine, so a block
+// with many SC events costs nothing extra when nobody would receive them. Call it with nil
+// to unwire a hub that is shutting down — otherwise a later block still consults a stopped
+// hub's stale state.
+func SetLogsSubscriberChecker(checker func() bool) {
+	logsSubscriberChecker.Store(&checker)
+}
+
+// GetLogsSubscriberChecker returns the currently installed checker, or nil if none is set
+// (no hub wired yet, or this indexer package used outside the websocket feature).
+func GetLogsSubscriberChecker() func() bool {
+	stored, _ := logsSubscriberChecker.Load().(*func() bool)
+	if stored == nil {
+		return nil
+	}
+	return *stored
+}
 
 type Event struct {
 	EvType  EventType
@@ -76,13 +92,4 @@ func NewEventTypeStrict(evType string) (EventType, error) {
 	default:
 		return UNKNOWN, ErrUnknownEventType
 	}
-}
-
-// NewEventType is the non-strict counterpart of NewEventTypeStrict, returning UNKNOWN
-// instead of an error for an unrecognized type. Delegates to it rather than duplicating
-// the switch, so the two can't silently drift out of sync (e.g. a new type added to one
-// and forgotten in the other).
-func NewEventType(evType string) EventType {
-	t, _ := NewEventTypeStrict(evType)
-	return t
 }

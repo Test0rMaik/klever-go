@@ -635,13 +635,13 @@ func TestEventsProcessor_SaveBlock_DispatchesLogEvents_WhenPrepareIsSkipped(t *t
 // bech32/hex-encoding PrepareLogsForDB conversion on the block-commit goroutine whenever
 // UseEventQueue was on, even when no client subscribed to LOGS and no mirror was
 // configured — the hub's own subscriber gate only skipped cost later, per entry, after
-// conversion had already run for all of them. LogsSubscriberChecker lets the commit
+// conversion had already run for all of them. SetLogsSubscriberChecker lets the commit
 // goroutine skip the conversion (and the LOGS event) entirely in that case.
 func TestEventsProcessor_SaveBlock_SkipsLogConversionWithNoSubscriber(t *testing.T) {
 	testQueue := saveAndRestoreEventQueue(t, true)
-	original := LogsSubscriberChecker
-	LogsSubscriberChecker = func() bool { return false }
-	t.Cleanup(func() { LogsSubscriberChecker = original })
+	original := GetLogsSubscriberChecker()
+	SetLogsSubscriberChecker(func() bool { return false })
+	t.Cleanup(func() { SetLogsSubscriberChecker(original) })
 
 	ep := createTestEventsProcessor(t)
 
@@ -654,7 +654,7 @@ func TestEventsProcessor_SaveBlock_SkipsLogConversionWithNoSubscriber(t *testing
 	ep.SaveBlock(&indexer.ArgsSaveBlockData{Header: header, TransactionsPool: pool})
 
 	logsEvent := findEventType(drainAllEvents(testQueue), LOGS)
-	assert.Nil(t, logsEvent, "LOGS must not dispatch when LogsSubscriberChecker reports nobody is listening")
+	assert.Nil(t, logsEvent, "LOGS must not dispatch when the logs-subscriber checker reports nobody is listening")
 }
 
 // TestEventsProcessor_SaveBlock_SkipsLogConversionWithNoSubscriber_PinsGateOrdering asserts
@@ -664,9 +664,9 @@ func TestEventsProcessor_SaveBlock_SkipsLogConversionWithNoSubscriber(t *testing
 // its result), which would still pay the conversion cost the fix exists to avoid.
 func TestEventsProcessor_SaveBlock_SkipsLogConversionWithNoSubscriber_PinsGateOrdering(t *testing.T) {
 	saveAndRestoreEventQueue(t, true)
-	original := LogsSubscriberChecker
-	LogsSubscriberChecker = func() bool { return false }
-	t.Cleanup(func() { LogsSubscriberChecker = original })
+	original := GetLogsSubscriberChecker()
+	SetLogsSubscriberChecker(func() bool { return false })
+	t.Cleanup(func() { SetLogsSubscriberChecker(original) })
 
 	ep := createTestEventsProcessor(t)
 	counting := &countingLogsProc{inner: ep.logsAndEventsProc}

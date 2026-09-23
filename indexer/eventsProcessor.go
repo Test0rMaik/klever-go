@@ -189,7 +189,7 @@ func (ep *eventsProcessor) dispatchLogEvents(prepared *data.PreparedBlockData, p
 	if pool == nil || len(pool.Logs) == 0 {
 		return
 	}
-	if LogsSubscriberChecker != nil && !LogsSubscriberChecker() {
+	if checker := GetLogsSubscriberChecker(); checker != nil && !checker() {
 		return
 	}
 
