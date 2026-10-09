@@ -2,6 +2,7 @@ package logsevents_test
 
 import (
 	"encoding/hex"
+	"strings"
 	"testing"
 
 	"github.com/klever-io/klever-go/common/mock"
@@ -25,6 +26,7 @@ import (
 func TestExtractDataFromLogs_LightweightModeSkipsExpensiveProcessors(t *testing.T) {
 	var encodeCalls int
 	pubKeyConverter := &mock.PubkeyConverterStub{
+		LenCalled: func() int { return 32 },
 		EncodeCalled: func(pkBytes []byte) string {
 			encodeCalls++
 			return "klv1encoded"
@@ -48,6 +50,8 @@ func TestExtractDataFromLogs_LightweightModeSkipsExpensiveProcessors(t *testing.
 	deployEvent := &transaction.Event{
 		Identifier: []byte(core.SCDeployIdentifier),
 		Topics:     [][]byte{[]byte("deployedaddr12345678901234567890"), []byte("creatoraddr123456789012345678901")},
+		// The node's own deploy log; see TestExtractDataFromLogs_ForgedSCDeployEventIgnored.
+		IsSystemLog: true,
 	}
 	writeLogEvent := &transaction.Event{Identifier: []byte("writeLog")}
 	logHandler := &transaction.Log{
@@ -76,4 +80,49 @@ func TestExtractDataFromLogs_LightweightModeSkipsExpensiveProcessors(t *testing.
 	assert.True(t, fullTxs[0].HasOperations)
 	assert.Equal(t, transaction.Transaction_SUCCESS.String(), fullTxs[0].Status,
 		"full mode must produce the same tx-field parity as lightweight mode")
+}
+
+// TestExtractDataFromLogs_ForgedSCDeployEventIgnored pins that a contract cannot forge an
+// ES scdeploys record: an event identifier is just the name of the endpoint that wrote it,
+// so a contract exporting an endpoint called SCDeploy emits an identical-looking event. Only
+// the node's own (system) log with address-sized topics may produce one, and a rejected
+// event must not reach pubKeyConverter.Encode at all (it logs a stack-trace WARN on a
+// wrong-sized input).
+func TestExtractDataFromLogs_ForgedSCDeployEventIgnored(t *testing.T) {
+	addr := func(c byte) []byte { return []byte(strings.Repeat(string(c), 32)) }
+	tests := []struct {
+		name  string
+		event *transaction.Event
+	}{
+		{"contract-written (not a system log)", &transaction.Event{
+			Identifier: []byte(core.SCDeployIdentifier), Topics: [][]byte{addr('a'), addr('b')}}},
+		{"system log with short topic", &transaction.Event{
+			Identifier: []byte(core.SCDeployIdentifier), IsSystemLog: true, Topics: [][]byte{[]byte("short"), addr('b')}}},
+		{"system log with oversized creator topic", &transaction.Event{
+			Identifier: []byte(core.SCUpgradeIdentifier), IsSystemLog: true, Topics: [][]byte{addr('a'), append(addr('b'), 'x')}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var encodeCalls int
+			lep, err := logsevents.NewLogsAndEventsProcessor(logsevents.ArgsLogsAndEventsProcessor{
+				PubKeyConverter: &mock.PubkeyConverterStub{
+					LenCalled:    func() int { return 32 },
+					EncodeCalled: func([]byte) string { encodeCalls++; return "klv1encoded" },
+				},
+				Marshalizer: &mock.MarshalizerMock{},
+				Hasher:      &mock.HasherMock{},
+			})
+			require.NoError(t, err)
+
+			pool := &indexer.Pool{Logs: []*nodeData.LogData{{
+				LogHandler: &transaction.Log{Address: []byte("contractaddr"), Events: []*transaction.Event{tc.event}},
+				TxHash:     "txhash1",
+			}}}
+			txs := []*data.Transaction{{Hash: hex.EncodeToString([]byte("txhash1"))}}
+
+			result := lep.ExtractDataFromLogs(pool, txs, 100, true)
+			assert.Empty(t, result.ScDeploys)
+			assert.Equal(t, 0, encodeCalls)
+		})
+	}
 }

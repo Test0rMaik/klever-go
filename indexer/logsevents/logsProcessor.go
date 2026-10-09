@@ -2,6 +2,7 @@ package logsevents
 
 import (
 	"encoding/hex"
+	"strings"
 	"time"
 
 	"github.com/klever-io/klever-go/common"
@@ -180,7 +181,9 @@ func (lep *logsAndEventsProcessor) prepareLogsForDB(
 		// transaction apart from one whose effects actually committed (a tx can still
 		// generate SC logs on its error path, see processIfErrorWithAddedLogs).
 		logsDB.Caller = tx.Sender
-		logsDB.Status = tx.Status
+		// Lowercased to match the "success"/"fail" the transactions index uses; the
+		// informativeLogs override writes the enum's own casing.
+		logsDB.Status = strings.ToLower(tx.Status)
 		logsDB.ResultCode = tx.ResultCode
 	}
 

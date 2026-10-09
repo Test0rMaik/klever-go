@@ -322,14 +322,11 @@ func (h *SocketHub) startPostWorkers(ctx context.Context) {
 	}
 }
 
-// dispatchToAddress marshals message for evType/address/hash and sends it to every client
-// currently watching address whose userOptions filterFn accepts, skipping the
-// marshal/mirror-post cost entirely when nobody would receive it (no matching subscriber
-// and no mirror configured). One lock/lookup snapshots the matching clients; shared by
-// every address-scoped event handler (ACCOUNTS, LOGS, tx sender/receipts) so the
-// "is anybody listening" gate isn't special-cased to one event type.
-func (h *SocketHub) dispatchToAddress(evType indexer.EventType, address, hash string, message interface{}, filterFn func(userOptions) bool) {
+// subscribersFor snapshots the clients currently watching address whose userOptions
+// filterFn accepts, under one read lock.
+func (h *SocketHub) subscribersFor(address string, filterFn func(userOptions) bool) []*client {
 	h.mu.RLock()
+	defer h.mu.RUnlock()
 	clients := h.addressSubscription[address]
 	snapshot := make([]*client, 0, len(clients))
 	for c, opts := range clients {
@@ -337,8 +334,17 @@ func (h *SocketHub) dispatchToAddress(evType indexer.EventType, address, hash st
 			snapshot = append(snapshot, c)
 		}
 	}
-	h.mu.RUnlock()
+	return snapshot
+}
 
+// dispatchToAddress marshals message for evType/address/hash and sends it to every client
+// currently watching address whose userOptions filterFn accepts, skipping the
+// marshal/mirror-post cost entirely when nobody would receive it (no matching subscriber
+// and no mirror configured). One lock/lookup snapshots the matching clients; shared by
+// every address-scoped event handler (ACCOUNTS, tx sender/receipts) so the
+// "is anybody listening" gate isn't special-cased to one event type.
+func (h *SocketHub) dispatchToAddress(evType indexer.EventType, address, hash string, message interface{}, filterFn func(userOptions) bool) {
+	snapshot := h.subscribersFor(address, filterFn)
 	if len(snapshot) == 0 && h.postQueue == nil {
 		return
 	}
@@ -496,11 +502,49 @@ func (h *SocketHub) handleLogsEvent(event indexer.Event) {
 		if entry == nil || entry.Address == "" {
 			continue
 		}
-		// entry.ID is the hex-encoded hash of the transaction that produced this log
-		// (already computed for the Elasticsearch-facing shape; reused here as the
-		// envelope hash so a subscriber can correlate a log back to its transaction).
-		for address := range logEntryAddresses(entry) {
-			h.dispatchToAddress(event.EvType, address, entry.ID, entry, acceptLogs)
+		h.dispatchLogEntry(event.EvType, entry, acceptLogs)
+	}
+}
+
+// dispatchLogEntry fans one log entry out to every subscriber of any address it is
+// relevant to (see logEntryAddresses). The entry is marshalled once and the same bytes are
+// shared by every per-address envelope, so K fan-out addresses cost K cheap envelope
+// allocations rather than K full json.Marshal passes on the hub goroutine. The mirror, if
+// configured, gets exactly one POST per entry (under entry.Address) — it is a firehose
+// copy of the entry, not a per-subscriber delivery, so extra copies differing only in the
+// envelope address would just crowd the bounded postQueue.
+//
+// entry.ID is the hex-encoded hash of the transaction that produced this log (already
+// computed for the Elasticsearch-facing shape), reused as the envelope hash so a subscriber
+// can correlate a log back to its transaction.
+func (h *SocketHub) dispatchLogEntry(evType indexer.EventType, entry *data.Logs, acceptLogs func(userOptions) bool) {
+	type target struct {
+		address string
+		clients []*client
+	}
+	var targets []target
+	for address := range logEntryAddresses(entry) {
+		if clients := h.subscribersFor(address, acceptLogs); len(clients) > 0 {
+			targets = append(targets, target{address: address, clients: clients})
+		}
+	}
+	if len(targets) == 0 && h.postQueue == nil {
+		return
+	}
+
+	raw, err := json.Marshal(entry)
+	if err != nil {
+		log.Error("ws.EventReceive", "cannot marshal message", err.Error())
+		return
+	}
+
+	h.asyncPost(&Send{Type: evType, Address: entry.Address, Hash: entry.ID, Data: raw})
+	for _, t := range targets {
+		parsed := &Send{Type: evType, Address: t.address, Hash: entry.ID, Data: raw}
+		for _, c := range t.clients {
+			if c.IsAlive() {
+				c.send(parsed)
+			}
 		}
 	}
 }
@@ -515,13 +559,15 @@ func (h *SocketHub) handleLogsEvent(event indexer.Event) {
 // Limitations" entry on this, now resolved by delivering under both addresses).
 //
 // This can dispatch one entry to more than one address (up to 1+len(entry.Events) distinct
-// addresses), each a real marshal-and-post — and one more mirror POST each, if a mirror is
-// configured. Deliberately uncapped: every event.Address is the real, gas-priced address of
-// whichever contract called ManagedWriteLog (runtime.GetContextAddress(), not
-// attacker-supplied data), so distinct addresses in one entry cost the tx real gas to
-// produce, same as the event count itself already does — not a free amplification lever
-// under current gas economics. Revisit if that ever changes (e.g. a gas-schedule change
-// cheapening cross-contract calls or logging).
+// addresses); the entry is marshalled once and mirrored once regardless (see
+// dispatchLogEntry), so each extra address only costs an envelope and a send per subscriber.
+// Deliberately uncapped: an event.Address is not chosen freely by the tx sender — it is the
+// contract that wrote the log (runtime.GetContextAddress()), or, for node-generated system
+// logs, a wallet fixed by the protocol (a KDA transfer's caller, the sender of an internal
+// VM error, the original sender of deploy return data). Distinct addresses in one entry
+// therefore cost the tx real gas to produce, same as the event count itself already does —
+// not a free amplification lever under current gas economics. Revisit if that ever changes
+// (e.g. a gas-schedule change cheapening cross-contract calls or logging).
 func logEntryAddresses(entry *data.Logs) map[string]struct{} {
 	addresses := map[string]struct{}{entry.Address: {}}
 	for _, evt := range entry.Events {
@@ -961,7 +1007,10 @@ func (h *SocketHub) deleteAll() {
 
 	h.closed = true
 	h.logsSubscriberCount.Store(0)
-	indexer.SetLogsSubscriberChecker(nil)
+	// Closed, not nil: nil means "no hub wired" and dispatchLogEvents treats that as
+	// "convert everything", while UseEventQueue stays true after shutdown — so unwiring
+	// would make every later block pay the full conversion for a LOGS event nothing drains.
+	indexer.SetLogsSubscriberChecker(indexer.NoLogsSubscribers)
 
 	for c := range h.clients {
 		c.Close()

@@ -580,7 +580,7 @@ func TestEventsProcessor_SaveBlock_LogsPayloadConsistentWithoutIndexer(t *testin
 	require.NotNil(t, logsEvent)
 	logsDB := logsEvent.Message.([]*data.Logs)
 	require.Len(t, logsDB, 1)
-	assert.Equal(t, transaction.Transaction_SUCCESS.String(), logsDB[0].Status,
+	assert.Equal(t, "success", logsDB[0].Status,
 		"writeLog must override tx.Status even without an indexer configured")
 
 	txEvent := findEventType(events, TRANSACTIONS)

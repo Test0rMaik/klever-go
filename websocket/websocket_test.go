@@ -1449,3 +1449,88 @@ func TestNewClient_LoopIn_ConnectionClose(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	cleanup()
 }
+
+// TestLogsSubscriberCount_PerAddressAcrossRealPaths drives the counter only through the
+// real insertion/removal paths (never by writing acceptLogs into the map directly, which
+// would leave the counter out of step), with several addresses so a bug that adjusts it once
+// per client rather than once per (address, client) pair cannot pass.
+func TestLogsSubscriberCount_PerAddressAcrossRealPaths(t *testing.T) {
+	hub := newTestHub(nil)
+	c := newTestClient(hub)
+	addrs := []string{"klv1a", "klv1b", "klv1c"}
+
+	require.NoError(t, hub.HandleClientInsertion([]indexer.EventType{indexer.LOGS}, addrs, c))
+	assert.Equal(t, int64(3), hub.logsSubscriberCount.Load())
+
+	hub.HandleClientRemoval([]indexer.EventType{indexer.LOGS}, addrs[:2], c)
+	assert.Equal(t, int64(1), hub.logsSubscriberCount.Load(), "removing LOGS on two of three addresses must drop the count by exactly two")
+
+	hub.HandleClientRemoval([]indexer.EventType{indexer.LOGS}, addrs, c)
+	assert.Equal(t, int64(0), hub.logsSubscriberCount.Load(), "the already-removed addresses must not be decremented twice")
+
+	// Merge, then partial unsubscribe: ACCOUNTS+LOGS on one address, drop ACCOUNTS only. The
+	// pair still accepts LOGS, so it must still count.
+	require.NoError(t, hub.HandleClientInsertion([]indexer.EventType{indexer.ACCOUNTS, indexer.LOGS}, []string{"klv1a"}, c))
+	assert.Equal(t, int64(1), hub.logsSubscriberCount.Load())
+	hub.HandleClientRemoval([]indexer.EventType{indexer.ACCOUNTS}, []string{"klv1a"}, c)
+	assert.Equal(t, int64(1), hub.logsSubscriberCount.Load(), "dropping ACCOUNTS must leave the LOGS subscription counted")
+	assert.True(t, hub.HasLogsSubscriberOrMirror())
+}
+
+// TestDeleteAll_ClosesLogsGate pins the shutdown behavior a reviewer flagged: unwiring the
+// checker (nil) leaves dispatchLogEvents converting every block's logs for a LOGS event
+// nothing drains, while UseEventQueue stays true. A stopped hub must install a checker that
+// answers "nobody", and reset the count.
+func TestDeleteAll_ClosesLogsGate(t *testing.T) {
+	original := indexer.GetLogsSubscriberChecker()
+	t.Cleanup(func() { indexer.SetLogsSubscriberChecker(original) })
+
+	hub := newTestHub(nil)
+	c := newTestClient(hub)
+	require.NoError(t, hub.HandleClientInsertion([]indexer.EventType{indexer.LOGS}, []string{"klv1a", "klv1b"}, c))
+	indexer.SetLogsSubscriberChecker(hub.HasLogsSubscriberOrMirror)
+	require.True(t, indexer.GetLogsSubscriberChecker()())
+
+	killClient(c)
+	hub.deleteAll()
+
+	assert.Equal(t, int64(0), hub.logsSubscriberCount.Load())
+	checker := indexer.GetLogsSubscriberChecker()
+	require.NotNil(t, checker, "a stopped hub must leave a closed gate, not an unwired (convert-everything) one")
+	assert.False(t, checker())
+}
+
+// TestDispatchLogEntry_MirrorOncePerEntryAndSharedPayload guards the fan-out cost: one
+// entry relevant to several addresses must be marshalled once and mirrored once, while each
+// subscribed address still receives its own envelope carrying the same payload.
+func TestDispatchLogEntry_MirrorOncePerEntryAndSharedPayload(t *testing.T) {
+	hub := NewHub("http://mirror.example", "", nil)
+	c := newTestClient(hub)
+	require.NoError(t, hub.HandleClientInsertion([]indexer.EventType{indexer.LOGS}, []string{"klv1deployer", "klv1newcontract"}, c))
+
+	entry := &data.Logs{
+		ID:      "txhash1",
+		Address: "klv1deployer",
+		Events: []*data.Event{
+			{Address: "klv1newcontract", Identifier: "init"},
+			{Address: "klv1inner", Identifier: "call"},
+		},
+	}
+	hub.dispatchLogEntry(indexer.LOGS, entry, func(o userOptions) bool { return o.acceptLogs })
+
+	require.Len(t, hub.postQueue, 1, "three fan-out addresses must produce a single mirror post")
+	mirrored := <-hub.postQueue
+	assert.Equal(t, "klv1deployer", mirrored.Address, "the mirror copy is posted under entry.Address")
+
+	got := map[string]*Send{}
+	for i := 0; i < 2; i++ {
+		s := awaitSend(t, c)
+		got[s.Address] = s
+	}
+	require.Contains(t, got, "klv1deployer")
+	require.Contains(t, got, "klv1newcontract")
+	assert.JSONEq(t, string(mirrored.Data), string(got["klv1deployer"].Data))
+	assert.JSONEq(t, string(mirrored.Data), string(got["klv1newcontract"].Data))
+	assert.Equal(t, "txhash1", got["klv1newcontract"].Hash)
+	assert.Empty(t, c.out, "no delivery for the unsubscribed klv1inner address")
+}

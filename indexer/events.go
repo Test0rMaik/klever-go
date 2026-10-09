@@ -20,12 +20,16 @@ var logsSubscriberChecker atomic.Value // holds a `func() bool`, possibly nil
 
 // SetLogsSubscriberChecker installs the function dispatchLogEvents consults before paying
 // the full bech32/hex-encoding conversion cost on the block-commit goroutine, so a block
-// with many SC events costs nothing extra when nobody would receive them. Call it with nil
-// to unwire a hub that is shutting down — otherwise a later block still consults a stopped
-// hub's stale state.
+// with many SC events costs nothing extra when nobody would receive them. A nil checker
+// means "no hub wired" and converts every block; a hub that is shutting down must install
+// NoLogsSubscribers instead, so later blocks skip the conversion rather than pay for a
+// LOGS event nothing drains.
 func SetLogsSubscriberChecker(checker func() bool) {
 	logsSubscriberChecker.Store(&checker)
 }
+
+// NoLogsSubscribers is the checker for a stopped hub: nobody can receive logs, so skip.
+func NoLogsSubscribers() bool { return false }
 
 // GetLogsSubscriberChecker returns the currently installed checker, or nil if none is set
 // (no hub wired yet, or this indexer package used outside the websocket feature).
@@ -92,4 +96,11 @@ func NewEventTypeStrict(evType string) (EventType, error) {
 	default:
 		return UNKNOWN, ErrUnknownEventType
 	}
+}
+
+// Deprecated: use NewEventTypeStrict, which reports an unknown type as an error. Kept so
+// external importers of this exported helper keep building.
+func NewEventType(evType string) EventType {
+	t, _ := NewEventTypeStrict(evType)
+	return t
 }
